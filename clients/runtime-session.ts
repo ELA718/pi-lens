@@ -102,6 +102,8 @@ interface SessionStartDeps {
 	handlerEnteredAt?: number;
 	bootstrapClientsStartedAt?: number;
 	bootstrapClientsDurationMs?: number;
+	/** False in the fleet Pi host; keeps non-diagnostic caches but skips session diagnostics. */
+	diagnosticsEnabled?: boolean;
 	getFlag: (name: string) => boolean | string | undefined;
 	notify: (msg: string, level: "info" | "warning" | "error") => void;
 	dbg: (msg: string) => void;
@@ -1521,13 +1523,15 @@ export async function handleSessionStart(
 	//   entirely — but only when PI_LENS_STARTUP_MODE is unset in the env
 	//   (an explicit env var still takes highest precedence).
 	// Tunable: PI_LENS_WARMUP_DELAY_MS adjusts the warmup delay.
-	let startupMode = resolveStartupMode();
+	let startupMode =
+		deps.diagnosticsEnabled === false ? "quick" : resolveStartupMode();
 	const processGlobals = globalThis as unknown as {
 		__piLensFirstSessionDone?: boolean;
 		__piLensWarmupScheduled?: boolean;
 	};
 	const isFirstSessionOfProcess = !processGlobals.__piLensFirstSessionDone;
 	if (
+		deps.diagnosticsEnabled !== false &&
 		isFirstSessionOfProcess &&
 		process.env.PI_LENS_COLD_START_QUICK !== "0" &&
 		!process.env.PI_LENS_STARTUP_MODE

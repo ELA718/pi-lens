@@ -185,6 +185,7 @@ import {
 import { logSessionStart } from "./clients/sessionstart-logger.js";
 import { logConcurrentSessionBind } from "./clients/session-start-observability.js";
 import { warmFormatters } from "./clients/formatters-lazy.js";
+import { inSessionDiagnosticsEnabled } from "./clients/session-diagnostics.js";
 
 type DispatchIntegration = Awaited<ReturnType<typeof loadDispatchIntegration>>;
 let loadedDispatchIntegration: DispatchIntegration | undefined;
@@ -552,6 +553,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	const astGrepClient = new AstGrepClient();
 	const cacheManager = new CacheManager();
+	const sessionDiagnosticsEnabled = inSessionDiagnosticsEnabled();
 
 	type LspStatusTheme = {
 		fg: (
@@ -653,6 +655,17 @@ export default function (pi: ExtensionAPI) {
 			runtime.projectRoot,
 		);
 	}
+
+	const getRuntimeFlag = (
+		name: string,
+		editedFilePath?: string,
+	): boolean | string | undefined => {
+		if (!sessionDiagnosticsEnabled) {
+			if (name === "no-lsp" || name === "no-tests") return true;
+			if (name === "lens-guard") return false;
+		}
+		return getLensFlag(name, editedFilePath);
+	};
 
 	// #792: sibling of getLensFlag reporting WHICH config tier decided the
 	// value, so mutation-skip dbg lines can name it (e.g. "source=project")
@@ -1434,12 +1447,23 @@ export default function (pi: ExtensionAPI) {
 				"Record a disposition for a diagnostic: false-positive / suppress (inline ignore comment) / defer (this session) / flagged (to fix).",
 		},
 	];
+	const sessionDiagnosticToolNames = new Set([
+		"lens_diagnostics",
+		"lsp_diagnostics",
+		"lsp_navigation",
+		"lens_diagnostic_mark",
+	]);
+	const availableLazyToolCatalog = sessionDiagnosticsEnabled
+		? LAZY_TOOL_CATALOG
+		: LAZY_TOOL_CATALOG.filter(
+				(tool) => !sessionDiagnosticToolNames.has(tool.name),
+			);
 	const activateToolsTool = createActivateToolsTool(
 		pi as unknown as {
 			getActiveTools?: () => string[];
 			setActiveTools?: (names: string[]) => void;
 		},
-		LAZY_TOOL_CATALOG,
+		availableLazyToolCatalog,
 	);
 
 	// #1327: opt-in compact one-line tool rendering. Read once at load (like
@@ -1454,7 +1478,10 @@ export default function (pi: ExtensionAPI) {
 		...alwaysActiveTools,
 		activateToolsTool,
 		...lazyTools,
-	];
+	].filter(
+		(tool) =>
+			sessionDiagnosticsEnabled || !sessionDiagnosticToolNames.has(tool.name),
+	);
 	for (const tool of compactToolLineEnabled
 		? wrapToolsForCompactLine(toolsToRegister as any)
 		: toolsToRegister) {
@@ -1503,13 +1530,15 @@ export default function (pi: ExtensionAPI) {
 	// --- Events ---
 
 	pi.on("session_start", async (event, ctx) => {
-		warmDispatchAtSessionStart();
-		void warmLspService().catch((err) =>
-			logExtension({ subsystem: "lsp", level: "warn", message: `LSP warm failed: ${err}` }),
-		);
-		void warmFormatters().catch((err) =>
-			logExtension({ subsystem: "format", level: "warn", message: `formatter warm failed: ${err}` }),
-		);
+		if (sessionDiagnosticsEnabled) {
+			warmDispatchAtSessionStart();
+			void warmLspService().catch((err) =>
+				logExtension({ subsystem: "lsp", level: "warn", message: `LSP warm failed: ${err}` }),
+			);
+			void warmFormatters().catch((err) =>
+				logExtension({ subsystem: "format", level: "warn", message: `formatter warm failed: ${err}` }),
+			);
+		}
 		rememberEventCtx(ctx);
 		refreshCtxDerivedPlumbing();
 		const sessionStartFiredAt = Date.now();
@@ -1674,10 +1703,12 @@ export default function (pi: ExtensionAPI) {
 					dbg(`session_start: cross-process nudge read failed: ${err}`);
 				});
 			updateRuntimeIdentityFromEvent(event);
-			try {
-				await ensureLSPConfigInitialized(ctx.cwd ?? process.cwd());
-			} catch (cfgErr) {
-				dbg(`lsp config init failed: ${cfgErr}`);
+			if (sessionDiagnosticsEnabled) {
+				try {
+					await ensureLSPConfigInitialized(ctx.cwd ?? process.cwd());
+				} catch (cfgErr) {
+					dbg(`lsp config init failed: ${cfgErr}`);
+				}
 			}
 
 			const bootstrapClientsStartedAt = Date.now();
@@ -1707,7 +1738,8 @@ export default function (pi: ExtensionAPI) {
 				handlerEnteredAt,
 				bootstrapClientsStartedAt,
 				bootstrapClientsDurationMs,
-				getFlag: (name: string) => getLensFlag(name),
+				diagnosticsEnabled: sessionDiagnosticsEnabled,
+				getFlag: (name: string) => getRuntimeFlag(name),
 				notify: (msg, level) => notifyUi(ctx, msg, level),
 				dbg,
 				log,
@@ -1735,7 +1767,9 @@ export default function (pi: ExtensionAPI) {
 				resetDispatchBaselines,
 				resetLSPService,
 			});
-			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+			if (sessionDiagnosticsEnabled && ctx.ui) {
+				updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+			}
 
 			// Pin the stable identity + reason AFTER handleSessionStart (which ran
 			// resetForSession → a fresh random id); the stable id now wins (#190).
@@ -1868,7 +1902,8 @@ export default function (pi: ExtensionAPI) {
 			event: event as unknown as Parameters<typeof handleToolCall>[0]["event"],
 			ctx: ctx as unknown as Parameters<typeof handleToolCall>[0]["ctx"],
 			lensEnabled,
-			getFlag: (name: string) => getLensFlag(name),
+			diagnosticsEnabled: sessionDiagnosticsEnabled,
+			getFlag: (name: string) => getRuntimeFlag(name),
 			dbg,
 			runtime,
 			cacheManager,
@@ -1882,7 +1917,7 @@ export default function (pi: ExtensionAPI) {
 	// biome-ignore lint/suspicious/noExplicitAny: pi.on overload mismatch for tool_result event type
 	(pi as any).on("tool_result", async (event: any, ctx: any) => {
 		rememberEventCtx(ctx);
-		if (!lensEnabled) return;
+		if (!lensEnabled || !sessionDiagnosticsEnabled) return;
 		updateRuntimeIdentityFromEvent(event);
 		// Publish this turn's abort signal so the dispatch's linter/type-check
 		// child processes are killed if the agent is interrupted (#197 ctx.signal).
@@ -1992,7 +2027,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
-		if (!lensEnabled) return;
+		if (!lensEnabled || !sessionDiagnosticsEnabled) return;
 		// Esc/abort during the deferred format + flush kills in-flight children.
 		setAmbientAbortSignal((ctx as { signal?: AbortSignal })?.signal);
 		try {
@@ -2047,7 +2082,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("turn_end", async (_event: any, ctx) => {
-		if (!lensEnabled) return;
+		if (!lensEnabled || !sessionDiagnosticsEnabled) return;
 		// Esc/abort during the turn-end flush (knip/madge/tests + debounced
 		// dispatch) kills in-flight children instead of waiting out their timeout.
 		setAmbientAbortSignal((ctx as { signal?: AbortSignal })?.signal);
@@ -2288,7 +2323,7 @@ export default function (pi: ExtensionAPI) {
 		_turnSummaryEmitRegistered = true;
 		registerQuietWindowTask("turn_summary_emit", () => {
 			const emitCtx = _turnSummaryEmitCtx;
-			if (!emitCtx || !emitCtx.isLensEnabled()) return;
+			if (!sessionDiagnosticsEnabled || !emitCtx || !emitCtx.isLensEnabled()) return;
 			// The captured `pi` can go STALE between the activation that set this
 			// holder and this fire-and-forget quiet-window run: an interim
 			// newSession/fork/switchSession/reload invalidates the runtime, after
@@ -2365,7 +2400,7 @@ export default function (pi: ExtensionAPI) {
 		(pi as any).on(
 			"agent_settled",
 			(_event: unknown, ctx: { cwd?: string }) => {
-				if (!lensEnabled) return;
+				if (!lensEnabled || !sessionDiagnosticsEnabled) return;
 				void runQuietWindow({
 					runtime,
 					dbg,
@@ -2527,7 +2562,8 @@ export default function (pi: ExtensionAPI) {
 				sessionRole,
 				dbg,
 			);
-			const effectiveInjectionEnabled = lensEnabled && contextInjectionEnabled;
+			const effectiveInjectionEnabled =
+				sessionDiagnosticsEnabled && lensEnabled && contextInjectionEnabled;
 			let telemetryLogged = false;
 			const logContextObservation = (
 				resultMessages: Array<{ role: string; content: unknown }>,
