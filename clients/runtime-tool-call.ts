@@ -248,6 +248,7 @@ interface ToolCallDeps {
 	event: ToolCallEvent;
 	ctx: ToolCallCtx;
 	lensEnabled: boolean;
+	diagnosticsEnabled?: boolean;
 	getFlag: (name: string) => boolean | string | undefined;
 	dbg: (msg: string) => void;
 	runtime: RuntimeCoordinator;
@@ -275,6 +276,7 @@ export async function handleToolCall(
 		event,
 		ctx,
 		lensEnabled,
+		diagnosticsEnabled = true,
 		getFlag,
 		dbg,
 		runtime,
@@ -622,26 +624,27 @@ export async function handleToolCall(
 		});
 	}
 
-	const { complexityClient } = await loadBootstrapClients();
 	// Record complexity baseline for historical tracking (booboo/tdi).
 	// Not shown inline - just captured for delta analysis.
-	if (
-		!isExternalOrVendor &&
-		complexityClient.isSupportedFile(filePath) &&
-		!runtime.complexityBaselines.has(filePath)
-	) {
-		const baseline = await complexityClient.analyzeFile(filePath);
-		if (baseline) {
-			runtime.complexityBaselines.set(filePath, baseline);
-			const { captureSnapshot } = await import("./metrics-history.js");
-			captureSnapshot(filePath, {
-				maintainabilityIndex: baseline.maintainabilityIndex,
-				cognitiveComplexity: baseline.cognitiveComplexity,
-				maxNestingDepth: baseline.maxNestingDepth,
-				linesOfCode: baseline.linesOfCode,
-				maxCyclomatic: baseline.maxCyclomaticComplexity,
-				entropy: baseline.codeEntropy,
-			});
+	if (diagnosticsEnabled && !isExternalOrVendor) {
+		const { complexityClient } = await loadBootstrapClients();
+		if (
+			complexityClient.isSupportedFile(filePath) &&
+			!runtime.complexityBaselines.has(filePath)
+		) {
+			const baseline = await complexityClient.analyzeFile(filePath);
+			if (baseline) {
+				runtime.complexityBaselines.set(filePath, baseline);
+				const { captureSnapshot } = await import("./metrics-history.js");
+				captureSnapshot(filePath, {
+					maintainabilityIndex: baseline.maintainabilityIndex,
+					cognitiveComplexity: baseline.cognitiveComplexity,
+					maxNestingDepth: baseline.maxNestingDepth,
+					linesOfCode: baseline.linesOfCode,
+					maxCyclomatic: baseline.maxCyclomaticComplexity,
+					entropy: baseline.codeEntropy,
+				});
+			}
 		}
 	}
 
@@ -938,6 +941,7 @@ export async function handleToolCall(
 							summary: editBatchSummary,
 							correlationId: readGuardCorrelationId,
 							afterWrite: async () => {
+								if (!diagnosticsEnabled) return;
 								const {
 									biomeClient,
 									ruffClient,

@@ -31,3 +31,21 @@ The command uses the same graph builder, project configuration, file cap, and
 persist cap as an interactive session. It prints file/node/edge/element count,
 snapshot JSON bytes, and duration on success; an unsafe root, build skip/error,
 or failed/skipped persistence exits non-zero with the reason on stderr.
+
+## Fleet diagnostics CLI
+
+The fleet fork keeps diagnostics out of interactive Pi sessions. Run the same
+full project scan in CI instead:
+
+```bash
+npx pi-lens diagnostics --cwd . --format json
+```
+
+The command exits `0` when complete without blockers, `1` for blocking
+diagnostics, and `2` when the scan is incomplete or infrastructure failed.
+Use `--max-lsp-files N` and `--max-project-files N` to bound large projects.
+Use `--allow-unconfirmed-lsp` only on heterogeneous runners where a headless
+language server cannot confirm clean files; other incomplete scans still exit
+`2`.
+Interactive diagnostics can be enabled only for fork development with
+`PI_LENS_IN_SESSION_DIAGNOSTICS=1`.

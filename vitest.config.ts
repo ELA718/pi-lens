@@ -2,6 +2,9 @@ import { defineConfig } from "vitest/config";
 
 // Applies to globalSetup as well as workers: ordinary tests never install tools.
 process.env.PI_LENS_DISABLE_TOOL_INSTALL ??= "1";
+// The fleet fork disables session diagnostics by default; legacy suites opt in
+// so they continue covering the original interactive pipeline.
+process.env.PI_LENS_IN_SESSION_DIAGNOSTICS ??= "1";
 
 // Background coding agents get worktrees under .claude/worktrees/ — vitest's
 // default exclude covers node_modules/.git/dist but NOT those, so a "full

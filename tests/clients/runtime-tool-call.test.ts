@@ -21,8 +21,8 @@ vi.mock("../../clients/lsp/index.js", () => ({
 	resetLSPService: () => {},
 }));
 
-vi.mock("../../clients/bootstrap.js", () => ({
-	loadBootstrapClients: async () => ({
+const { loadBootstrapClientsMock } = vi.hoisted(() => ({
+	loadBootstrapClientsMock: vi.fn(async () => ({
 		complexityClient: {
 			isSupportedFile: () => false,
 			analyzeFile: async () => null,
@@ -31,7 +31,10 @@ vi.mock("../../clients/bootstrap.js", () => ({
 		ruffClient: {},
 		metricsClient: {},
 		agentBehaviorClient: { recordToolCall: () => {}, formatWarnings: () => "" },
-	}),
+	})),
+}));
+vi.mock("../../clients/bootstrap.js", () => ({
+	loadBootstrapClients: loadBootstrapClientsMock,
 }));
 
 function baseDeps(overrides: Partial<Parameters<typeof handleToolCall>[0]> = {}) {
@@ -64,6 +67,38 @@ describe("handleToolCall", () => {
 		);
 		expect(result).toBeUndefined();
 		expect(recordRead).not.toHaveBeenCalled();
+	});
+
+	it("keeps read guard active without starting diagnostics", async () => {
+		touchFileMock.mockClear();
+		loadBootstrapClientsMock.mockClear();
+		const env = setupTestEnvironment("pi-lens-runtime-tool-call-external-");
+		try {
+			const filePath = createTempFile(
+				env.tmpDir,
+				"src/a.ts",
+				"export const a = 1;\n",
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const recordRead = vi.spyOn(runtime.readGuard, "recordRead");
+
+			await handleToolCall(
+				baseDeps({
+					diagnosticsEnabled: false,
+					getFlag: (name) => name === "no-lsp",
+					runtime,
+					event: { toolName: "read", input: { path: filePath } },
+					ctx: { cwd: env.tmpDir },
+				}),
+			);
+
+			expect(recordRead).toHaveBeenCalled();
+			expect(touchFileMock).not.toHaveBeenCalled();
+			expect(loadBootstrapClientsMock).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
 	});
 
 	it("records a read-guard read for a full-file read and LSP-warms it", async () => {

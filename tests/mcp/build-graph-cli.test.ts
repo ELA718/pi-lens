@@ -164,3 +164,17 @@ describe("pi-lens build-graph CLI", () => {
 		}
 	});
 });
+
+describe("pi-lens diagnostics CLI", () => {
+	it("rejects invalid output formats with the infrastructure exit code", async () => {
+		const result = await runCli(
+			["diagnostics", "--cwd", projectDir, "--format", "xml"],
+			dataDir,
+		);
+		expect(result.code).toBe(2);
+		expect(result.stdout).toBe("");
+		expect(result.stderr).toContain(
+			"pi-lens diagnostics failed: --format must be text or json",
+		);
+	});
+});
