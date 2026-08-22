@@ -11,13 +11,14 @@ export interface DiagnosticsCliResult {
 export function diagnosticsExitCode(
 	details: Record<string, unknown>,
 	isError = false,
+	allowUnconfirmedLsp = false,
 ): 0 | 1 | 2 {
 	const incomplete =
 		isError ||
 		details.partial === true ||
 		details.timedOut === true ||
 		details.lspUnavailable === true ||
-		Number(details.lspFilesUnconfirmed ?? 0) > 0 ||
+		(!allowUnconfirmedLsp && Number(details.lspFilesUnconfirmed ?? 0) > 0) ||
 		(Array.isArray(details.failedAnalyzers) &&
 			details.failedAnalyzers.length > 0) ||
 		details.analyzersAborted === true ||
@@ -30,7 +31,11 @@ export function diagnosticsExitCode(
 
 export async function runDiagnostics(
 	cwd: string,
-	options: { maxLspFiles?: number; maxProjectFiles?: number } = {},
+	options: {
+		maxLspFiles?: number;
+		maxProjectFiles?: number;
+		allowUnconfirmedLsp?: boolean;
+	} = {},
 ): Promise<DiagnosticsCliResult> {
 	const tool = createLensDiagnosticsTool(new CacheManager(), () => cwd);
 	try {
@@ -54,7 +59,11 @@ export async function runDiagnostics(
 		return {
 			text: result.content.map((item) => item.text).join("\n"),
 			details,
-			exitCode: diagnosticsExitCode(details, result.isError === true),
+			exitCode: diagnosticsExitCode(
+				details,
+				result.isError === true,
+				options.allowUnconfirmedLsp,
+			),
 		};
 	} finally {
 		resetLSPService({ fast: true, reason: "ci_diagnostics" });

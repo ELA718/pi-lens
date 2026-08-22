@@ -39,6 +39,21 @@ describe("fleet diagnostics execution", () => {
 		expect(diagnosticsExitCode({ totalBlocking: 0 })).toBe(0);
 		expect(diagnosticsExitCode({ totalBlocking: 1 })).toBe(1);
 		expect(diagnosticsExitCode({ lspFilesUnconfirmed: 1 })).toBe(2);
+		expect(diagnosticsExitCode({ lspFilesUnconfirmed: 1 }, false, true)).toBe(0);
+		expect(
+			diagnosticsExitCode(
+				{ lspFilesUnconfirmed: 1, totalBlocking: 1 },
+				false,
+				true,
+			),
+		).toBe(1);
 		expect(diagnosticsExitCode({ failedAnalyzers: [{ id: "knip" }] })).toBe(2);
+		expect(
+			diagnosticsExitCode(
+				{ failedAnalyzers: [{ id: "knip" }] },
+				false,
+				true,
+			),
+		).toBe(2);
 	});
 });

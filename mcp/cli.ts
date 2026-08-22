@@ -145,6 +145,7 @@ async function diagnostics(): Promise<void> {
 	const result = await runDiagnostics(cwd, {
 		maxLspFiles: positiveIntArg("--max-lsp-files"),
 		maxProjectFiles: positiveIntArg("--max-project-files"),
+		allowUnconfirmedLsp: process.argv.includes("--allow-unconfirmed-lsp"),
 	});
 	process.stdout.write(
 		format === "json"
@@ -159,7 +160,7 @@ async function main(): Promise<void> {
 	if (activeCommand === "build-graph") return buildGraph();
 	if (activeCommand === "diagnostics") return diagnostics();
 	fail(
-		"usage: pi-lens build-graph [--cwd <dir>] | pi-lens diagnostics [--cwd <dir>] [--format text|json] [--max-lsp-files N] [--max-project-files N]",
+		"usage: pi-lens build-graph [--cwd <dir>] | pi-lens diagnostics [--cwd <dir>] [--format text|json] [--max-lsp-files N] [--max-project-files N] [--allow-unconfirmed-lsp]",
 	);
 }
 
