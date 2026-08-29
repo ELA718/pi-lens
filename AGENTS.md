@@ -1649,3 +1649,48 @@ Every issue should carry **one TYPE label + at least one `area:` label**.
   events. Tool-call inspection must not mutate read-guard state, and wrapper,
   launcher, and continuation forms must remain conservative for git commits and
   pushes.
+
+
+<!-- Canonical section below. Source: ~/GITHUB/globalskills/docs/agents-worktree-policy.md -->
+
+## Worktrees, Concurrency, And Closeout
+
+Canonical source: `~/GITHUB/globalskills/docs/agents-worktree-policy.md`. Change
+it there, then re-apply to all repositories. Do not diverge local copies.
+
+### Worktree-first
+
+- Do all task work in a dedicated worktree branched from freshly fetched
+  `origin/<default-branch>`. Never edit, stage, commit, or run mutating
+  commands in the shared checkout. The shared checkout is read-only
+  coordination and inspection space.
+- On EIS, run `eis-worktree doctor`, then create the lane only with
+  `eis-worktree create <repo> <task> [--branch <branch>]`. Its physical path
+  must be under `/Volumes/AgentRoles-Main/eis-storage/worktrees/<repo>/<task>`.
+  If that exact volume is unavailable, read-only, has the wrong UUID, or cannot
+  host the lane, stop. Never fall back to the internal disk,
+  `/Volumes/EISdata`, `/tmp`, or another volume.
+- Repository-specific helpers may perform setup after creation, but they must
+  not create or redirect an EIS worktree outside the approved external root.
+  Existing legacy lanes elsewhere are migration/closeout-only, not reusable
+  task lanes.
+- One session, one worktree, one branch. Reviewers and inspectors stay
+  read-only.
+
+### Concurrent edits to the same resources
+
+- Other agents may edit the same files. Before you edit a high-collision file
+  (`AGENTS.md`, `package.json`, lockfiles, shared configs), fetch and re-read
+  it; another lane may have changed it.
+- Stage only the paths your task owns. Never run `git add .` or `git add -A`.
+- Never reset, clean, stash over, rebase over, or commit over unrelated work.
+- If another lane changed the same hunk, stop and report the exact hunk.
+  Never overwrite it.
+
+### Closeout — remove the worktree
+
+- When your task branch is merged (or the lane is cancelled), remove your
+  lane: `git worktree remove <path>`, then `git branch -d <branch>`.
+- Remove only clean, merged worktrees. Keep dirty, current, or unmerged lanes.
+- Closeout is part of done: an abandoned worktree is an unfinished task.
+- If this repository documents its own closeout command, run that instead.
