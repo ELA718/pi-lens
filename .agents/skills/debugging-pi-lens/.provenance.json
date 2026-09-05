@@ -1,0 +1,11 @@
+{
+  "source_repository": "https://github.com/ELA718/pi-lens.git",
+  "source_commit": "8242fcbc298b2dcb8eafa2dd37771c9a6ea1b6b0",
+  "source_paths": [
+    "AGENTS.md",
+    "package.json",
+    "tsconfig.build.json",
+    "tsconfig.dist.json"
+  ],
+  "adaptation": "Original repo source-development router; package skill source and manifests preserved."
+}
