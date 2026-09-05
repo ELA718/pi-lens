@@ -1,5 +1,10 @@
 # pi-lens — agent context
 
+For repository source diagnosis and local verification, read
+`.agents/skills/debugging-pi-lens/SKILL.md`. Package-shipped skills stay under
+`skills/`; this helper does not replace the contract below.
+
+
 Advisory caches must carry immutable capture provenance and validate it again
 at every delivery surface. A finding is current only when session/turn state
 matches and every affected file is SHA-256-confirmed (size+mtime is only the
@@ -1650,7 +1655,6 @@ Every issue should carry **one TYPE label + at least one `area:` label**.
   launcher, and continuation forms must remain conservative for git commits and
   pushes.
 
-
 <!-- Canonical section below. Source: ~/GITHUB/globalskills/docs/agents-worktree-policy.md -->
 
 ## Worktrees, Concurrency, And Closeout
@@ -1666,14 +1670,13 @@ it there, then re-apply to all repositories. Do not diverge local copies.
   coordination and inspection space.
 - On EIS, run `eis-worktree doctor`, then create the lane only with
   `eis-worktree create <repo> <task> [--branch <branch>]`. Its physical path
-  must be under `/Volumes/AgentRoles-Main/eis-storage/worktrees/<repo>/<task>`.
-  If that exact volume is unavailable, read-only, has the wrong UUID, or cannot
-  host the lane, stop. Never fall back to the internal disk,
-  `/Volumes/EISdata`, `/tmp`, or another volume.
+  must be under `~/GITHUB/.eis-local-worktrees/<repo>/<task>` on the internal
+  SSD. If the helper's root or free-space checks fail, stop and repair the
+  managed root; do not choose another path or volume manually.
 - Repository-specific helpers may perform setup after creation, but they must
-  not create or redirect an EIS worktree outside the approved external root.
-  Existing legacy lanes elsewhere are migration/closeout-only, not reusable
-  task lanes.
+  not create or redirect an EIS worktree outside the managed internal root.
+  Existing external lanes are migration/closeout-only; preserve dirty,
+  current or unmerged lanes and migrate only clean inactive ones with verification.
 - One session, one worktree, one branch. Reviewers and inspectors stay
   read-only.
 
