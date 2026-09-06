@@ -1664,16 +1664,17 @@ it there, then re-apply to all repositories. Do not diverge local copies.
   `origin/<default-branch>`. Never edit, stage, commit, or run mutating
   commands in the shared checkout. The shared checkout is read-only
   coordination and inspection space.
-- On EIS, run `eis-worktree doctor`, then create the lane only with
-  `eis-worktree create <repo> <task> [--branch <branch>]`. Its physical path
-  must be under `/Volumes/AgentRoles-Main/eis-storage/worktrees/<repo>/<task>`.
-  If that exact volume is unavailable, read-only, has the wrong UUID, or cannot
-  host the lane, stop. Never fall back to the internal disk,
-  `/Volumes/EISdata`, `/tmp`, or another volume.
+- On EIS, use the selected internal SSD policy. Run `eis-worktree doctor`,
+  then create the lane only with
+  `eis-worktree create <repo> <task> [--branch <branch>]`. The helper must
+  report `policy=local` and place the lane under
+  `/Users/eis/GITHUB/.eis-local-worktrees/<repo>/<task>`.
+  If that root is unavailable or cannot host the lane, stop and report the
+  failure; do not choose an alternate path.
 - Repository-specific helpers may perform setup after creation, but they must
-  not create or redirect an EIS worktree outside the approved external root.
-  Existing legacy lanes elsewhere are migration/closeout-only, not reusable
-  task lanes.
+  not create or redirect an EIS worktree outside the selected internal root.
+  Existing lanes elsewhere are migration/closeout-only, not reusable task
+  lanes. External-volume availability does not gate an internal task lane.
 - One session, one worktree, one branch. Reviewers and inspectors stay
   read-only.
 
