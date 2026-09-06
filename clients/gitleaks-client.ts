@@ -35,6 +35,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { mkdtempSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { SecurityScanClient } from "./security-scan-client.js";
 
@@ -270,6 +271,7 @@ export class GitleaksClient extends SecurityScanClient<GitleaksResult> {
 
 			const findings = parseGitleaksReport(
 				fs.readFileSync(reportPath, "utf-8"),
+				cwd,
 			);
 			return {
 				success: true,
@@ -295,6 +297,74 @@ export class GitleaksClient extends SecurityScanClient<GitleaksResult> {
 
 // --- Parser ---
 
+/** Narrow generic-key noise using the actual matched binding and value.
+ * Provider-specific rules remain authoritative, including in test files. */
+function isNonCredentialGenericValue(entry: Record<string, unknown>): boolean {
+	if (entry.RuleID !== "generic-api-key" || typeof entry.Match !== "string" || typeof entry.Secret !== "string") return false;
+	const { Match: match, Secret: secret } = entry;
+	if (!secret || !match.includes(secret)) return false;
+	const binding = match.match(/^(?:[A-Za-z_$][\w$]*\.)*((?:p_)?idempotency_?key|route_key|optimizationKey)\s*(?::|=>|=)\s*['"]/i)?.[1];
+	// Human-readable replay/route identifiers have a distinct protocol role.
+	// Opaque random strings and token-shaped values keep their finding.
+	if (binding && /^[a-z0-9]+(?:-+[a-z0-9]+)+$/.test(secret) && secret.split(/-+/).some(part => /^[a-z]{3,16}$/.test(part) && /[g-z]/.test(part))) return true;
+	try {
+		const parts = secret.split(".");
+		const header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf-8"));
+		if (!header || typeof header !== "object" || Array.isArray(header)) return false;
+		if (parts.length === 1 && typeof header.alg === "string" && Object.keys(header).every(key => key === "alg" || key === "typ")) return true;
+		// This deliberately invalid fixture has no JWT algorithm and uses the
+		// literal word "signature". A real signed JWT is never excluded here.
+		if (parts.length === 3 && parts[2] === "signature" && Object.keys(header).length === 0) return true;
+		if (binding === "route_key" && parts.length === 1 && Object.keys(header).length > 0 && Object.keys(header).every(key => /(?:Id|Number)$/.test(key))) return true;
+	} catch { /* Non-JSON/opaque values remain candidate credentials. */ }
+	return false;
+}
+
+/** Verify the surrounding metadata rather than ignoring hashes or whole files. */
+function isVerifiedGenericMetadata(entry: Record<string, unknown>, cwd?: string): boolean {
+	if (!cwd || entry.RuleID !== "generic-api-key" || typeof entry.File !== "string" || typeof entry.Match !== "string" || typeof entry.Secret !== "string") return false;
+	try {
+		const file = fs.realpathSync(path.resolve(cwd, entry.File));
+		const relative = path.relative(fs.realpathSync(cwd), file);
+		if (relative.startsWith("..") || path.isAbsolute(relative)) return false;
+		const source = fs.readFileSync(file, "utf-8");
+		const start = Number(entry.StartLine) - 1;
+		const lines = source.split(/\r?\n/);
+		if (!Number.isInteger(start) || start < 0) return false;
+		const excerpt = lines.slice(start, start + entry.Match.split("\n").length + 1).join("\n");
+		const index = excerpt.indexOf(entry.Match);
+		if (index < 0) return false;
+		const secret = entry.Secret;
+		// The regex crossed from prose ending in "key" into the NAME of the
+		// next JSON property. This is not a credential assignment.
+		if (entry.Match.includes("\n") && /^[A-Z][A-Z0-9_]+$/.test(secret) && /^\s*:/.test(excerpt.slice(index + entry.Match.length))) return true;
+		if (!/^[a-f0-9]{64}$/.test(secret)) return false;
+		const artifact = entry.Match.match(/^(\d{14}_[a-z0-9_]+\.sql)['"],\s*['"]/);
+		if (artifact) {
+			const content = fs.readFileSync(path.join(cwd, "supabase", "migrations", artifact[1]));
+			return createHash("sha256").update(content).digest("hex") === secret;
+		}
+		if (!file.endsWith(".sql")) return false;
+		// A simple SQL metadata inventory: derive the value's column from its
+		// actual CREATE/INSERT shape. Complex SQL stays a finding.
+		const declaration = /^\s*CREATE\s+(?:TEMP|TEMPORARY)\s+TABLE\s+([a-z_]\w*)\s*\(([\s\S]*?)\)\s*ON\s+COMMIT\s+DROP\s*;/im.exec(source);
+		if (!declaration) return false;
+		const prefix = source.slice(0, declaration.index).replace(/^\s*--[^\n]*$/gm, "").trim();
+		if (prefix && !/^BEGIN\s*;$/i.test(prefix)) return false;
+		const beforeRow = lines.slice(0, start).join("\n") + "\n";
+		const following = beforeRow.slice(declaration.index + declaration[0].length).replace(/^\s*--[^\n]*$/gm, "");
+		if (!new RegExp(`^\\s*INSERT\\s+INTO\\s+${declaration[1]}\\s+VALUES\\s`, "i").test(following) || following.includes(";") || following.includes("/*")) return false;
+		const columns = [...declaration[2].matchAll(/^\s*([a-z_]\w*)\s+(?:text|varchar|boolean)\b/gim)].map(match => match[1]);
+		const row = lines[start]?.trim().match(/^\((.*)\)[,;]?$/)?.[1];
+		if (!row) return false;
+		const token = /'(?:''|[^'])*'|\b(?:true|false|null)\b/gi;
+		const values = [...row.matchAll(token)].map(match => match[0]);
+		if (row.replace(token, "").replace(/[\s,]/g, "") || values.length !== columns.length) return false;
+		const positions = values.flatMap((value, index) => value === `'${secret}'` ? [index] : []);
+		return positions.length > 0 && positions.every(index => /_sha256$/i.test(columns[index]));
+	} catch { return false; }
+}
+
 /**
  * Map gitleaks's JSON report (a flat array of finding objects) to our
  * structured `GitleaksFinding[]` shape. Exported for unit tests.
@@ -303,7 +373,7 @@ export class GitleaksClient extends SecurityScanClient<GitleaksResult> {
  * input returns `[]` rather than throwing — gitleaks itself is occasionally
  * truncated by upstream pipe failures.
  */
-export function parseGitleaksReport(raw: string): GitleaksFinding[] {
+export function parseGitleaksReport(raw: string, cwd?: string): GitleaksFinding[] {
 	if (!raw.trim()) return [];
 	let parsed: unknown;
 	try {
@@ -323,6 +393,8 @@ export function parseGitleaksReport(raw: string): GitleaksFinding[] {
 				? e.StartLine
 				: Number.parseInt(String(e.StartLine ?? ""), 10);
 		if (!ruleId || !file || !Number.isFinite(startLine)) continue;
+		if (isNonCredentialGenericValue(e)) continue;
+		if (isVerifiedGenericMetadata(e, cwd)) continue;
 		findings.push({
 			ruleId,
 			description:

@@ -21,6 +21,8 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import { loadWebTreeSitter } from "./deps/web-tree-sitter.js";
+import { findNearestMarkerRoot } from "./path-utils.js";
+import { resolveImportToFiles } from "./review-graph/import-resolvers.js";
 import { getProjectIgnoreMatcher, isExcludedDirName } from "./file-utils.js";
 import {
 	downloadGrammar,
@@ -1094,6 +1096,7 @@ export class TreeSitterClient {
 								entry.postFilterParams,
 								captures,
 								tree.rootNode,
+								filePath,
 							)
 						) {
 							continue;
@@ -1806,6 +1809,200 @@ export class TreeSitterClient {
 		return "";
 	}
 
+	/** A private transport callback inherits its sole SDK caller’s configured URL. */
+	private isPrivateSdkFetchHook(url: TreeSitterNode, root: TreeSitterNode, filePath: string): boolean {
+		const nodesOf = (start: TreeSitterNode): TreeSitterNode[] => {
+			const nodes: TreeSitterNode[] = []; const pending = [start];
+			while (pending.length && nodes.length < NO_NESTED_ANCHOR_VISIT_CAP) { const node = pending.pop()!; nodes.push(node); pending.push(...node.children); }
+			return pending.length ? [] : nodes;
+		};
+		const nodes = nodesOf(root);
+		if (!nodes.length || nodes.some(node => node.type === "ERROR")) return false;
+		let fn: TreeSitterNode | null | undefined = url.parent;
+		while (fn && fn.type !== "arrow_function") {
+			if (["function_declaration", "function_expression", "generator_function", "generator_function_declaration", "method_definition"].includes(fn.type)) return false;
+			fn = fn.parent;
+		}
+		const declaration = fn?.parent;
+		if (declaration?.type !== "variable_declarator" || declaration.parent?.parent?.type !== "program" || !declaration.parent.children.some(node => node.type === "const")) return false;
+		const name = declaration.childForFieldName?.("name")?.text;
+		const parameter = fn?.childForFieldName?.("parameters")?.children.find(node => node.isNamed && node.type !== "comment");
+		const inputName = parameter?.type === "identifier" ? parameter.text : parameter?.childForFieldName?.("pattern")?.text;
+		if (!name || url.type !== "identifier" || url.text !== inputName) return false;
+		if (nodes.some(node => node.type === "variable_declarator" && node.childForFieldName?.("name")?.text === inputName)) return false;
+		if (nodes.some(node => ["assignment_expression", "augmented_assignment_expression"].includes(node.type) &&
+			(node.childForFieldName?.("left")?.text === inputName || node.childForFieldName?.("left")?.childForFieldName?.("object")?.text === inputName))) return false;
+		const references = nodes.filter(node => ["identifier", "shorthand_property_identifier"].includes(node.type) && node.text === name && node.startIndex !== declaration.childForFieldName?.("name")?.startIndex);
+		if (references.length !== 1) return false;
+		const hook = references[0].parent;
+		const global = hook?.parent?.parent;
+		const options = global?.parent;
+		const call = options?.parent?.parent;
+		if (hook?.type !== "pair" || hook.childForFieldName?.("key")?.text !== "fetch" || global?.type !== "pair" || global.childForFieldName?.("key")?.text !== "global" || call?.type !== "call_expression") return false;
+		const callDeclaration = call.parent;
+		const callScope = callDeclaration?.parent?.parent;
+		if (callDeclaration?.type !== "variable_declarator" || !(callScope?.type === "program" || (callScope?.type === "export_statement" && callScope.parent?.type === "program"))) return false;
+		const factory = call.childForFieldName?.("function");
+		if (factory?.type !== "identifier") return false;
+		const factoryImport = nodes.find(node => node.type === "import_specifier" && node.childForFieldName?.("name")?.text === "createClient" &&
+			(node.childForFieldName?.("alias") ?? node.childForFieldName?.("name"))?.text === factory.text);
+		let importStatement = factoryImport?.parent;
+		while (importStatement && importStatement.type !== "import_statement") importStatement = importStatement.parent;
+		if (importStatement?.childForFieldName?.("source")?.text.slice(1, -1) !== "@supabase/supabase-js") return false;
+		const args = call.childForFieldName?.("arguments")?.children.filter(node => node.isNamed && node.type !== "comment");
+		if (args?.length !== 3 || args[2].startIndex !== options?.startIndex) return false;
+		const fixedBase = (value: TreeSitterNode | undefined, sourceRoot: TreeSitterNode, sourceFile: string, depth = 0): boolean => {
+			if (!value || depth > 2) return false;
+			if (value.type === "as_expression") return fixedBase(value.children.find(node => node.isNamed), sourceRoot, sourceFile, depth);
+			if (value.type === "identifier") return fixedBase(this.resolveFileConstValueNode(value.text, sourceRoot) ?? undefined, sourceRoot, sourceFile, depth + 1);
+			if (value.type === "string") return true;
+			if (/^import\.meta\.env\.VITE_[A-Z0-9_]+$/.test(value.text)) return !nodesOf(sourceRoot).some(node =>
+				["assignment_expression", "augmented_assignment_expression"].includes(node.type) && node.childForFieldName?.("left")?.text === value.text);
+			if (value.type !== "member_expression" || depth > 0) return false;
+			const object = value.childForFieldName?.("object"); const property = value.childForFieldName?.("property")?.text;
+			if (object?.type !== "identifier" || !property) return false;
+			const imported = nodes.find(node => node.type === "import_specifier" && (node.childForFieldName?.("alias") ?? node.childForFieldName?.("name"))?.text === object.text);
+			let statement = imported?.parent; while (statement && statement.type !== "import_statement") statement = statement.parent;
+			const module = statement?.childForFieldName?.("source")?.text.slice(1, -1);
+			const importedName = imported?.childForFieldName?.("name")?.text;
+			const cwd = findNearestMarkerRoot(path.dirname(sourceFile), ["package.json"], { boundaries: [".git"] });
+			if (!module || !importedName || !cwd) return false;
+			const targets = resolveImportToFiles(cwd, sourceFile, "typescript", module);
+			const parser = this.parsers.get("typescript");
+			if (targets.length !== 1 || !parser || fs.statSync(targets[0]).size > 256_000) return false;
+			const tree = parser.parse(fs.readFileSync(targets[0], "utf-8"));
+			try {
+				const config = this.resolveFileConstValueNode(importedName, tree.rootNode);
+				if (config?.type !== "as_expression" || !/\bas\s+const$/.test(config.text)) return false;
+				const objectValue = config.children.find(node => node.isNamed);
+				if (objectValue?.type !== "object") return false;
+				const fields = objectValue.children.filter(node => node.isNamed && node.type !== "comment");
+				if (fields.some(node => node.type !== "pair")) return false;
+				const matches = fields.filter(node => node.childForFieldName?.("key")?.text === property);
+				return matches.length === 1 && fixedBase(matches[0].childForFieldName?.("value") ?? undefined, tree.rootNode, targets[0], 1);
+			} finally { (tree as TreeSitterTree & { delete?: () => void }).delete?.(); }
+		};
+		return fixedBase(args[0], root, filePath);
+	}
+
+	private isProvenHtmlSanitizer(
+		value: TreeSitterNode | undefined,
+		root: TreeSitterNode,
+		filePath: string,
+		depth = 0,
+	): boolean {
+		if (value?.type !== "call_expression" || depth > 1) return false;
+		const fn = value.childForFieldName?.("function");
+		const binding = fn?.type === "member_expression" ? fn.childForFieldName?.("object") : fn;
+		if (binding?.type !== "identifier") return false;
+		const name = binding.text;
+		const nodes: TreeSitterNode[] = [];
+		const pending = [root];
+		while (pending.length && nodes.length < NO_NESTED_ANCHOR_VISIT_CAP) {
+			const node = pending.pop()!;
+			nodes.push(node);
+			pending.push(...node.children);
+		}
+		if (pending.length || nodes.some(node => node.type === "ERROR")) return false;
+		const containsName = (node: TreeSitterNode) => nodes.some(child => child.startIndex >= node.startIndex && child.endIndex <= node.endIndex && child.text === name);
+		if (nodes.some(node =>
+			(["formal_parameters", "catch_clause", "object_pattern", "array_pattern"].includes(node.type) && containsName(node)) ||
+			(node.type === "variable_declarator" && node.childForFieldName?.("name")?.text === name) ||
+			(node.type === "arrow_function" && node.childForFieldName?.("parameter")?.text === name) ||
+			(["assignment_expression", "augmented_assignment_expression"].includes(node.type) && !!node.childForFieldName?.("left") && containsName(node.childForFieldName!("left")!)),
+		)) return false;
+		const imports = nodes.filter(node => node.type === "import_statement").filter(node => {
+			const clause = node.children.find(child => child.type === "import_clause");
+			return clause && nodes.some(child => child.startIndex >= clause.startIndex && child.endIndex <= clause.endIndex &&
+				((child.type === "identifier" && child.parent?.type === "import_clause" && child.text === name) ||
+				(child.type === "import_specifier" && (child.childForFieldName?.("alias") ?? child.childForFieldName?.("name"))?.text === name)));
+		});
+		if (imports.length !== 1) return false;
+		const source = imports[0].childForFieldName?.("source")?.text.slice(1, -1);
+		if (!source) return false;
+		if (source === "dompurify") {
+			if (fn?.type !== "member_expression" || fn.childForFieldName?.("property")?.text !== "sanitize") return false;
+			const defaultImport = imports[0].children.find(node => node.type === "import_clause")?.children.find(node => node.type === "identifier" && node.text === name);
+			if (!defaultImport) return false;
+			// An escaped library object can be reconfigured or mutated through an
+			// alias. Only direct member use retains local sanitizer provenance.
+			if (nodes.some(node => ["identifier", "shorthand_property_identifier"].includes(node.type) && node.text === name && node.startIndex !== defaultImport.startIndex &&
+				!(node.parent?.type === "member_expression" && node.parent.childForFieldName?.("object")?.startIndex === node.startIndex))) return false;
+			if (nodes.some(node => node.type === "member_expression" && node.childForFieldName?.("object")?.text === name && node.childForFieldName?.("property")?.text !== "sanitize")) return false;
+			const args = value.childForFieldName?.("arguments")?.children.filter(child => child.isNamed && child.type !== "comment") ?? [];
+			if (args.length === 1) return true;
+			if (args.length !== 2 || args[1].type !== "object") return false;
+			return args[1].children.filter(child => child.isNamed && child.type !== "comment").every(option => {
+				if (option.type !== "pair") return false;
+				const key = option.childForFieldName?.("key")?.text;
+				const optionValue = option.childForFieldName?.("value");
+				if (key === "USE_PROFILES") return /^\{\s*html\s*:\s*true\s*,?\s*\}$/.test(optionValue?.text ?? "");
+				if (key !== "ALLOWED_TAGS" && key !== "ALLOWED_ATTR") return false;
+				if (optionValue?.type !== "array") return false;
+				return optionValue.children.filter(child => child.isNamed && child.type !== "comment").every(child => child.type === "string" && !child.text.includes("\\") &&
+					(key === "ALLOWED_TAGS" ? !/^(script|style|iframe|object|embed|svg|math|link|meta|base)$/i.test(child.text.slice(1, -1)) : !/^(on|srcdoc)/i.test(child.text.slice(1, -1))));
+			});
+		}
+		if (fn?.type !== "identifier") return false;
+		const imported = nodes.find(node => node.type === "import_specifier" && node.startIndex >= imports[0].startIndex && node.endIndex <= imports[0].endIndex &&
+			(node.childForFieldName?.("alias") ?? node.childForFieldName?.("name"))?.text === name)?.childForFieldName?.("name")?.text;
+		if (!imported) return false;
+		const cwd = findNearestMarkerRoot(path.dirname(filePath), ["package.json"], { boundaries: [".git"] });
+		if (!cwd) return false;
+		const targets = resolveImportToFiles(cwd, filePath, "tsx", source);
+		if (targets.length !== 1 || fs.statSync(targets[0]).size > 256_000) return false;
+		const parser = this.parsers.get("tsx");
+		if (!parser) return false;
+		const tree = parser.parse(fs.readFileSync(targets[0], "utf-8"));
+		try {
+			const exported = tree.rootNode.children.filter(node => node.type === "export_statement")
+				.flatMap(node => node.children).filter(node => node.type === "function_declaration" && node.childForFieldName?.("name")?.text === imported);
+			if (exported.length !== 1) return false;
+			const body = exported[0].childForFieldName?.("body")?.children.filter(node => node.isNamed && node.type !== "comment");
+			if (body?.length !== 1 || body[0].type !== "return_statement") return false;
+			return this.isProvenHtmlSanitizer(body[0].children.find(node => node.isNamed), tree.rootNode, targets[0], depth + 1);
+		} finally { (tree as TreeSitterTree & { delete?: () => void }).delete?.(); }
+	}
+
+	private isStaticSqlExpression(
+		node: TreeSitterNode | undefined,
+		root: TreeSitterNode,
+		seen = new Set<string>(),
+	): boolean {
+		if (!node || seen.size > 32) return false;
+		if (node.type === "string" || node.type === "number") return true;
+		if (node.type === "template_string") {
+			return node.children.filter(child => child.type === "template_substitution")
+				.every(child => this.isStaticSqlExpression(child.children.find(part => part.isNamed), root, new Set(seen)));
+		}
+		if (node.type !== "identifier" || seen.has(node.text)) return false;
+		const value = this.resolveFileConstValueNode(node.text, root);
+		if (!value) return false;
+		// A uniquely named const in another function is not visible here.
+		const scope = value.parent?.parent?.parent;
+		let enclosing: TreeSitterNode | null | undefined = node;
+		while (enclosing && !(enclosing.startIndex === scope?.startIndex && enclosing.endIndex === scope?.endIndex && enclosing.type === scope?.type)) enclosing = enclosing.parent;
+		if (!enclosing) return false;
+		// The shared const resolver rejects duplicate declarations/writes. Also
+		// reject parameters, imports and destructuring bindings with this name.
+		const pending = [root];
+		while (pending.length) {
+			const current = pending.pop()!;
+			if (["formal_parameters", "catch_clause", "import_clause", "object_pattern", "array_pattern"].includes(current.type) ||
+				(current.parent?.type === "arrow_function" && current.parent.childForFieldName?.("parameter")?.startIndex === current.startIndex)) {
+				const bindings = [current];
+				while (bindings.length) {
+					const binding = bindings.pop()!;
+					if (binding.type === "identifier" && binding.text === node.text) return false;
+					bindings.push(...binding.children);
+				}
+			}
+			pending.push(...current.children);
+		}
+		seen.add(node.text);
+		return this.isStaticSqlExpression(value, root, seen);
+	}
+
 	/**
 	 * Resolves `name` (as used in the *same file*) to a provably fixed URL:
 	 * a `const` declarator whose initializer is a string literal, or a
@@ -2183,6 +2380,7 @@ export class TreeSitterClient {
 		postFilterParams: any,
 		captures: Record<string, TreeSitterNode>,
 		rootNode?: TreeSitterNode,
+		filePath?: string,
 	): boolean {
 		/**
 		 * Extract the list of declared slot names from a class_definition's
@@ -3164,12 +3362,29 @@ export class TreeSitterClient {
 						c.isNamed && !["comment", "nil", "nil_literal"].includes(c.type),
 				);
 			}
+			case "html_sanitizer_provenance": {
+				if (!rootNode || !filePath) return true;
+				try {
+					const expression = captures.ATTRIBUTE?.children.find(node => node.type === "jsx_expression");
+					const object = expression?.children.find(node => node.type === "object");
+					const fields = object?.children.filter(node => node.isNamed && node.type !== "comment");
+					if (fields?.length !== 1 || fields[0].type !== "pair" || fields[0].childForFieldName?.("key")?.text !== "__html") return true;
+					return !this.isProvenHtmlSanitizer(fields[0].childForFieldName?.("value") ?? undefined, rootNode, filePath);
+				} catch { return true; }
+			}
+			case "sql_dynamic_composition":
+				return !rootNode || !this.isStaticSqlExpression(
+					captures.INTERPOLATION?.children.find(child => child.isNamed), rootNode,
+				);
 			case "ts_command_injection_sink":
 				return (
 					captures.MOD?.text === "child_process" &&
 					/^(exec|execSync)$/.test(captures.FN?.text ?? "")
 				);
 			case "ts_ssrf_sink": {
+				if (rootNode && filePath && captures.URL) {
+					try { if (this.isPrivateSdkFetchHook(captures.URL, rootNode, filePath)) return false; } catch { /* Unknown hooks retain the finding. */ }
+				}
 				const fn = captures.FN?.text ?? "";
 				const obj = captures.OBJ?.text ?? "";
 				const urlText = captures.URL?.text ?? "";
@@ -3652,6 +3867,7 @@ export class TreeSitterClient {
 								postFilterParams,
 								captures,
 								tree.rootNode,
+								filePath,
 							)
 						) {
 							continue;

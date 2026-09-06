@@ -220,6 +220,28 @@ export function normalizeMapKey(filePath: string): string {
 	return normalizeFilePath(filePath);
 }
 
+/** Physical identity for externally supplied aliases; not a display or storage root. */
+export function normalizePhysicalMapKey(filePath: string): string {
+	// macOS can host both case-sensitive and case-insensitive volumes. Let
+	// the filesystem resolve existing aliases instead of folding case globally.
+	if (process.platform === "darwin" && !isWindowsPath(filePath)) {
+		let current = path.resolve(filePath);
+		const tail: string[] = [];
+		for (;;) {
+			try {
+				return path.join(realpathSync.native(current), ...tail.reverse());
+			} catch {
+				// Canonicalize the existing ancestor, preserving missing names.
+				const parent = path.dirname(current);
+				if (parent === current) break;
+				tail.push(path.basename(current));
+				current = parent;
+			}
+		}
+	}
+	return normalizeFilePath(filePath);
+}
+
 /**
  * Human-facing path relative to a project root when the file is inside it.
  *
@@ -462,9 +484,9 @@ export function isExternalOrVendorFile(
 	filePath: string,
 	projectRoot: string,
 ): boolean {
-	if (!isUnderDir(filePath, projectRoot)) return true;
-	const normalized = normalizeFilePath(filePath);
-	const rootNorm = normalizeFilePath(projectRoot);
+	const normalized = normalizePhysicalMapKey(filePath);
+	const rootNorm = normalizePhysicalMapKey(projectRoot);
+	if (!isUnderDir(normalized, rootNorm)) return true;
 	const rel = normalized.startsWith(rootNorm + "/")
 		? normalized.slice(rootNorm.length + 1)
 		: normalized;

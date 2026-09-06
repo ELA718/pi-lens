@@ -15,6 +15,8 @@ import * as path from "node:path";
 import { getProjectDataDir } from "./file-utils.js";
 import { findNearestMarkerRoot } from "./path-utils.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { loadAstGrepNapi } from "./deps/ast-grep-napi.js";
+import { tokenizeShellCommand } from "./bash-file-access.js";
 import {
 	createAvailabilityChecker,
 	getManagedToolEnvironment,
@@ -300,7 +302,130 @@ export class KnipClient {
 			};
 		}
 
-		return this.dropOverridePinnedDeps(this.parseOutput(output), targetDir);
+		const runtimeResult = await this.dropResolvedDenoImports(
+			this.dropOverridePinnedDeps(this.parseOutput(output), targetDir),
+			targetDir,
+		);
+		return this.dropDeclaredK6Imports(runtimeResult, targetDir);
+	}
+
+	private async dropDeclaredK6Imports(result: KnipResult, targetDir: string): Promise<KnipResult> {
+		if (!result.unlistedDeps.some(issue => issue.type === "unlisted" && issue.name === "k6")) return result;
+		try {
+			const root = fs.realpathSync(targetDir);
+			const withinRoot = (file: string) => {
+				const relative = path.relative(root, file);
+				return !relative.startsWith("..") && !path.isAbsolute(relative);
+			};
+			const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf-8"));
+			const declared = new Set<string>();
+			const inspect = (source: string, followShell: boolean) => {
+				// Heredocs and command redefinitions need a full shell evaluator;
+				// never interpret their text as a runtime declaration.
+				if (source.includes("<<") || /\bk6\s*\(\s*\)|\balias\s+k6\b/.test(source)) return;
+				for (const segment of tokenizeShellCommand(source)) {
+					if (segment.unsupported) continue;
+					const tokens = [...segment.tokens];
+					if (tokens[0] === "if") tokens.shift();
+					if (tokens[0] === "!") tokens.shift();
+					if (tokens.length === 3 && tokens[0] === "k6" && tokens[1] === "run" && /^[\w./-]+$/.test(tokens[2])) {
+						const file = fs.realpathSync(path.resolve(root, tokens[2]));
+						if (withinRoot(file)) declared.add(file);
+					} else if (followShell && tokens.length === 2 && ["bash", "sh"].includes(tokens[0]) && /^[\w./-]+$/.test(tokens[1])) {
+						const script = fs.realpathSync(path.resolve(root, tokens[1]));
+						if (withinRoot(script) && fs.statSync(script).size < 256_000) inspect(fs.readFileSync(script, "utf-8"), false);
+					}
+				}
+			};
+			for (const command of Object.values(pkg.scripts ?? {})) {
+				if (typeof command !== "string") continue;
+				try { inspect(command, true); } catch { /* Invalid declarations do not establish a runtime. */ }
+			}
+			if (declared.size === 0) return result;
+			const { parse, Lang } = await loadAstGrepNapi();
+			const resolved = new Set<KnipIssue>();
+			for (const issue of result.unlistedDeps) {
+				if (issue.type !== "unlisted" || issue.name !== "k6" || !issue.file) continue;
+				const file = fs.realpathSync(path.resolve(root, issue.file));
+				if (!declared.has(file)) continue;
+				const ast = parse(Lang.JavaScript, fs.readFileSync(file, "utf-8")).root();
+				if (ast.find({ rule: { kind: "ERROR" } })) continue;
+				const imports = ast.findAll({ rule: { kind: "import_statement" } }).map(node => node.field("source")?.text().slice(1, -1)).filter((source): source is string => !!source && (source === "k6" || source.startsWith("k6/")));
+				if (imports.length > 0 && imports.every(source => ["k6", "k6/http", "k6/metrics"].includes(source))) resolved.add(issue);
+			}
+			const issues = result.issues.filter(issue => !resolved.has(issue));
+			return { ...result, issues, unlistedDeps: result.unlistedDeps.filter(issue => !resolved.has(issue)), summary: `Found ${issues.length} issues` };
+		} catch { return result; }
+	}
+
+	/** Knip treats npm:/jsr: protocols as Node package names. Remove that
+	 * classification only after the owning runtime resolves the actual imports.
+	 * A missing runtime, stale source, or incomplete graph retains the finding. */
+	private async dropResolvedDenoImports(result: KnipResult, targetDir: string): Promise<KnipResult> {
+		const candidates = result.unlistedDeps.filter(issue =>
+			issue.type === "unlisted" && (issue.name === "npm" || issue.name === "jsr") && issue.file && issue.line,
+		);
+		if (candidates.length === 0) return result;
+		const groups = new Map<string, { config: string; imports: { issue: KnipIssue; file: string; content: string; specifier: string; boundary: [string, boolean][] }[] }>();
+		try {
+			const { parse, Lang } = await loadAstGrepNapi();
+			const root = fs.realpathSync(targetDir);
+			for (const issue of candidates) {
+				try {
+					const file = fs.realpathSync(path.resolve(targetDir, issue.file!));
+					const relative = path.relative(root, file);
+					if (relative.startsWith("..") || path.isAbsolute(relative)) continue;
+					let dir = path.dirname(file);
+					let configPath: string | undefined;
+					const boundary: [string, boolean][] = [];
+					while (true) {
+						for (const marker of ["deno.json", "deno.jsonc", "package.json"]) { const markerPath = path.join(dir, marker); boundary.push([markerPath, fs.existsSync(markerPath)]); }
+						configPath = ["deno.json", "deno.jsonc"].map(name => path.join(dir, name)).find(candidate => fs.existsSync(candidate));
+						if (configPath || fs.existsSync(path.join(dir, "package.json")) || dir === root) break;
+						dir = path.dirname(dir);
+					}
+					if (!configPath) continue;
+					const content = fs.readFileSync(file, "utf-8");
+					const ast = parse(file.endsWith(".tsx") ? Lang.Tsx : Lang.TypeScript, content).root();
+					if (ast.find({ rule: { kind: "ERROR" } })) continue;
+					const imports = ast.findAll({ rule: { any: [{ kind: "import_statement" }, { kind: "export_statement" }] } })
+						.filter(node => node.range().start.line + 1 <= issue.line! && node.range().end.line + 1 >= issue.line!)
+						.map(node => node.field("source")?.text()).filter((text): text is string => !!text);
+					if (imports.length !== 1) continue;
+					const specifier = imports[0].slice(1, -1);
+					if (!specifier.startsWith(`${issue.name}:`) || /[\\\s]/.test(specifier)) continue;
+					let group = groups.get(configPath);
+					if (!group) {
+						group = { config: fs.readFileSync(configPath, "utf-8"), imports: [] };
+						groups.set(configPath, group);
+					}
+					group.imports.push({ issue, file, content, specifier, boundary });
+				} catch { /* Unreadable or malformed source cannot justify removal. */ }
+			}
+		} catch { return result; }
+
+		const resolved = new Set<KnipIssue>();
+		const deadline = Date.now() + ANALYSIS_TIMEOUT_MS;
+		for (const [configPath, group] of groups) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) break;
+			const imports = [...new Set(group.imports.map(item => item.specifier))];
+			const entrypoint = `data:application/typescript,${encodeURIComponent(imports.map(specifier => `import ${JSON.stringify(specifier)};`).join("\n"))}`;
+			try {
+				const validation = await safeSpawnAsync("deno", ["info", "--no-lock", "--node-modules-dir=none", "--json", "--config", configPath, entrypoint], { cwd: targetDir, timeout: remaining });
+				if (validation.error || validation.status !== 0) continue;
+				const graph = JSON.parse(validation.stdout ?? "");
+				const hasError = (value: unknown): boolean => !!value && typeof value === "object" && Object.entries(value).some(([key, child]) => key === "error" || hasError(child));
+				if (!Array.isArray(graph.modules) || graph.modules.length === 0 || !graph.roots?.includes(entrypoint) || hasError(graph)) continue;
+				if (fs.readFileSync(configPath, "utf-8") !== group.config) continue;
+				for (const item of group.imports) {
+					if (fs.readFileSync(item.file, "utf-8") === item.content && fs.realpathSync(path.resolve(targetDir, item.issue.file!)) === item.file && item.boundary.every(([marker, existed]) => fs.existsSync(marker) === existed)) resolved.add(item.issue);
+				}
+			} catch { /* Failed validation is not evidence that an import is clean. */ }
+		}
+		if (resolved.size === 0) return result;
+		const issues = result.issues.filter(issue => !resolved.has(issue));
+		return { ...result, issues, unlistedDeps: result.unlistedDeps.filter(issue => !resolved.has(issue)), summary: `Found ${issues.length} issues` };
 	}
 
 	/**

@@ -1574,6 +1574,40 @@ Mock the **environment** (tool presence, network, abort/error injection) — nev
 - The LSP runner's real-dispatch coverage lives in `lsp-real-runner.test.ts`: it registers the stdio fake server from `tests/fixtures/fake-lsp-server.mjs` as a workspace custom server for a test-only extension, then exercises the production `LSPService` and runner with `makeRealRunnerEnv`. Keep server launch/protocol, diagnostics, conversion, and code-action fetching real; environment setup (custom config and binary-presence skip) is the only test seam.
 - Mocked control-flow tests (availability gates, error paths) stay legitimate and complement the above; so do the ~20 CLI runner tests that mock `safeSpawnAsync` — the seam there is an external binary, with real coverage in the nightly `tool-smoke.yml`.
 
+## Diagnostic precision and reviewed runtime imports
+
+Use `normalizePhysicalMapKey` for macOS file identity in diagnostic anchors,
+turn-state maps, and vendor boundary checks. Resolve existing filesystem aliases
+without folding case for missing names. Keep display paths and project-store
+roots unchanged so canonicalization does not orphan existing state. Test fixture
+relative paths must resolve both anchors before counting parent segments. (#6)
+
+Knip protocol findings require runtime evidence: a nearest Deno boundary, an
+AST-bound npm:/jsr: import, and a successful bounded `deno info` graph. Keep
+findings when the runtime is unavailable, resolution fails, or source/config
+boundaries change. Resolution may populate Deno's global cache, but must not
+execute application code, change lockfiles, or create project node_modules.
+k6 builtins require a declared package-script invocation; do not infer k6 from
+an import alone or execute load tests to establish runtime ownership.
+
+Generic-secret narrowing applies only to exact protocol identifier bindings,
+recognizable incomplete/synthetic JWTs, and verified metadata. Provider-specific
+credential rules and opaque values remain active, including in tests. SQL
+composition must resolve to visible, unique immutable constants; dynamic,
+shadowed and unresolved bindings stay findings. SSRF inspects the destination
+argument, not request options. Private Supabase transport hooks require a sole
+SDK registration and a configured destination; exported or independently called
+hooks remain unproven. HTML exemptions require an imported DOMPurify sanitizer
+or a directly verified wrapper with safe literal options; re-read wrappers when
+cached callers are scanned again. Never trust a sanitizer's name alone.
+Sanitizer objects must stay local to direct member calls: aliases, argument
+escapes, bracket access, and unknown named imports invalidate provenance.
+Count shorthand object references when proving SDK hooks private; do not carry
+the hook parameter's URL provenance across nested function boundaries.
+
+Shell tokenization treats unquoted newlines as command boundaries. Whitespace
+handling must not consume a newline before separator handling sees it.
+
 ## Commit conventions
 
 - Always include the GitHub issue number in the commit subject line: `(closes #NNN)` or `(refs #NNN)`.

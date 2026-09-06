@@ -38,6 +38,8 @@ metavars:
   - SQL_FUNC
   - INTERPOLATION
 
+post_filter: sql_dynamic_composition
+
 has_fix: false
 
 tags:

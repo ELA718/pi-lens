@@ -129,7 +129,9 @@ describe("vendored CodeRabbit ast-grep rules", () => {
 				fs.writeFileSync(path.join(fixtures, `empty.${extension}`), "");
 			}
 			const relativeRuleDir = path
-				.relative(env.tmpDir, source!.dir)
+				// Resolve both anchors before counting `..`: macOS /var is a
+				// symlink to /private/var, adding a physical directory level.
+				.relative(fs.realpathSync(env.tmpDir), fs.realpathSync(source!.dir))
 				.replace(/\\/g, "/");
 			const configPath = path.join(env.tmpDir, "sgconfig.yml");
 			fs.writeFileSync(

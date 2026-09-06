@@ -13,6 +13,7 @@ import {
 	normalizeEphemeralMapKey,
 	normalizeFilePath,
 	normalizeMapKey,
+	normalizePhysicalMapKey,
 	pathToUri,
 	splitPathSegments,
 	toPosix,
@@ -21,6 +22,43 @@ import {
 	walkUpDirs,
 } from "../../clients/path-utils.js";
 import { setupTestEnvironment } from "./test-utils.js";
+
+describe.skipIf(process.platform !== "darwin")("macOS physical path identity", () => {
+	it("resolves existing aliases without changing display keys or missing-name case", () => {
+		const env = setupTestEnvironment("pi-lens-physical-path-");
+		try {
+			const file = path.join(env.tmpDir, "MixedCase.ts");
+			fs.writeFileSync(file, "");
+			const alias = path.join(env.tmpDir, "alias.ts");
+			fs.symlinkSync(file, alias);
+			expect(normalizePhysicalMapKey(alias)).toBe(normalizePhysicalMapKey(file));
+			expect(normalizeMapKey(file)).toBe(file);
+			if (fs.existsSync(file.toUpperCase())) {
+				expect(normalizePhysicalMapKey(file.toUpperCase())).toBe(normalizePhysicalMapKey(file));
+			}
+			const missing = path.join(env.tmpDir, "NewDir", "NewFile.ts");
+			expect(normalizePhysicalMapKey(missing)).toBe(path.join(fs.realpathSync.native(env.tmpDir), "NewDir", "NewFile.ts"));
+			expect(isExternalOrVendorFile(missing, env.tmpDir)).toBe(false);
+		} finally { env.cleanup(); }
+	});
+
+	it("keeps symlink escapes and vendor aliases outside the pipeline", () => {
+		const env = setupTestEnvironment("pi-lens-physical-boundary-");
+		try {
+			const root = path.join(env.tmpDir, "project");
+			fs.mkdirSync(path.join(root, "node_modules"), { recursive: true });
+			const outside = path.join(env.tmpDir, "outside.ts");
+			fs.writeFileSync(outside, "");
+			const vendor = path.join(root, "node_modules", "vendor.ts");
+			fs.writeFileSync(vendor, "");
+			for (const [name, target] of [["escape.ts", outside], ["vendor-alias.ts", vendor]]) {
+				const alias = path.join(root, name);
+				fs.symlinkSync(target, alias);
+				expect(isExternalOrVendorFile(alias, root)).toBe(true);
+			}
+		} finally { env.cleanup(); }
+	});
+});
 
 describe("isWindowsPath (#1213 review pins)", () => {
 	it("matches drive-prefixed and UNC shapes only", async () => {

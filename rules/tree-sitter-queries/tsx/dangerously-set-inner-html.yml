@@ -29,10 +29,13 @@ description: |
 query: |
   (jsx_attribute
     (property_identifier) @ATTR
-    (#match? @ATTR "dangerouslySetInnerHTML"))
+    (#match? @ATTR "^dangerouslySetInnerHTML$")) @ATTRIBUTE
 
 metavars:
   - ATTR
+  - ATTRIBUTE
+
+post_filter: html_sanitizer_provenance
 
 tags:
   - security

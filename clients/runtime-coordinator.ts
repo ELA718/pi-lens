@@ -7,7 +7,7 @@ import type { WordIndex } from "./word-index.js";
 import type { CascadeRun } from "./cascade-types.js";
 import type { CodeQualityWarningRecord } from "./code-quality-warnings.js";
 import type { FileComplexity } from "./complexity-client.js";
-import { normalizeMapKey } from "./path-utils.js";
+import { normalizeMapKey, normalizePhysicalMapKey } from "./path-utils.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { ReadGuard } from "./read-guard.js";
 import type { RuleScanResult } from "./rules-scanner.js";
@@ -94,9 +94,9 @@ export class RuntimeCoordinator {
 		coldSnapshotTouches: 0,
 	};
 	private _complexityBaselines = new Map<string, FileComplexity>();
-	private readonly _fixedThisTurn = new PathKeyedMap<true>(normalizeMapKey);
-	private readonly _writtenThisTurn = new PathKeyedMap<true>(normalizeMapKey);
-	private readonly _autofixDemotedThisTurn = new PathKeyedMap<true>(normalizeMapKey);
+	private readonly _fixedThisTurn = new PathKeyedMap<true>(normalizePhysicalMapKey);
+	private readonly _writtenThisTurn = new PathKeyedMap<true>(normalizePhysicalMapKey);
+	private readonly _autofixDemotedThisTurn = new PathKeyedMap<true>(normalizePhysicalMapKey);
 	private readonly _reportedThisTurn = new Set<string>();
 	private _projectRulesScan: RuleScanResult = {
 		rules: [],

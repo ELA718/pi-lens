@@ -123,7 +123,7 @@ export function tokenizeShellCommand(command: string): ShellCommandSegment[] {
 			while (i + 1 < command.length && command[i + 1] !== "\n") i++;
 			continue;
 		}
-		if (/\s/.test(ch)) {
+		if (/\s/.test(ch) && ch !== "\n") {
 			flushWord();
 			continue;
 		}
