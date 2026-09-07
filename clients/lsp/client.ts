@@ -692,12 +692,18 @@ export interface LSPClientState {
 		string,
 		{ version: number; hash: string }
 	>;
-	/** #1095: the content binding for the diagnostics currently stored for a path
-	 *  — {version, contentHash} of the document those diagnostics were computed
-	 *  against. Set only when the accepted publish carried a version; a version-
-	 *  less server never populates this, so its binding reads "unknown" and
-	 *  behavior is unchanged. Kept in lockstep with `pushDiagnostics`: written on
-	 *  publish accept, cleared by `clearDiagnosticsForPath`. */
+	/** Fail-closed proof for versionless push diagnostics. It survives clears for
+	 * the client lifetime so edits, pre-open pushes, and close/reopen cannot regain
+	 * eligibility merely because later disk bytes match. */
+	readonly versionlessBindingEligibility: Map<
+		string,
+		{ eligible: boolean; version: number; contentHash?: string }
+	>;
+	/** #1095: the content binding for diagnostics currently stored for a path.
+	 * Versioned pushes bind to the matching sent payload. A versionless push binds
+	 * only while `versionlessBindingEligibility` proves an unchanged first-open
+	 * generation; edits, pre-open pushes, and close/reopen permanently invalidate
+	 * that proof for this client. Kept in lockstep with `pushDiagnostics`. */
 	readonly diagnosticBindings: Map<string, StoredDiagnosticBinding>;
 	/** #1104: the server-issued `resultId` from the last `textDocument/diagnostic`
 	 *  pull for a path (primary or a `relatedDocuments` entry), so the NEXT pull
@@ -1125,11 +1131,36 @@ function recordSentContent(
 	normalizedPath: string,
 	version: number,
 	content: string,
+	lifecycle: "open" | "change" | "reopen",
 ): void {
-	state.documentContentHashes.set(normalizedPath, {
-		version,
-		hash: hashDiagnosticContent(content),
-	});
+	const previous = state.documentContentHashes.get(normalizedPath);
+	const contentHash = hashDiagnosticContent(content);
+	const eligibility = state.versionlessBindingEligibility.get(normalizedPath);
+	if (lifecycle === "open" && !eligibility) {
+		state.versionlessBindingEligibility.set(normalizedPath, {
+			eligible: true,
+			version,
+			contentHash,
+		});
+	} else if (
+		lifecycle === "change" &&
+		eligibility?.eligible &&
+		previous?.hash === contentHash
+	) {
+		// A duplicate warmup send did not change the semantic input. Keep the
+		// first-open proof, but advance it to the exact payload version just sent.
+		state.versionlessBindingEligibility.set(normalizedPath, {
+			eligible: true,
+			version,
+			contentHash,
+		});
+	} else {
+		state.versionlessBindingEligibility.set(normalizedPath, {
+			eligible: false,
+			version,
+		});
+	}
+	state.documentContentHashes.set(normalizedPath, { version, hash: contentHash });
 }
 
 // Methods that can be registered dynamically and map to operationSupport keys
@@ -1228,6 +1259,16 @@ export function setupIncomingHandlers(
 		}) => {
 			const filePath = uriToPath(params.uri);
 			const normalizedPath = normalizeMapKey(filePath);
+			if (
+				params.version === undefined &&
+				!state.openDocuments.has(normalizedPath) &&
+				!state.pendingOpens.has(normalizedPath)
+			) {
+				state.versionlessBindingEligibility.set(normalizedPath, {
+					eligible: false,
+					version: -1,
+				});
+			}
 			// A server can flush a queued publish after didClose during teardown.
 			// Do not resurrect diagnostics or their content binding for a document
 			// that is no longer open on this client.
@@ -1295,17 +1336,31 @@ export function setupIncomingHandlers(
 				}
 				recordBinding();
 			};
-			// #1095: bind the just-stored diagnostics to the content they were
-			// computed against. Only when the server reported a version AND we still
-			// hold the sent-content fingerprint for exactly that version — otherwise
-			// no contentHash is recorded, so the binding reads "unknown" and a
-			// version-less server behaves exactly as before. Runs at the same
-			// write-time moment as `pushDiagnostics.set` (superseded pushes are
-			// dropped before this via `isSupersededPush`, so a binding never lags the
-			// latest sent version).
+			// #1095: bind accepted diagnostics to an exact sent payload. Versioned
+			// pushes require the matching sent version. Versionless pushes require the
+			// lifetime eligibility proof established by first didOpen and invalidated
+			// by any ambiguous lifecycle transition. Disk equality is never evidence.
+			// Runs at the same write-time moment as `pushDiagnostics.set`.
 			const recordBinding = (): void => {
 				if (docVersion === undefined) {
-					state.diagnosticBindings.delete(normalizedPath);
+					const sent = state.documentContentHashes.get(normalizedPath);
+					const eligibility =
+						state.versionlessBindingEligibility.get(normalizedPath);
+					if (
+						eligibility?.eligible &&
+						eligibility.contentHash &&
+						sent?.version === eligibility.version &&
+						sent.hash === eligibility.contentHash &&
+						(state.openDocuments.has(normalizedPath) ||
+							state.pendingOpens.has(normalizedPath))
+					) {
+						state.diagnosticBindings.set(normalizedPath, {
+							version: eligibility.version,
+							contentHash: eligibility.contentHash,
+						});
+					} else {
+						state.diagnosticBindings.delete(normalizedPath);
+					}
 					return;
 				}
 				const sent = state.documentContentHashes.get(normalizedPath);
@@ -1976,7 +2031,7 @@ export async function handleNotifyOpen(
 			await safeSendNotification(state.connection, "textDocument/didOpen", {
 				textDocument: { uri, languageId, version, text: content },
 			});
-			recordSentContent(state, normalizedPath, version, content);
+			recordSentContent(state, normalizedPath, version, content, "reopen");
 			state.openDocuments.add(normalizedPath);
 			state.openDocumentUris?.set(normalizedPath, uri);
 			return;
@@ -1985,7 +2040,7 @@ export async function handleNotifyOpen(
 			textDocument: { uri, version },
 			contentChanges: [{ text: content }],
 		});
-		recordSentContent(state, normalizedPath, version, content);
+		recordSentContent(state, normalizedPath, version, content, "change");
 		return;
 	}
 
@@ -2023,7 +2078,7 @@ export async function handleNotifyOpen(
 	await safeSendNotification(state.connection, "textDocument/didOpen", {
 		textDocument: { uri, languageId, version: 0, text: content },
 	});
-	recordSentContent(state, normalizedPath, 0, content);
+	recordSentContent(state, normalizedPath, 0, content, "open");
 	state.pendingOpens.delete(normalizedPath);
 	state.openDocuments.add(normalizedPath);
 	state.closedDocuments?.delete(normalizedPath);
@@ -2048,7 +2103,7 @@ export async function handleNotifyChange(
 		state.documentVersions.set(normalizedPath, 0);
 		state.documentOpenedAt.set(normalizedPath, Date.now());
 		state.diagnosticPublicationCounts.set(normalizedPath, 0);
-		recordSentContent(state, normalizedPath, 0, content);
+		recordSentContent(state, normalizedPath, 0, content, "open");
 		state.openDocuments.add(normalizedPath);
 		state.openDocumentUris?.set(normalizedPath, uri);
 		return;
@@ -2063,7 +2118,7 @@ export async function handleNotifyChange(
 		textDocument: { uri, version },
 		contentChanges: [{ text: content }],
 	});
-	recordSentContent(state, normalizedPath, version, content);
+	recordSentContent(state, normalizedPath, version, content, "change");
 }
 
 /** Close a document through the same lifecycle path exposed by the client. */
@@ -2081,6 +2136,10 @@ export async function closeDocument(
 	});
 	state.openDocuments.delete(normalizedPath);
 	state.closedDocuments?.add(normalizedPath);
+	state.versionlessBindingEligibility.set(normalizedPath, {
+		eligible: false,
+		version: state.documentVersions.get(normalizedPath) ?? -1,
+	});
 	state.openDocumentUris?.delete(normalizedPath);
 	state.documentVersions.delete(normalizedPath);
 	state.documentOpenedAt.delete(normalizedPath);
@@ -2606,6 +2665,7 @@ export async function createLSPClient(options: {
 		documentVersions: new Map(),
 		diagnosticDocVersions: new Map(),
 		documentContentHashes: new Map(),
+		versionlessBindingEligibility: new Map(),
 		diagnosticBindings: new Map(),
 		pullResultIds: new Map(),
 		workspacePullResultCache: new Map(),
