@@ -7,7 +7,7 @@
  * - Platform-specific handling
  */
 
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import {
 	access,
 	readFile,
@@ -55,6 +55,8 @@ import { createLombokJdtlsArgs } from "./lombok.js";
 import { resolveJavaRuntimeEnv } from "./jvm-runtime.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { getRubyVersionDirNamesSync } from "./ruby-drive-dirs.js";
+import { load as loadYaml } from "../deps/js-yaml.js";
+import { minimatch } from "../deps/minimatch.js";
 
 // --- Types ---
 
@@ -2883,11 +2885,43 @@ const AST_GREP_EXTENSIONS: readonly string[] = Array.from(
 	),
 );
 
+function isAstGrepNativePath(filePath: string): boolean {
+	const extension = path.extname(filePath).toLowerCase();
+	if (extension !== ".jsonc" && extension !== ".json5") return true;
+	const config = findLocalSgconfig(path.dirname(filePath));
+	if (!config) return false;
+	try {
+		const parsed = loadYaml(readFileSync(config, "utf8")) as {
+			languageGlobs?: unknown;
+		};
+		if (parsed?.languageGlobs === undefined) return false;
+		if (
+			typeof parsed.languageGlobs !== "object" ||
+			parsed.languageGlobs === null ||
+			Array.isArray(parsed.languageGlobs)
+		) return true;
+		const configured = Object.entries(parsed.languageGlobs).find(
+			([language]) => language.toLowerCase() === "json",
+		)?.[1];
+		if (configured === undefined) return false;
+		if (
+			!Array.isArray(configured) ||
+			configured.some((pattern) => typeof pattern !== "string")
+		) return true;
+		return configured.some(
+			(pattern) => minimatch(path.basename(filePath), pattern, { dot: true }),
+		);
+	} catch {
+		return true;
+	}
+}
+
 export const AstGrepServer: LSPServerInfo = {
 	id: "ast-grep",
 	name: "ast-grep structural linter",
 	role: "auxiliary",
 	extensions: AST_GREP_EXTENSIONS,
+	pathFilter: isAstGrepNativePath,
 	// Attaches everywhere (#239 Phase 2): prefer a project `sgconfig.y[a]ml` root,
 	// else the repo root (.git) or cwd — like Opengrep. When there's no project
 	// sgconfig the spawn launches with `--config <shipped baseline>` so the team's

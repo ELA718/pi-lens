@@ -64,6 +64,43 @@ describe("lsp server policy", () => {
 		expect(missing).toEqual([]);
 	});
 
+	it("admits native ast-grep JSON paths and explicit JSON extension overrides", async () => {
+		const { AstGrepServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ast-json-"));
+		dirs.push(tmp);
+		const json = path.join(tmp, "config.json");
+		const nested = path.join(tmp, "nested");
+		fs.mkdirSync(nested);
+		const jsonc = path.join(nested, "config.jsonc");
+		const json5 = path.join(nested, "config.json5");
+
+		expect(AstGrepServer.pathFilter?.(json)).toBe(true);
+		expect(AstGrepServer.pathFilter?.(jsonc)).toBe(false);
+		expect(AstGrepServer.pathFilter?.(json5)).toBe(false);
+
+		fs.writeFileSync(
+			path.join(tmp, "sgconfig.yml"),
+			"languageGlobs:\n  json: ['*.jsonc', '*.json5']\n",
+		);
+		expect(AstGrepServer.pathFilter?.(jsonc)).toBe(true);
+		expect(AstGrepServer.pathFilter?.(json5)).toBe(true);
+
+		fs.writeFileSync(
+			path.join(tmp, "sgconfig.yml"),
+			"languageGlobs:\n  json: ['nested/*.jsonc']\n",
+		);
+		expect(AstGrepServer.pathFilter?.(jsonc)).toBe(false);
+
+		fs.writeFileSync(
+			path.join(tmp, "sgconfig.yml"),
+			"languageGlobs:\n  json: ['**/*.jsonc']\n",
+		);
+		expect(AstGrepServer.pathFilter?.(jsonc)).toBe(true);
+
+		fs.writeFileSync(path.join(tmp, "sgconfig.yml"), "languageGlobs: [\n");
+		expect(AstGrepServer.pathFilter?.(jsonc)).toBe(true);
+	});
+
 	it("uses the enclosing Gradle settings project instead of a nested module", async () => {
 		const { JavaServer } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-java-root-"));
