@@ -2033,10 +2033,13 @@ export class TreeSitterClient {
 		const hasCompetingBinding = (
 			reference: TreeSitterNode,
 			name: string,
-			nodes: readonly TreeSitterNode[],
-			treeRoot: TreeSitterNode,
-			allowedDeclarator?: TreeSitterNode,
+			context: {
+				nodes: readonly TreeSitterNode[];
+				treeRoot: TreeSitterNode;
+				allowedDeclarator?: TreeSitterNode;
+			},
 		) => {
+			const { nodes, treeRoot, allowedDeclarator } = context;
 			if (
 				this.isImportedBinding(name, treeRoot) ||
 				this.isShadowedByEnclosingParam(reference, name)
@@ -2161,13 +2164,11 @@ export class TreeSitterClient {
 				);
 				return (
 					initializer !== null &&
-					!hasCompetingBinding(
-						candidate,
-						candidate.text,
+					!hasCompetingBinding(candidate, candidate.text, {
 						nodes,
 						treeRoot,
-						initializer.parent ?? undefined,
-					) &&
+						allowedDeclarator: initializer.parent ?? undefined,
+					}) &&
 					prove(initializer, treeRoot, sourceFile, depth + 1)
 				);
 			}
@@ -2370,7 +2371,7 @@ export class TreeSitterClient {
 								return (
 									constructor?.type !== "identifier" ||
 									constructor.text !== "Set" ||
-									hasCompetingBinding(constructor, "Set", nodes, treeRoot)
+									hasCompetingBinding(constructor, "Set", { nodes, treeRoot })
 								);
 							})
 						)
