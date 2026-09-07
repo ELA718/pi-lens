@@ -4,8 +4,17 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { parseGitleaksReport } from "../../clients/gitleaks-client.js";
+import { parseGitleaksReport, parseGitleaksReportWithProvenance } from "../../clients/gitleaks-client.js";
 import { setupTestEnvironment } from "./test-utils.js";
+
+function commitFixture(cwd: string, sourcePath: string): string {
+	execFileSync("git", ["init", "-q"], { cwd });
+	execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
+	execFileSync("git", ["config", "user.name", "Test"], { cwd });
+	execFileSync("git", ["add", "--", sourcePath], { cwd });
+	execFileSync("git", ["commit", "-qm", "fixture"], { cwd });
+	return execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf-8" }).trim();
+}
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });
@@ -27,6 +36,10 @@ function finding(file: string, match: string, secret: string, startLine: number,
 
 function scan(cwd: string, file: string, match: string, secret: string, startLine: number, rule?: string) {
 	return parseGitleaksReport(JSON.stringify([finding(file, match, secret, startLine, rule)]), cwd);
+}
+
+function historicalScan(cwd: string, file: string, match: string, secret: string, startLine: number, rule?: string, signal?: AbortSignal) {
+	return parseGitleaksReportWithProvenance(JSON.stringify([finding(file, match, secret, startLine, rule)]), cwd, signal);
 }
 
 function writeAudit(cwd: string, sourcePath: string, digest: string, extra = "") {
@@ -81,21 +94,111 @@ describe("generic-api-key source hash provenance", () => {
 		expect(scan(env.tmpDir, symlink.file, symlink.match, digest, symlink.line)).toHaveLength(1);
 	});
 
-	it("retains historical, duplicate, and malformed metadata", () => {
+	it("removes a historical digest proven by its envelope commit", async () => {
+		const env = fixture();
+		const commit = commitFixture(env.tmpDir, env.sourcePath);
+		fs.writeFileSync(env.fullSourcePath, "changed after evidence\n");
+		const file = path.join(env.tmpDir, "historical-proven.json");
+		fs.writeFileSync(file, `{"priorRecounts":[{"verifiedSourceCommit":"${commit}","sourceSha256":{${JSON.stringify(env.sourcePath)}:"${env.digest}"}}]}\n`);
+		expect(await historicalScan(env.tmpDir, file, `token.test.ts\":\"${env.digest}`, env.digest, 1)).toEqual([]);
+	});
+
+	it("retains hostile historical proof payloads", async () => {
+		const env = fixture();
+		const commit = commitFixture(env.tmpDir, env.sourcePath);
+		fs.writeFileSync(env.fullSourcePath, "changed after evidence\n");
+		const blobId = execFileSync("git", ["rev-parse", `${commit}:${env.sourcePath}`], { cwd: env.tmpDir, encoding: "utf-8" }).trim();
+		const cases = [
+			[`{"verifiedSourceCommit":"${"a".repeat(40)}","sourceSha256":{${JSON.stringify(env.sourcePath)}:"${env.digest}"}}`, "token.test.ts", env.digest],
+			[`{"verifiedSourceCommit":"${blobId}","sourceSha256":{${JSON.stringify(env.sourcePath)}:"${env.digest}"}}`, "token.test.ts", env.digest],
+			[`{"verifiedSourceCommit":"${commit}","sourceSha256":{"../escape.ts":"${env.digest}"}}`, "escape.ts", env.digest],
+			[`{"verifiedSourceCommit":"${commit}","sourceSha256":{${JSON.stringify(env.sourcePath)}:"${"a".repeat(64)}"}}`, "token.test.ts", "a".repeat(64)],
+			[`{"verifiedSourceCommit":"${commit}"},{"sourceSha256":{${JSON.stringify(env.sourcePath)}:"${env.digest}"}}`, "token.test.ts", env.digest],
+			[`{"verifiedSourceCommit":"${commit}","verifiedSourceCommit":"${commit}","sourceSha256":{${JSON.stringify(env.sourcePath)}:"${env.digest}"}}`, "token.test.ts", env.digest],
+			[`{"verifiedSourceCommit":"${commit}","sourceSha256":{${JSON.stringify(env.sourcePath)}:"${env.digest}",${JSON.stringify(env.sourcePath)}:"${env.digest}"}}`, "token.test.ts", env.digest],
+		] as const;
+		for (const [index, [body, matchedPath, secret]] of cases.entries()) {
+			const file = path.join(env.tmpDir, `hostile-${index}.json`);
+			fs.writeFileSync(file, `{"priorRecounts":[${body}]}\n`);
+			expect(await historicalScan(env.tmpDir, file, `${matchedPath}\":\"${secret}`, secret, 1)).toHaveLength(1);
+		}
+		const replacement = "replacement object bytes\n";
+		fs.writeFileSync(env.fullSourcePath, replacement);
+		execFileSync("git", ["add", "--", env.sourcePath], { cwd: env.tmpDir });
+		execFileSync("git", ["commit", "-qm", "replacement"], { cwd: env.tmpDir });
+		const replacementCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: env.tmpDir, encoding: "utf-8" }).trim();
+		execFileSync("git", ["replace", commit, replacementCommit], { cwd: env.tmpDir });
+		const replacementDigest = createHash("sha256").update(replacement).digest("hex");
+		const file = path.join(env.tmpDir, "replacement.json");
+		fs.writeFileSync(file, `{"priorRecounts":[{"verifiedSourceCommit":"${commit}","sourceSha256":{${JSON.stringify(env.sourcePath)}:"${replacementDigest}"}}]}\n`);
+		expect(await historicalScan(env.tmpDir, file, `token.test.ts\":\"${replacementDigest}`, replacementDigest, 1)).toHaveLength(1);
+	});
+
+	it("retains duplicate reports, provider rules, cancellation, symlinks, and oversized blobs", async () => {
+		const env = fixture();
+		const commit = commitFixture(env.tmpDir, env.sourcePath);
+		fs.writeFileSync(env.fullSourcePath, "changed after evidence\n");
+		const file = path.join(env.tmpDir, "proof.json");
+		fs.writeFileSync(file, `{"verifiedSourceCommit":"${commit}","sourceSha256":{${JSON.stringify(env.sourcePath)}:"${env.digest}"}}\n`);
+		const match = `token.test.ts\":\"${env.digest}`;
+		const duplicate = finding(file, match, env.digest, 1);
+		expect(await parseGitleaksReportWithProvenance(JSON.stringify([duplicate, duplicate]), env.tmpDir)).toHaveLength(2);
+		expect(await historicalScan(env.tmpDir, file, match, env.digest, 1, "github-pat")).toHaveLength(1);
+		const controller = new AbortController(); controller.abort();
+		expect(await historicalScan(env.tmpDir, file, match, env.digest, 1, undefined, controller.signal)).toHaveLength(1);
+
+		const linkPath = "linked-token.test.ts";
+		fs.symlinkSync(env.sourcePath, path.join(env.tmpDir, linkPath));
+		execFileSync("git", ["add", "--", linkPath], { cwd: env.tmpDir });
+		execFileSync("git", ["commit", "-qm", "link"], { cwd: env.tmpDir });
+		const linkCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: env.tmpDir, encoding: "utf-8" }).trim();
+		const linkFile = path.join(env.tmpDir, "link-proof.json");
+		fs.writeFileSync(linkFile, `{"verifiedSourceCommit":"${linkCommit}","sourceSha256":{"${linkPath}":"${env.digest}"}}\n`);
+		expect(await historicalScan(env.tmpDir, linkFile, `linked-token.test.ts\":\"${env.digest}`, env.digest, 1)).toHaveLength(1);
+
+		const bigPath = "big.test.ts";
+		const big = Buffer.alloc(1_048_577, 120);
+		fs.writeFileSync(path.join(env.tmpDir, bigPath), big);
+		execFileSync("git", ["add", "--", bigPath], { cwd: env.tmpDir });
+		execFileSync("git", ["commit", "-qm", "big"], { cwd: env.tmpDir });
+		const bigCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: env.tmpDir, encoding: "utf-8" }).trim();
+		const bigDigest = createHash("sha256").update(big).digest("hex");
+		const bigFile = path.join(env.tmpDir, "big-proof.json");
+		fs.writeFileSync(bigFile, `{"verifiedSourceCommit":"${bigCommit}","sourceSha256":{"${bigPath}":"${bigDigest}"}}\n`);
+		expect(await historicalScan(env.tmpDir, bigFile, `big.test.ts\":\"${bigDigest}`, bigDigest, 1)).toHaveLength(1);
+	});
+
+	it("retains proof when local Git times out", async () => {
+		const env = fixture();
+		const commit = commitFixture(env.tmpDir, env.sourcePath);
+		fs.writeFileSync(env.fullSourcePath, "changed after evidence\n");
+		const file = path.join(env.tmpDir, "timeout-proof.json");
+		fs.writeFileSync(file, `{"verifiedSourceCommit":"${commit}","sourceSha256":{${JSON.stringify(env.sourcePath)}:"${env.digest}"}}\n`);
+		const fakeBin = path.join(env.tmpDir, "fake-bin");
+		fs.mkdirSync(fakeBin);
+		fs.writeFileSync(path.join(fakeBin, "git"), `#!${process.execPath}\nsetInterval(() => {}, 1000);\n`, { mode: 0o755 });
+		const savedPath = process.env.PATH;
+		process.env.PATH = `${fakeBin}${path.delimiter}${savedPath ?? ""}`;
+		try {
+			expect(await historicalScan(env.tmpDir, file, `token.test.ts\":\"${env.digest}`, env.digest, 1)).toHaveLength(1);
+		} finally { process.env.PATH = savedPath; }
+	}, 4_000);
+
+	it("retains historical, duplicate, and malformed metadata", async () => {
 		const env = fixture();
 		const historicalFile = path.join(env.tmpDir, "historical.json");
 		const historical = `{\n  "priorRecounts": [{\n    "verifiedSourceCommit": "deadbeef",\n    "sourceSha256": { ${JSON.stringify(env.sourcePath)}: "${env.digest}" }\n  }]\n}\n`;
 		fs.writeFileSync(historicalFile, historical);
-		expect(scan(env.tmpDir, historicalFile, `token.test.ts\": \"${env.digest}\"`, env.digest, 4)).toHaveLength(1);
+		expect(await historicalScan(env.tmpDir, historicalFile, `token.test.ts\": \"${env.digest}\"`, env.digest, 4)).toHaveLength(1);
 
 		const duplicateFile = path.join(env.tmpDir, "duplicate.json");
 		const duplicate = `{\n  "sourceSha256": {\n    ${JSON.stringify(env.sourcePath)}: "${env.digest}",\n    ${JSON.stringify(env.sourcePath)}: "${env.digest}"\n  }\n}\n`;
 		fs.writeFileSync(duplicateFile, duplicate);
-		expect(scan(env.tmpDir, duplicateFile, `token.test.ts\": \"${env.digest}\"`, env.digest, 3)).toHaveLength(1);
+		expect(await historicalScan(env.tmpDir, duplicateFile, `token.test.ts\": \"${env.digest}\"`, env.digest, 3)).toHaveLength(1);
 
 		const malformedFile = path.join(env.tmpDir, "malformed.json");
 		fs.writeFileSync(malformedFile, `{ "sourceSha256": { ${JSON.stringify(env.sourcePath)}: "${env.digest}"`);
-		expect(scan(env.tmpDir, malformedFile, `token.test.ts\": \"${env.digest}\"`, env.digest, 1)).toHaveLength(1);
+		expect(await historicalScan(env.tmpDir, malformedFile, `token.test.ts\": \"${env.digest}`, env.digest, 1)).toHaveLength(1);
 	});
 
 	it.skipIf(process.platform === "win32")("retains a nonregular source without blocking", () => {
