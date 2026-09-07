@@ -35,6 +35,10 @@ import {
 import { shouldPreferPullOnlyDiagnostics } from "../lsp-budget.js";
 import { withDeadline } from "../deadline-utils.js";
 import {
+	filterBoundAstGrepObjectUrlDiagnostics,
+	hasAstGrepObjectUrlCandidate,
+} from "../object-url-provenance.js";
+import {
 	filterBoundAstGrepSqlDiagnostics,
 	hasAstGrepSqlCandidate,
 } from "../sql-provenance.js";
@@ -450,7 +454,13 @@ async function filterClientSqlDiagnostics(
 	content?: string,
 	readContent: (filePath: string) => Promise<string> = (target) => nodeFs.promises.readFile(target, "utf-8"),
 ): Promise<import("./client.js").LSPDiagnostic[]> {
-	if (!hasAstGrepSqlCandidate(diagnostics) || !contentHash || !positionEncoding) return diagnostics;
+	if (
+		(!hasAstGrepSqlCandidate(diagnostics) &&
+			!hasAstGrepObjectUrlCandidate(diagnostics)) ||
+		!contentHash ||
+		!positionEncoding
+	)
+		return diagnostics;
 	let snapshot = content;
 	if (snapshot === undefined) {
 		try {
@@ -459,8 +469,15 @@ async function filterClientSqlDiagnostics(
 			return diagnostics;
 		}
 	}
-	return filterBoundAstGrepSqlDiagnostics(
+	const sqlFiltered = await filterBoundAstGrepSqlDiagnostics(
 		diagnostics,
+		filePath,
+		snapshot,
+		contentHash,
+		positionEncoding,
+	);
+	return filterBoundAstGrepObjectUrlDiagnostics(
+		sqlFiltered,
 		filePath,
 		snapshot,
 		contentHash,

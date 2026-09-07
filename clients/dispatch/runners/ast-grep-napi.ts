@@ -27,6 +27,7 @@ import { enabledAuxiliaryLspServerIds } from "../auxiliary-lsp.js";
 import { classifyDefect } from "../diagnostic-taxonomy.js";
 import { isAuxiliaryLspAlive } from "../../lsp/index.js";
 import { resolveAstGrepNativeExe } from "../../lsp/wait-policy/index.js";
+import { isProvenObjectUrlNapiMatch } from "../../object-url-provenance.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -517,6 +518,10 @@ export function evaluateAstGrepRules(
 					const node = match as SgNode & {
 						range(): { start: { line: number; column: number } };
 					};
+					if (
+						(rule.id === "no-open-redirect" || rule.id === "no-open-redirect-js") &&
+						isProvenObjectUrlNapiMatch(node)
+					) continue;
 					if (
 						(rule.id === "no-sql-in-code" || rule.id === "no-sql-in-code-js") &&
 						isProvenStaticSqlNapiMatch(node)
