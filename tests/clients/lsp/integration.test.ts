@@ -5,7 +5,7 @@
  * Validates the full wire protocol: message framing, initialize handshake,
  * request/response round-trips, and shutdown lifecycle.
  */
-
+import { createHook } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -24,6 +24,7 @@ vi.hoisted(() => {
 import { createLSPClient } from "../../../clients/lsp/client.js";
 import { launchLSP, stopLSP } from "../../../clients/lsp/launch.js";
 import { removeTempDirSync } from "../test-utils.js";
+import { waitFor } from "../interleaving-kit.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FAKE_SERVER_PATH = path.join(
@@ -68,6 +69,53 @@ describe("LSP Client Integration", () => {
 	it("initializes and reports connected", () => {
 		expect(client).toBeDefined();
 		expect(client!.isAlive()).toBe(true);
+	});
+
+	it("disposes the JSON-RPC reader partial-frame timer on shutdown", async () => {
+		await client!.shutdown();
+		client = undefined;
+		await stopLSP(proc!);
+		proc = undefined;
+
+		const partialTimers = new Set<number>();
+		const hook = createHook({
+			init(asyncId, type) {
+				if (
+					type === "Timeout" &&
+					new Error().stack?.includes("setPartialMessageTimer")
+				) {
+					partialTimers.add(asyncId);
+				}
+			},
+			destroy(asyncId) {
+				partialTimers.delete(asyncId);
+			},
+		});
+		hook.enable();
+		try {
+			proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+				cwd: process.cwd(),
+				env: {
+					...process.env,
+					FAKE_LSP_SEND_PARTIAL_AFTER_INITIALIZE: "1",
+				},
+			});
+			client = await createLSPClient({
+				serverId: "fake-partial-frame",
+				process: proc,
+				root: process.cwd(),
+			});
+			await waitFor(() => partialTimers.size, (count) => count > 0, {
+				timeoutMs: 2_000,
+			});
+
+			await client.shutdown();
+			client = undefined;
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(partialTimers.size).toBe(0);
+		} finally {
+			hook.disable();
+		}
 	});
 
 	it("detects operation capabilities from initialize result", () => {

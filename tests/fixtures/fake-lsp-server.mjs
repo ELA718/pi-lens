@@ -84,6 +84,9 @@ function handle(raw) {
 				},
 			},
 		});
+		if (process.env.FAKE_LSP_SEND_PARTIAL_AFTER_INITIALIZE === "1") {
+			process.stdout.write("Content-Length: 1000\r\n\r\n{");
+		}
 		return;
 	}
 

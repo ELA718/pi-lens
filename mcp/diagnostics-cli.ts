@@ -66,6 +66,6 @@ export async function runDiagnostics(
 			),
 		};
 	} finally {
-		resetLSPService({ fast: true, reason: "ci_diagnostics" });
+		await resetLSPService({ reason: "ci_diagnostics" });
 	}
 }

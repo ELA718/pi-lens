@@ -1,5 +1,11 @@
 # pi-lens — agent context
 
+Standalone diagnostics await LSP generation teardown before emitting results.
+Track spawned processes during initialization, await abandoned startup cleanup,
+and terminate only the owned process tree. Dispose partial-frame reader timers
+when the connection closes; a completed shutdown must not retain protocol timers. Preserve fast shutdown for existing
+callers and natural CLI exit; unrelated processes must survive. (refs #6)
+
 Java JDBC index checks inspect the first argument only. Same-name Java calls
 are excluded as overload delegation only when the current method is fixed-arity,
 the call has a different arity, and a unique local fixed-arity overload exists.

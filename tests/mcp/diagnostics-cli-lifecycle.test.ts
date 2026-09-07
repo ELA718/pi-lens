@@ -50,13 +50,20 @@ afterEach(async () => {
 
 const posixIt = process.platform === "win32" ? it.skip : it;
 
-describe("diagnostics CLI analyzer lifecycle", () => {
+describe("diagnostics CLI owned-child lifecycle", () => {
 	posixIt(
-		"exits naturally after a truthful timeout and leaves no analyzer child",
+		"emits JSON after owned cleanup, exits naturally, and leaves unrelated children alone",
 		async () => {
 			tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cli-lifecycle-"));
+			const unrelated = spawn(
+				process.execPath,
+				["-e", "setInterval(() => {}, 1000)"],
+				{ detached: true, stdio: "ignore" },
+			);
+			if (unrelated.pid) livePids.add(unrelated.pid);
 			const binDir = path.join(tmp, "bin");
 			const receipt = path.join(tmp, "trivy-child.json");
+			const lspReceipt = path.join(tmp, "lsp-child.json");
 			fs.mkdirSync(binDir);
 			fs.writeFileSync(path.join(tmp, "package.json"), '{"name":"fixture"}\n');
 			fs.writeFileSync(
@@ -75,6 +82,16 @@ describe("diagnostics CLI analyzer lifecycle", () => {
 					`if(process.argv.includes("--version")){console.log("Version: hermetic");process.exitCode=0;}else{fs.writeFileSync(process.env.PI_LENS_TEST_CHILD_RECEIPT,JSON.stringify({pid:process.pid,ppid:process.ppid,startedAt:new Date().toISOString(),argv:process.argv.slice(2)})+"\\n");setInterval(()=>{},1000);}\n`,
 			);
 			fs.chmodSync(fakeTrivy, 0o755);
+			const fakeJsonLsp = path.join(binDir, "vscode-json-language-server");
+			fs.writeFileSync(
+				fakeJsonLsp,
+				`#!${process.execPath}\n` +
+					`const fs=require("node:fs"),{spawn}=require("node:child_process");\n` +
+					`const child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore"});\n` +
+					`fs.writeFileSync(process.env.PI_LENS_TEST_LSP_RECEIPT,JSON.stringify({pid:process.pid,ppid:process.ppid,childPid:child.pid})+"\\n");\n` +
+					`process.stdin.resume();setInterval(()=>{},1000);\n`,
+			);
+			fs.chmodSync(fakeJsonLsp, 0o755);
 			const fakeOpengrep = path.join(binDir, "opengrep");
 			fs.writeFileSync(
 				fakeOpengrep,
@@ -112,23 +129,43 @@ describe("diagnostics CLI analyzer lifecycle", () => {
 					PATH: [binDir, "/usr/bin", "/bin"].join(path.delimiter),
 					PI_LENS_HOME: path.join(tmp, "pi-lens-home"),
 					PI_LENS_LENS_DIAGNOSTICS_FULL_TIMEOUT_MS: "2000",
+					PI_LENS_LSP_WARMUP_TIMEOUT_MS: "500",
 					PI_LENS_TEST_CHILD_RECEIPT: receipt,
+					PI_LENS_TEST_LSP_RECEIPT: lspReceipt,
 				},
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			let stdout = "";
 			let stderr = "";
-			cli.stdout?.on("data", (chunk) => (stdout += chunk));
+			let ownedPids: number[] = [];
+			let ownedAliveAtOutput: number[] | undefined;
+			cli.stdout?.on("data", (chunk) => {
+				stdout += chunk;
+				ownedAliveAtOutput = ownedPids.filter(isAlive);
+			});
 			cli.stderr?.on("data", (chunk) => (stderr += chunk));
 
 			try {
-				await waitForFile(receipt, 5_000);
+				await Promise.all([
+					waitForFile(receipt, 5_000),
+					waitForFile(lspReceipt, 5_000),
+				]);
 				const child = JSON.parse(fs.readFileSync(receipt, "utf8")) as {
 					pid: number;
 					ppid: number;
 				};
+				const lsp = JSON.parse(fs.readFileSync(lspReceipt, "utf8")) as {
+					pid: number;
+					ppid: number;
+					childPid: number;
+				};
 				livePids.add(child.pid);
+				livePids.add(lsp.pid);
+				livePids.add(lsp.childPid);
+				ownedPids = [child.pid, lsp.pid, lsp.childPid];
 				expect(child.ppid).toBe(cli.pid);
+				expect(lsp.ppid).toBe(cli.pid);
+				expect(isAlive(unrelated.pid!)).toBe(true);
 				const outcome = await Promise.race([
 					new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
 						(resolve) =>
@@ -167,10 +204,18 @@ describe("diagnostics CLI analyzer lifecycle", () => {
 					partial: true,
 					timedOut: true,
 				});
+				expect(ownedAliveAtOutput).toEqual([]);
 				expect(isAlive(child.pid)).toBe(false);
+				expect(isAlive(lsp.pid)).toBe(false);
+				expect(isAlive(lsp.childPid)).toBe(false);
+				expect(isAlive(unrelated.pid!)).toBe(true);
 				livePids.delete(child.pid);
+				livePids.delete(lsp.pid);
+				livePids.delete(lsp.childPid);
 			} finally {
 				await terminate(cli);
+				await terminate(unrelated);
+				if (unrelated.pid) livePids.delete(unrelated.pid);
 			}
 		},
 		12_000,
