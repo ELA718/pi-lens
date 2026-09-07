@@ -1,5 +1,12 @@
 # pi-lens — agent context
 
+Generic secret findings may be excluded as source hashes only when the exact
+reported span is a unique entry in a top-level sourceSha256 map and its digest
+matches bounded current file bytes inside the repository. Historical, duplicate,
+malformed, outside-root, nonregular, oversized, or mismatched proof remains a
+finding. Keep provider-specific rules and unrelated opaque values intact;
+metadata/source reads must not block on FIFOs. (refs #6)
+
 Project scan coverage distinguishes file-budget overflow from entry-budget
 exhaustion. Collectors inspect one additional eligible file to prove overflow;
 an exhausted inventory exactly at the cap remains complete. Explicit file

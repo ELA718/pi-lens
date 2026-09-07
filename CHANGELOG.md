@@ -1,5 +1,7 @@
 # Changelog
 
+- Verify current source-file hashes before excluding generic secret findings; preserve historical and unproven metadata and bound file reads. (refs #6)
+
 All notable changes to pi-lens will be documented in this file.
 
 ## [Unreleased]
