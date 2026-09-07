@@ -26,13 +26,15 @@ query: |
   (method_invocation
     name: (identifier) @METHOD (#match? @METHOD "^(setString|setInt|setLong|setDouble|setBoolean|getString|getInt|getLong|getDouble|getBoolean)$")
     arguments: (argument_list
-      . (decimal_integer_literal) @INDEX
+      (decimal_integer_literal) @INDEX
       (#match? @INDEX "^0+$")) @ARGS)
 
 metavars:
   - METHOD
   - INDEX
   - ARGS
+
+post_filter: java_first_non_comment_argument
 
 tags:
   - reliability

@@ -58,6 +58,24 @@ describe("Java rule applicability", () => {
 		).resolves.toBe(1);
 	});
 
+	it("ignores block and line comments when locating the first argument", async () => {
+		await expect(
+			count(
+				"prepared-statement-valid-indices",
+				`class T { void f() {
+					rs.getInt(/* index */ 0);
+					stmt.setInt(
+						// index
+						0, value);
+					prefs.getInt("key", /* default */ 0);
+					prefs.getInt("key",
+						// default
+						0);
+				} }`,
+			),
+		).resolves.toBe(2);
+	});
+
 	it("excludes only proven fixed-arity overload delegation", async () => {
 		await expect(
 			count(

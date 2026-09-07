@@ -2633,6 +2633,31 @@ export class TreeSitterClient {
 					return true;
 				}
 			}
+			case "java_first_non_comment_argument": {
+				try {
+					const args = captures.ARGS;
+					const index = captures.INDEX;
+					if (!args || !index || args.childCount > NO_NESTED_ANCHOR_VISIT_CAP) {
+						return true;
+					}
+					const parent = args as TreeSitterNode & {
+						child?: (position: number) => TreeSitterNode | null;
+					};
+					if (args.childCount > 0 && !parent.child) return true;
+					for (let position = 0; position < args.childCount; position++) {
+						const argument = parent.child?.(position);
+						if (!argument) return true;
+						if (!argument.isNamed || argument.type.endsWith("comment")) continue;
+						return (
+							argument.startIndex === index.startIndex &&
+							argument.endIndex === index.endIndex
+						);
+					}
+					return true;
+				} catch {
+					return true;
+				}
+			}
 			case "same_method_no_base_case": {
 				try {
 					const method = captures.NAME?.text ?? "";
