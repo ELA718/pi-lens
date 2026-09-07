@@ -1978,6 +1978,134 @@ export class TreeSitterClient {
 		} finally { (tree as TreeSitterTree & { delete?: () => void }).delete?.(); }
 	}
 
+	private isProvenRegExpReceiver(
+		node: TreeSitterNode | undefined,
+		root: TreeSitterNode,
+		depth = 0,
+		boundedNodes?: readonly TreeSitterNode[],
+	): boolean {
+		if (!node || depth > 8) return false;
+		let nodes = boundedNodes;
+		if (!nodes) {
+			const collected: TreeSitterNode[] = [];
+			const pending = [root];
+			while (pending.length > 0 && collected.length < NO_NESTED_ANCHOR_VISIT_CAP) {
+				const current = pending.pop();
+				if (!current) continue;
+				collected.push(current);
+				pending.push(...current.children);
+			}
+			if (pending.length > 0 || collected.some((candidate) => candidate.type === "ERROR")) {
+				return false;
+			}
+			nodes = collected;
+		}
+
+		const containsIdentifier = (container: TreeSitterNode, name: string) =>
+			nodes!.some(
+				(candidate) =>
+					candidate.type === "identifier" &&
+					candidate.text === name &&
+					candidate.startIndex >= container.startIndex &&
+					candidate.endIndex <= container.endIndex,
+			);
+
+		const bindingContainsIdentifier = (
+			container: TreeSitterNode,
+			name: string,
+		) => {
+			const binding =
+				container.type === "catch_clause"
+					? container.childForFieldName?.("parameter")
+					: container.type === "for_in_statement"
+						? container.childForFieldName?.("left")
+						: container;
+			return !!binding && containsIdentifier(binding, name);
+		};
+		if (node.type === "regex") return true;
+		if (node.type === "parenthesized_expression") {
+			return this.isProvenRegExpReceiver(
+				node.children.find((child) => child.isNamed),
+				root,
+				depth + 1,
+				nodes,
+			);
+		}
+		if (node.type === "new_expression" || node.type === "call_expression") {
+			const constructor = node.childForFieldName?.(
+				node.type === "new_expression" ? "constructor" : "function",
+			);
+			if (constructor?.type !== "identifier" || constructor.text !== "RegExp") return false;
+			const shadowsOrWritesGlobal = nodes.some((candidate) => {
+				const name = candidate.childForFieldName?.("name");
+				const left = candidate.childForFieldName?.("left")?.text ?? "";
+				return (
+					(["variable_declarator", "function_declaration", "class_declaration", "type_alias_declaration"].includes(candidate.type) && name?.text === "RegExp") ||
+					(["import_clause", "import_specifier", "namespace_import"].includes(candidate.type) && containsIdentifier(candidate, "RegExp")) ||
+					(["formal_parameters", "catch_clause", "object_pattern", "array_pattern", "for_in_statement"].includes(candidate.type) && bindingContainsIdentifier(candidate, "RegExp")) ||
+					(["assignment_expression", "augmented_assignment_expression"].includes(candidate.type) && /^(?:RegExp|globalThis\.RegExp|RegExp\.prototype(?:\.|$))/.test(left)) ||
+					(candidate.type === "call_expression" && /^(?:Object\.)?defineProperty\((?:RegExp(?:\.prototype)?|globalThis\s*,\s*["']RegExp["'])/.test(candidate.text))
+				);
+			});
+			return !shadowsOrWritesGlobal;
+		}
+		if (node.type !== "identifier") return false;
+
+		const declarators = nodes.filter(
+			(candidate) =>
+				candidate.type === "variable_declarator" &&
+				candidate.childForFieldName?.("name")?.type === "identifier" &&
+				candidate.childForFieldName?.("name")?.text === node.text,
+		);
+		if (declarators.length !== 1) return false;
+		const declarator = declarators[0];
+		const declaration = declarator.parent;
+		const scope = declaration?.parent;
+		const initializer = declarator.childForFieldName?.("value");
+		if (
+			declaration?.type !== "lexical_declaration" ||
+			!declaration.children.some((child) => child.type === "const") ||
+			!scope ||
+			!initializer ||
+			declarator.startIndex >= node.startIndex ||
+			scope.startIndex > node.startIndex ||
+			scope.endIndex < node.endIndex
+		) {
+			return false;
+		}
+
+		const unsafeBindingOrMutation = nodes.some((candidate) => {
+			if (
+				["formal_parameters", "catch_clause", "object_pattern", "array_pattern", "for_in_statement"].includes(candidate.type) &&
+				bindingContainsIdentifier(candidate, node.text)
+			) {
+				return true;
+			}
+			if (candidate.type === "variable_declarator" && candidate !== declarator) {
+				return candidate.childForFieldName?.("value")?.text === node.text;
+			}
+			if (
+				candidate.type === "call_expression" &&
+				candidate.childForFieldName?.("arguments")?.children.some(
+					(argument) => argument.isNamed && argument.text === node.text,
+				)
+			) {
+				return true;
+			}
+			if (!["assignment_expression", "augmented_assignment_expression"].includes(candidate.type)) return false;
+			if (candidate.childForFieldName?.("right")?.text === node.text) return true;
+			const left = candidate.childForFieldName?.("left");
+			if (left?.type === "identifier" && left.text === node.text) return true;
+			if (left?.childForFieldName?.("object")?.text !== node.text) return false;
+			return !(
+				left.childForFieldName?.("property")?.text === "lastIndex" &&
+				candidate.childForFieldName?.("right")?.type === "number"
+			);
+		});
+		if (unsafeBindingOrMutation) return false;
+		return this.isProvenRegExpReceiver(initializer, root, depth + 1, nodes);
+	}
+
 	private isStaticSqlExpression(
 		node: TreeSitterNode | undefined,
 		root: TreeSitterNode,
@@ -3360,6 +3488,10 @@ export class TreeSitterClient {
 					const sqlArg = captures.SQL_ARG ?? captures.INTERPOLATION?.children.find(child => child.isNamed);
 					if (!sqlArg) return true;
 					if (["arrow_function", "function_expression"].includes(sqlArg.type)) return false;
+					if (
+						captures.SQL_FUNC?.text === "exec" &&
+						this.isProvenRegExpReceiver(captures.SQL_RECEIVER, rootNode)
+					) return false;
 					return !this.isStaticSqlExpression(sqlArg, rootNode);
 				}
 			case "ts_command_injection_sink":
