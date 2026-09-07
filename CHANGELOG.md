@@ -14,6 +14,10 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- Workspace diagnostics warm the selected primary language server without
+  waiting for unused alternatives. Selected fallbacks still warm normally,
+  and unavailable or unresponsive providers remain incomplete. (refs #6)
+
 - JSONC and JSON5 diagnostics no longer wait for an ast-grep publication when
   the native default grammar does not admit that extension. Explicit native
   language overrides remain active, and ambiguous configuration stays gated.

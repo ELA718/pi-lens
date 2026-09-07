@@ -1,5 +1,10 @@
 # pi-lens — agent context
 
+Workspace warm-up gates the canonical primary provider actually selected for
+the representative file. Registered alternatives remain selectable fallbacks;
+an unselected fallback cannot mark a healthy primary cold. Preserve the selected
+server/root readiness identity, no-provider failure, and auxiliary aggregation. (refs #6)
+
 Ast-grep JSON admission follows its native extension contract: default JSONC
 and JSON5 files use their JSON language server without an unsupported ast-grep
 wait. Preserve explicit languageGlobs and custom-language extensions. Native
