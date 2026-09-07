@@ -137,6 +137,8 @@ describe("HTML sanitizer provenance", () => {
 		"import purifier from 'dompurify'; const tags = ['p']; tags.push('script'); const view = <div dangerouslySetInnerHTML={{__html: purifier.sanitize(input, {ALLOWED_TAGS: tags})}} />;",
 		"const sanitizeHtml: (value: string) => string = value => value; const view = <div dangerouslySetInnerHTML={{__html: sanitizeHtml(input)}} />;",
 		"import { useMemo } from 'not-react'; import purifier from 'dompurify'; const html = useMemo(() => purifier.sanitize(input), []); const view = <div dangerouslySetInnerHTML={{__html: html}} />;",
+		"import purifier from 'dompurify'; import { useMemo as memo } from 'react'; function View() { function memo() { return input; } return <div dangerouslySetInnerHTML={{__html: memo(() => purifier.sanitize(input), [])}} />; }",
+		"import purifier from 'dompurify'; import { useMemo as memo } from 'react'; function View() { for (var memo of unsafeFunctions) {} return <div dangerouslySetInnerHTML={{__html: memo(() => purifier.sanitize(input), [])}} />; }",
 		"import purifier from 'dompurify'; const view = <div dangerouslySetInnerHTML={{__html: purifier.sanitize(input)}}",
 		"const view = <div dangerouslySetInnerHTML={{__html: '<img src=x onerror=alert(1)>'}} />;",
 		"const view = <div dangerouslySetInnerHTML={{__html: `<img src=x onerror=alert(1)>`}} />;",
@@ -153,6 +155,20 @@ describe("HTML sanitizer provenance", () => {
 			expect((await findings(code)).length).toBeGreaterThan(0);
 		},
 	);
+
+	it.each([
+		"import { clean } from './sanitize'; function View() { function clean(value) { return value; } return <div dangerouslySetInnerHTML={{__html: clean(input)}} />; }",
+		"import { clean } from './sanitize'; function View() { for (var clean of unsafeFunctions) {} return <div dangerouslySetInnerHTML={{__html: clean(input)}} />; }",
+	])("retains shadowed custom imported wrappers: %s", async (code) => {
+		expect(
+			(
+				await findings(
+					code,
+					"import purifier from 'dompurify'; export function clean(value: string) { return purifier.sanitize(value); }",
+				)
+			).length,
+		).toBeGreaterThan(0);
+	});
 
 	it("fails closed for symlinked and oversized sanitizer dependencies", async () => {
 		const safe = "import purifier from 'dompurify'; export function clean(value: string) { return purifier.sanitize(value); }";

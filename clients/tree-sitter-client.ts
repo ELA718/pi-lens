@@ -2018,21 +2018,37 @@ export class TreeSitterClient {
 		) =>
 			left?.startIndex === right.startIndex && left.endIndex === right.endIndex;
 		const hasCompetingBinding = (
-			reference: TreeSitterNode,
 			name: string,
 			context: {
 				nodes: readonly TreeSitterNode[];
-				treeRoot: TreeSitterNode;
 				allowedDeclarator?: TreeSitterNode;
+				allowedImport?: TreeSitterNode;
 			},
 		) => {
-			const { nodes, treeRoot, allowedDeclarator } = context;
-			if (
-				this.isImportedBinding(name, treeRoot) ||
-				this.isShadowedByEnclosingParam(reference, name)
-			)
-				return true;
+			const { nodes, allowedDeclarator, allowedImport } = context;
 			return nodes.some((node) => {
+				if (node.type === "import_statement") {
+					if (allowedImport && sameNode(node, allowedImport)) return false;
+					const clause = node.children.find(
+						(child) => child.type === "import_clause",
+					);
+					return (
+						clause != null &&
+						nodes.some(
+							(child) =>
+								child.startIndex >= clause.startIndex &&
+								child.endIndex <= clause.endIndex &&
+								((child.type === "identifier" &&
+									child.parent?.type === "import_clause" &&
+									child.text === name) ||
+									(child.type === "import_specifier" &&
+										(
+											child.childForFieldName?.("alias") ??
+											child.childForFieldName?.("name")
+										)?.text === name)),
+						)
+					);
+				}
 				if (
 					node.type === "formal_parameters" &&
 					this.paramsBindName(node, name)
@@ -2148,9 +2164,8 @@ export class TreeSitterClient {
 				);
 				return (
 					initializer !== null &&
-					!hasCompetingBinding(candidate, candidate.text, {
+					!hasCompetingBinding(candidate.text, {
 						nodes,
-						treeRoot,
 						allowedDeclarator: initializer.parent ?? undefined,
 					}) &&
 					prove(initializer, treeRoot, sourceFile, depth + 1)
@@ -2164,36 +2179,6 @@ export class TreeSitterClient {
 					: fn;
 			if (binding?.type !== "identifier") return false;
 			const name = binding.text;
-			const containsName = (node: TreeSitterNode) =>
-				nodes.some(
-					(child) =>
-						child.startIndex >= node.startIndex &&
-						child.endIndex <= node.endIndex &&
-						child.text === name,
-				);
-			if (
-				nodes.some(
-					(node) =>
-						([
-							"formal_parameters",
-							"catch_clause",
-							"object_pattern",
-							"array_pattern",
-						].includes(node.type) &&
-							containsName(node)) ||
-						(node.type === "variable_declarator" &&
-							node.childForFieldName?.("name")?.text === name) ||
-						(node.type === "arrow_function" &&
-							node.childForFieldName?.("parameter")?.text === name) ||
-						([
-							"assignment_expression",
-							"augmented_assignment_expression",
-						].includes(node.type) &&
-							node.childForFieldName?.("left") != null &&
-							containsName(node.childForFieldName!("left")!)),
-				)
-			)
-				return false;
 			const imports = nodes
 				.filter((node) => node.type === "import_statement")
 				.filter((node) => {
@@ -2218,6 +2203,13 @@ export class TreeSitterClient {
 					);
 				});
 			if (imports.length !== 1) return false;
+			if (
+				hasCompetingBinding(name, {
+					nodes,
+					allowedImport: imports[0],
+				})
+			)
+				return false;
 			const source = imports[0]
 				.childForFieldName?.("source")
 				?.text.slice(1, -1);
@@ -2355,7 +2347,7 @@ export class TreeSitterClient {
 								return (
 									constructor?.type !== "identifier" ||
 									constructor.text !== "Set" ||
-									hasCompetingBinding(constructor, "Set", { nodes, treeRoot })
+									hasCompetingBinding("Set", { nodes })
 								);
 							})
 						)
