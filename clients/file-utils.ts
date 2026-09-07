@@ -125,7 +125,6 @@ export const EXCLUDED_DIRS = [
 	"vendor", // Go modules, PHP Composer, Ruby Bundler
 	"third_party", // Chromium/Google convention (llama.cpp, sherpa-onnx, gRPC, TF)
 	"third-party",
-	"vendors",
 ];
 
 /**

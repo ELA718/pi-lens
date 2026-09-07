@@ -467,7 +467,6 @@ export function isUnderDir(child: string, parent: string): boolean {
 const VENDOR_DIR_NAMES = new Set([
 	"node_modules",
 	"vendor",
-	"vendors",
 	"third_party",
 	"third-party",
 ]);

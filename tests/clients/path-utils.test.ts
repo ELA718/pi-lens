@@ -559,8 +559,12 @@ describe("isExternalOrVendorFile", () => {
 		expect(isExternalOrVendorFile(`${root}/vendor/dep/file.go`, root)).toBe(true);
 	});
 
-	it("returns true for vendors/", () => {
-		expect(isExternalOrVendorFile(`${root}/vendors/lib.py`, root)).toBe(true);
+	it.each(["vendors/lib.py", "src/domains/directory/vendors/query.ts"])("keeps business source %s internal", (file) => {
+		expect(isExternalOrVendorFile(`${root}/${file}`, root)).toBe(false);
+	});
+
+	it("still excludes dependencies nested inside a business vendors directory", () => {
+		expect(isExternalOrVendorFile(`${root}/src/vendors/node_modules/dep/index.js`, root)).toBe(true);
 	});
 
 	it("returns true for third_party/", () => {

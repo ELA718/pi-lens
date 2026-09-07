@@ -18,6 +18,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { __collectWorkspaceDiagnosticFilesForTest } from "../../../clients/lsp/index.js";
 import { resetProjectLensConfigCache } from "../../../clients/project-lens-config.js";
+import { collectSourceFiles } from "../../../clients/source-filter.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 let tmpDir: string;
@@ -47,6 +48,25 @@ function relUnix(files: string[]): string[] {
 }
 
 describe("LSP workspace-diagnostics exclusion (#243)", () => {
+	it("includes business vendors directories in both source and LSP inventories", async () => {
+		write("src/domains/directory/vendors/query.ts");
+		write("vendors/service.ts");
+		write("src/vendors/node_modules/dep/index.ts");
+		const expected = ["src/domains/directory/vendors/query.ts", "vendors/service.ts"];
+		expect(relUnix(await __collectWorkspaceDiagnosticFilesForTest(tmpDir))).toEqual(expected);
+		expect(relUnix(collectSourceFiles(tmpDir, { extensions: [".ts"] }))).toEqual(expected);
+	});
+
+	it.each([".gitignore", ".pi-lens.json"])("respects explicit vendors exclusions in %s", async (config) => {
+		write("src/vendors/query.ts");
+		write("vendors/dependency.ts");
+		fs.writeFileSync(path.join(tmpDir, config), config === ".gitignore"
+			? "/vendors/\n"
+			: JSON.stringify({ ignore: ["vendors/**"] }));
+		expect(relUnix(await __collectWorkspaceDiagnosticFilesForTest(tmpDir))).toContain("src/vendors/query.ts");
+		expect(relUnix(await __collectWorkspaceDiagnosticFilesForTest(tmpDir))).not.toContain("vendors/dependency.ts");
+	});
+
 	it("excludes default dependency/build dirs via the canonical list", async () => {
 		write("src/real.ts");
 		write("node_modules/dep/index.ts");

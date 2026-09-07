@@ -1,5 +1,12 @@
 # pi-lens — agent context
 
+`vendors` is a business-domain directory name, not an unconditional dependency
+boundary. Keep it out of both `EXCLUDED_DIRS` and `VENDOR_DIR_NAMES`, so source
+walks, LSP inventory and pipeline admission agree. Actual dependency directories
+(`vendor`, `node_modules`, `third_party`, `third-party`) remain excluded;
+repositories using plural `vendors` for dependencies must declare an explicit
+ignore. Preserve user ignores and outside-root/symlink boundaries. (refs #6)
+
 LSP document language selection treats `tsconfig.json`, `jsconfig.json`, and
 their dot-qualified `.json` variants as JSONC before extension lookup. Match
 the basename after canonical separator folding, so nested POSIX/Windows paths
