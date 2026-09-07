@@ -78,11 +78,22 @@ const MAX_METADATA_BYTES = 1_048_576;
 const MAX_SOURCE_BYTES = 1_048_576;
 const MAX_MATCH_BYTES = 4_096;
 const GIT_PROOF_TIMEOUT_MS = 2_000;
+const GIT_PROOF_KILL_GRACE_MS = 100;
+const PROVENANCE_DEADLINE_MS = 5_000;
 const MAX_GIT_IDENTITY_BYTES = 4_096;
 const MAX_JSON_VALUES = 10_000;
 const MAX_HISTORICAL_PROOFS = 128;
 
 interface HistoricalSourceProof { commit: string; sourcePath: string }
+
+interface BoundedFileSnapshot {
+	content: Buffer;
+	dev: number;
+	ino: number;
+	mtimeMs: number;
+	sha256: string;
+	size: number;
+}
 
 interface JsonPropertyRange {
 	key: string;
@@ -111,6 +122,7 @@ function jsonValueEnd(source: string, start: number): number {
 			i = jsonStringEnd(source, i) - 1;
 			if (i < 0) return -1;
 		} else if (source[i] === "{" || source[i] === "[") stack.push(source[i]);
+		if (stack.length > MAX_JSON_VALUES) return -1;
 		else if (source[i] === "}" || source[i] === "]") {
 			stack.pop();
 			if (stack.length === 0) return i + 1;
@@ -139,6 +151,7 @@ function jsonObjectProperties(source: string, start: number, end: number): JsonP
 		const valueStart = i;
 		const valueEnd = jsonValueEnd(source, valueStart);
 		if (valueEnd < 0 || valueEnd > end) return undefined;
+		if (properties.length >= MAX_JSON_VALUES) return undefined;
 		properties.push({ key, valueStart, valueEnd });
 		i = valueEnd;
 	}
@@ -154,6 +167,7 @@ function jsonArrayValues(source: string, start: number, end: number): { valueSta
 		if (i >= end - 1) break;
 		const valueEnd = jsonValueEnd(source, i);
 		if (valueEnd < 0 || valueEnd > end) return undefined;
+		if (values.length >= MAX_JSON_VALUES) return undefined;
 		values.push({ valueStart: i, valueEnd });
 		i = valueEnd;
 	}
@@ -177,12 +191,14 @@ function historicalSourceProof(source: string, matchOffset: number, match: strin
 		if (source[value.valueStart] === "[") {
 			const children = jsonArrayValues(source, value.valueStart, value.valueEnd);
 			if (!children) return undefined;
+			if (stack.length + children.length > MAX_JSON_VALUES) return undefined;
 			stack.push(...children);
 			continue;
 		}
 		if (source[value.valueStart] !== "{") continue;
 		const properties = jsonObjectProperties(source, value.valueStart, value.valueEnd);
 		if (!properties) return undefined;
+		if (stack.length + properties.length > MAX_JSON_VALUES) return undefined;
 		stack.push(...properties);
 		if (new Set(properties.map(property => property.key)).size !== properties.length) continue;
 		const hashes = properties.filter(property => property.key === "sourceSha256");
@@ -200,17 +216,32 @@ function historicalSourceProof(source: string, matchOffset: number, match: strin
 	return proofs.length === 1 ? proofs[0] : undefined;
 }
 
-function runBoundedGit(root: string, args: string[], signal: AbortSignal | undefined, maxBytes: number): Promise<Buffer | undefined> {
-	if (signal?.aborted) return Promise.resolve(undefined);
+function runBoundedGit(root: string, args: string[], signal: AbortSignal | undefined, maxBytes: number, deadlineAt: number): Promise<Buffer | undefined> {
+	const remaining = Math.min(GIT_PROOF_TIMEOUT_MS, deadlineAt - Date.now());
+	if (signal?.aborted || remaining <= 0) return Promise.resolve(undefined);
 	return new Promise(resolve => {
 		const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
 		Object.assign(env, { GIT_LITERAL_PATHSPECS: "1", GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" });
-		const child = spawn("git", ["--no-optional-locks", "-C", root, ...args], { env, shell: false, stdio: ["ignore", "pipe", "ignore"] });
+		const detached = process.platform !== "win32";
+		const child = spawn("git", ["--no-optional-locks", "-C", root, ...args], { detached, env, shell: false, stdio: ["ignore", "pipe", "ignore"] });
 		const chunks: Buffer[] = [];
 		let bytes = 0;
 		let failed = false;
-		const stop = () => { failed = true; child.kill(); };
-		const timer = setTimeout(stop, GIT_PROOF_TIMEOUT_MS);
+		let stopping = false;
+		let forceTimer: NodeJS.Timeout | undefined;
+		const signalOwned = (ownedSignal: NodeJS.Signals) => {
+			if (!child.pid) return;
+			try { if (detached) process.kill(-child.pid, ownedSignal); else child.kill(ownedSignal); } catch { /* already exited */ }
+		};
+		const stop = () => {
+			failed = true;
+			if (stopping) return;
+			stopping = true;
+			signalOwned("SIGTERM");
+			forceTimer = setTimeout(() => signalOwned("SIGKILL"), GIT_PROOF_KILL_GRACE_MS);
+			forceTimer.unref();
+		};
+		const timer = setTimeout(stop, remaining);
 		timer.unref();
 		signal?.addEventListener("abort", stop, { once: true });
 		child.stdout.on("data", (chunk: Buffer) => {
@@ -221,30 +252,31 @@ function runBoundedGit(root: string, args: string[], signal: AbortSignal | undef
 		child.on("error", stop);
 		child.on("close", code => {
 			clearTimeout(timer);
+			if (forceTimer) clearTimeout(forceTimer);
 			signal?.removeEventListener("abort", stop);
 			resolve(!failed && code === 0 ? Buffer.concat(chunks, bytes) : undefined);
 		});
 	});
 }
 
-async function verifyHistoricalSourceProof(root: string, proof: HistoricalSourceProof, secret: string, signal?: AbortSignal): Promise<boolean> {
+async function verifyHistoricalSourceProof(root: string, proof: HistoricalSourceProof, secret: string, deadlineAt: number, signal?: AbortSignal): Promise<boolean> {
 	if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(proof.commit)) return false;
 	if (!proof.sourcePath || proof.sourcePath.includes("\\") || path.posix.normalize(proof.sourcePath) !== proof.sourcePath
 		|| proof.sourcePath.startsWith("../") || path.posix.isAbsolute(proof.sourcePath) || isFullyQualifiedWin32(proof.sourcePath)) return false;
-	const format = (await runBoundedGit(root, ["rev-parse", "--show-object-format"], signal, 16))?.toString().trim();
+	const format = (await runBoundedGit(root, ["rev-parse", "--show-object-format"], signal, 16, deadlineAt))?.toString().trim();
 	if (!format || !["sha1", "sha256"].includes(format) || (format === "sha1" && proof.commit.length !== 40)
 		|| (format === "sha256" && proof.commit.length !== 64)) return false;
-	const type = (await runBoundedGit(root, ["cat-file", "-t", proof.commit], signal, 16))?.toString().trim();
+	const type = (await runBoundedGit(root, ["cat-file", "-t", proof.commit], signal, 16, deadlineAt))?.toString().trim();
 	if (type !== "commit") return false;
-	const treeEntry = await runBoundedGit(root, ["ls-tree", "-z", "--full-tree", proof.commit, "--", proof.sourcePath], signal, MAX_GIT_IDENTITY_BYTES);
+	const treeEntry = await runBoundedGit(root, ["ls-tree", "-z", "--full-tree", proof.commit, "--", proof.sourcePath], signal, MAX_GIT_IDENTITY_BYTES, deadlineAt);
 	if (!treeEntry || treeEntry.at(-1) !== 0 || treeEntry.subarray(0, -1).includes(0)) return false;
 	const separator = treeEntry.indexOf(9);
 	if (separator < 0 || treeEntry.subarray(separator + 1, -1).toString() !== proof.sourcePath) return false;
 	const [mode, kind, objectId] = treeEntry.subarray(0, separator).toString().split(" ");
 	if (!["100644", "100755"].includes(mode) || kind !== "blob" || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(objectId)) return false;
-	const sizeText = (await runBoundedGit(root, ["cat-file", "-s", objectId], signal, 32))?.toString().trim();
+	const sizeText = (await runBoundedGit(root, ["cat-file", "-s", objectId], signal, 32, deadlineAt))?.toString().trim();
 	if (!sizeText || !/^\d+$/.test(sizeText) || Number(sizeText) > MAX_SOURCE_BYTES) return false;
-	const blob = await runBoundedGit(root, ["cat-file", "blob", objectId], signal, MAX_SOURCE_BYTES + 1);
+	const blob = await runBoundedGit(root, ["cat-file", "blob", objectId], signal, MAX_SOURCE_BYTES + 1, deadlineAt);
 	return blob?.length === Number(sizeText) && createHash("sha256").update(blob).digest("hex") === secret;
 }
 
@@ -263,6 +295,33 @@ function readBoundedFile(file: string, maxBytes: number): Buffer | undefined {
 		}
 		return fs.readSync(fd, Buffer.alloc(1), 0, 1, offset) === 0 ? content : undefined;
 	} finally { fs.closeSync(fd); }
+}
+
+function readBoundedSnapshot(file: string, maxBytes: number): BoundedFileSnapshot | undefined {
+	const before = fs.lstatSync(file);
+	if (!before.isFile() || before.size > maxBytes) return undefined;
+	const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+	const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | noFollow);
+	try {
+		const stat = fs.fstatSync(fd);
+		if (!stat.isFile() || stat.dev !== before.dev || stat.ino !== before.ino || stat.size !== before.size || stat.mtimeMs !== before.mtimeMs) return undefined;
+		const content = Buffer.alloc(stat.size);
+		let offset = 0;
+		for (; offset < content.length;) {
+			const bytes = fs.readSync(fd, content, offset, content.length - offset, offset);
+			if (bytes === 0) return undefined;
+			offset += bytes;
+		}
+		if (fs.readSync(fd, Buffer.alloc(1), 0, 1, offset) !== 0) return undefined;
+		const after = fs.fstatSync(fd);
+		if (after.size !== stat.size || after.mtimeMs !== stat.mtimeMs) return undefined;
+		return { content, dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size, sha256: createHash("sha256").update(content).digest("hex") };
+	} finally { fs.closeSync(fd); }
+}
+
+function sameSnapshot(left: BoundedFileSnapshot, right: BoundedFileSnapshot): boolean {
+	return left.dev === right.dev && left.ino === right.ino && left.mtimeMs === right.mtimeMs
+		&& left.size === right.size && left.sha256 === right.sha256;
 }
 
 // --- Detection ---
@@ -636,25 +695,30 @@ export async function parseGitleaksReportWithProvenance(raw: string, cwd?: strin
 		if (key) counts.set(key, (counts.get(key) ?? 0) + 1);
 	}
 	if (counts.size > MAX_HISTORICAL_PROOFS) return parseGitleaksReport(raw, cwd);
+	const deadlineAt = Date.now() + PROVENANCE_DEADLINE_MS;
 	let root: string;
 	try { root = fs.realpathSync(cwd); } catch { return parseGitleaksReport(raw, cwd); }
-	const topLevel = (await runBoundedGit(root, ["rev-parse", "--show-toplevel"], signal, MAX_GIT_IDENTITY_BYTES))?.toString().trim();
+	const topLevel = (await runBoundedGit(root, ["rev-parse", "--show-toplevel"], signal, MAX_GIT_IDENTITY_BYTES, deadlineAt))?.toString().trim();
 	if (!topLevel) return parseGitleaksReport(raw, cwd);
 	try { if (fs.realpathSync(topLevel) !== root) return parseGitleaksReport(raw, cwd); } catch { return parseGitleaksReport(raw, cwd); }
 	const retained: Record<string, unknown>[] = [];
 	for (const entry of entries) {
 		const key = historicalFindingKey(entry);
-		if (!key || counts.get(key) !== 1 || signal?.aborted) { retained.push(entry); continue; }
+		if (!key || counts.get(key) !== 1 || signal?.aborted || Date.now() >= deadlineAt) { retained.push(entry); continue; }
 		try {
-			const file = fs.realpathSync(path.resolve(root, String(entry.File)));
+			const requestedFile = path.resolve(root, String(entry.File));
+			const file = fs.realpathSync(requestedFile);
 			const relative = path.relative(root, file);
 			if (relative.startsWith("..") || path.isAbsolute(relative)) { retained.push(entry); continue; }
-			const metadata = readBoundedFile(file, MAX_METADATA_BYTES);
+			const metadata = readBoundedSnapshot(requestedFile, MAX_METADATA_BYTES);
 			if (!metadata) { retained.push(entry); continue; }
-			const source = metadata.toString("utf-8");
+			const source = metadata.content.toString("utf-8");
 			const matchOffset = reportedMatchOffset(source, entry);
 			const proof = matchOffset === undefined ? undefined : historicalSourceProof(source, matchOffset, String(entry.Match), String(entry.Secret));
-			if (!proof || !await verifyHistoricalSourceProof(root, proof, String(entry.Secret), signal)) retained.push(entry);
+			if (!proof || !await verifyHistoricalSourceProof(root, proof, String(entry.Secret), deadlineAt, signal)) { retained.push(entry); continue; }
+			if (fs.realpathSync(requestedFile) !== file) { retained.push(entry); continue; }
+			const finalMetadata = readBoundedSnapshot(requestedFile, MAX_METADATA_BYTES);
+			if (!finalMetadata || !sameSnapshot(metadata, finalMetadata)) retained.push(entry);
 		} catch { retained.push(entry); }
 	}
 	return parseGitleaksReport(JSON.stringify(retained), cwd);
