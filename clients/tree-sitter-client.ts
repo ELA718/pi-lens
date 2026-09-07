@@ -3682,8 +3682,10 @@ export class TreeSitterClient {
 				return !!left && references.some((reference) => contains(left, reference));
 			});
 		};
+		const isGlobalReference = (use: TreeSitterNode): boolean =>
+			!bindingFor(use) && !this.isImportedBinding(use.text, root) && !this.isShadowedByEnclosingParam(use, use.text);
 		const globalIsUnbound = (use: TreeSitterNode): boolean => {
-			if (bindingFor(use) || this.isImportedBinding(use.text, root) || this.isShadowedByEnclosingParam(use, use.text)) return false;
+			if (!isGlobalReference(use)) return false;
 			return !nodes.some((node) => {
 				if (["assignment_expression", "augmented_assignment_expression", "update_expression"].includes(node.type)) {
 					const target = node.childForFieldName?.("left") ?? node.childForFieldName?.("argument") ?? node.children.find((child) => child.isNamed);
@@ -3705,9 +3707,34 @@ export class TreeSitterClient {
 				return false;
 			});
 		};
+		const globalObjectIsStable = (use: TreeSitterNode): boolean =>
+			nodes.every((node) => {
+				if (node.type !== "identifier" || node.text !== use.text || !isGlobalReference(node)) return true;
+				const parent = node.parent;
+				return parent?.type === "member_expression" && sameNode(parent.childForFieldName?.("object"), node);
+			});
+		const nativeTransformIsStable = (method: string): boolean => {
+			const owners = method === "trim" || method === "toLowerCase" || method === "toUpperCase" || method === "split"
+				? ["String"]
+				: method === "filter" || method === "at" || method === "join"
+					? ["Array"]
+					: method === "slice"
+						? ["String", "Array"]
+						: ["String", "Array", "URL"];
+			return owners.every((owner) => {
+				const references = nodes.filter((node) => node.type === "identifier" && node.text === owner && isGlobalReference(node));
+				return references.every((reference) => {
+					const parent = reference.parent;
+					if (parent?.type === "member_expression" && sameNode(parent.childForFieldName?.("object"), reference)) return parent.childForFieldName?.("property")?.text !== "prototype";
+					if (parent?.type === "call_expression" && sameNode(parent.childForFieldName?.("function"), reference)) return true;
+					if (parent?.type === "new_expression" && sameNode(parent.childForFieldName?.("constructor"), reference)) return true;
+					return false;
+				}) && !nodes.some((node) => node.type === "member_expression" && node.text === `globalThis.${owner}.prototype`);
+			});
+		};
 		const environmentIsStable = (environment: TreeSitterNode): boolean => {
 			const owner = environment.childForFieldName?.("object");
-			if (!owner || (owner.type === "identifier" && !globalIsUnbound(owner))) return false;
+			if (!owner || (owner.type === "identifier" && (!globalIsUnbound(owner) || !globalObjectIsStable(owner)))) return false;
 			for (const candidate of nodes) {
 				if (candidate.type !== "member_expression" || candidate.childForFieldName?.("property")?.text !== "env") continue;
 				const candidateOwner = candidate.childForFieldName?.("object");
@@ -3925,7 +3952,7 @@ export class TreeSitterClient {
 							const owner = receiver.childForFieldName?.("object");
 							return property === undefined && args.length === 1 && args[0].type === "string" && !!owner && ["Deno", "process", "Bun"].includes(owner.text) && globalIsUnbound(owner) && environmentIsStable(receiver);
 						}
-						if (!receiver || !method || !new Set(["trim", "toLowerCase", "toUpperCase", "split", "filter", "at", "slice", "join", "toString"]).has(method)) return false;
+						if (!receiver || !method || !new Set(["trim", "toLowerCase", "toUpperCase", "split", "filter", "at", "slice", "join", "toString"]).has(method) || !nativeTransformIsStable(method)) return false;
 						return trace(receiver, property, ctx, depth + 1) && args.every((arg) => trace(arg, undefined, ctx, depth + 1));
 					}
 					if (callee?.type !== "identifier") return false;

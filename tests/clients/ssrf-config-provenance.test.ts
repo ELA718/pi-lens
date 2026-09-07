@@ -70,6 +70,7 @@ describe("SSRF deployment-configuration provenance", () => {
 		["unrelated catch binding", `try {} catch (Deno) { void Deno; } fetch(Deno.env.get("URL"));`],
 		["unrelated mutable-binding shadow", `const cfg = { url: Deno.env.get("URL") }; function unrelated() { const cfg = { url: request.url }; cfg.url = request.other; } fetch(cfg.url);`],
 		["later safe property read", `const cfg = { url: Deno.env.get("URL") }; function send() { fetch(cfg.url); } function inspect() { return cfg.url; } send();`],
+		["unrelated native prototype shadow", `function unrelated(String: typeof request.runtime) { String.prototype.trim = request.fn; } fetch(Deno.env.get("URL").trim());`],
 		["unrelated class binding", `{ class Deno {} void Deno; } fetch(Deno.env.get("URL"));`],
 	])("removes $0 destinations", async (_label, code) => {
 		expect(await findings(code)).toHaveLength(0);
@@ -77,6 +78,14 @@ describe("SSRF deployment-configuration provenance", () => {
 
 	it.each([
 		["request input", `async function send(request: { url: string }) { await fetch(request.url); }`],
+		["runtime object alias", `const runtime = Deno; runtime.env.set("URL", request.url); fetch(Deno.env.get("URL"));`],
+		["runtime Object.assign mutation", `Object.assign(Deno, { env: request.env }); fetch(Deno.env.get("URL"));`],
+		["runtime unknown mutator", `mutate(Deno); fetch(Deno.env.get("URL"));`],
+		["aliased String prototype mutation", `const NativeString = String; NativeString.prototype.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
+		["globalThis String prototype mutation", `globalThis.String.prototype.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
+		["Array prototype transform mutation", `Array.prototype.join = function () { return request.url; }; fetch(Deno.env.get("URL").split("/").join("/"));`],
+		["String prototype transform mutation", `String.prototype.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
+		["URL prototype transform mutation", `URL.prototype.toString = function () { return request.url; }; fetch(new URL(Deno.env.get("URL")).toString());`],
 		["for-var environment shadow", `function send() { for (var Deno of request.runtimes) {} fetch(Deno.env.get("URL")); }`],
 		["for-const environment shadow", `for (const Deno of request.runtimes) { fetch(Deno.env.get("URL")); }`],
 		["destructured config shadow", `const cfg = { url: Deno.env.get("URL") }; function send() { const { cfg } = request; fetch(cfg.url); }`],
