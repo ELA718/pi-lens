@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createDeadline, yieldIfOverBudget } from "../cooperative-budget.js";
 import { createDispatchContext } from "../dispatch/dispatcher.js";
 import { evaluateRules } from "../dispatch/fact-rule-runner.js";
 import { runProviders } from "../dispatch/fact-runner.js";
@@ -248,12 +249,22 @@ async function scanFileMajorRules(
 	};
 
 	const scan = async (): Promise<void> => {
+		const deadline = createDeadline(8);
 		for (const filePath of files) {
 			// #891: a wasm-level abort poisons the shared parser for the rest of the
 			// process — stop the whole pass, don't keep feeding it files.
 			if (signal?.aborted || isTreeSitterWasmAborted()) {
 				wasmAborted ||= isTreeSitterWasmAborted();
 				break;
+			}
+			// Native rule matching can resolve its promise synchronously for many files.
+			// Yield by elapsed work, not file count, so timers and I/O can progress.
+			if (deadline.expired()) {
+				await yieldIfOverBudget(deadline);
+				if (signal?.aborted || isTreeSitterWasmAborted()) {
+					wasmAborted ||= isTreeSitterWasmAborted();
+					break;
+				}
 			}
 			if (isTestFile(filePath)) continue;
 			const ext = path.extname(filePath);
@@ -433,14 +444,14 @@ export async function scanProjectDiagnostics(
 	const runners: string[] = [];
 	const diagnostics: ProjectDiagnostic[] = [];
 	let wasmAborted = false;
-	let filesScanned = files.length;
+	let filesScanned = 0;
 	if (!signal?.aborted) {
 		// All in-process syntax consumers share one file-major pass (#675/#896).
 		const scanned = await scanFileMajorRules(cwd, files, signal);
 		diagnostics.push(...scanned.treeSitter, ...scanned.factRules);
 		runners.push("tree-sitter", "fact-rules");
 		wasmAborted = scanned.wasmAborted;
-		if (wasmAborted) filesScanned = scanned.filesScanned;
+		filesScanned = signal?.aborted || wasmAborted ? scanned.filesScanned : files.length;
 		if (!signal?.aborted && !wasmAborted) {
 			diagnostics.push(...scanned.astGrep);
 			runners.push("ast-grep-napi");
@@ -470,6 +481,7 @@ export async function scanProjectDiagnostics(
 	if (collected.generatedDirSkips) {
 		snapshot.generatedDirSkips = collected.generatedDirSkips;
 	}
+	if (signal?.aborted) snapshot.scanTruncated = true;
 	if (wasmAborted) {
 		snapshot.scanTruncated = true;
 		snapshot.treeSitterStatus = "wasm_aborted_restart_required";
