@@ -436,15 +436,15 @@ function buildProjectIgnoreMatcher(
 		if (inheritanceCheck) memoPrefix = "A:";
 		else if (isDirectory) memoPrefix = "D:";
 		const memoKey = memoPrefix + resolved;
+		const patternSets = ancestorDirsBetween(
+			resolvedRoot,
+			path.dirname(resolved),
+		).map((dir) => ({ dir, patterns: patternsForDir(dir) }));
 		const cached = patternMemo.get(memoKey);
 		if (cached) return cached;
 		let ignored = false;
 		let layer: GitignorePatternLayer | undefined;
-		for (const dir of ancestorDirsBetween(
-			resolvedRoot,
-			path.dirname(resolved),
-		)) {
-			const dirPatterns = patternsForDir(dir);
+		for (const { dir, patterns: dirPatterns } of patternSets) {
 			if (dirPatterns.length === 0) continue;
 			const normalized = normalizeIgnorePath(path.relative(dir, resolved));
 			for (const pattern of dirPatterns) {
