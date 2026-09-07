@@ -82,6 +82,11 @@ export const LANGUAGE_EXTENSIONS: Record<string, string> = {
 	".zsh": "shellscript",
 	".fish": "fish",
 
+	// PowerShell
+	".ps1": "powershell",
+	".psm1": "powershell",
+	".psd1": "powershell",
+
 	// CMake
 	".cmake": "cmake",
 	"CMakeLists.txt": "cmake",

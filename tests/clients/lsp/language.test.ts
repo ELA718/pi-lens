@@ -7,6 +7,9 @@ describe("lsp language mapping", () => {
 		expect(getLanguageId("src/script.sh")).toBe("shellscript");
 		expect(getLanguageId("src/config.fish")).toBe("fish");
 		expect(getLanguageId("cmake/helpers.cmake")).toBe("cmake");
+		expect(getLanguageId("scripts/task.ps1")).toBe("powershell");
+		expect(getLanguageId("modules/task.psm1")).toBe("powershell");
+		expect(getLanguageId("modules/task.psd1")).toBe("powershell");
 	});
 
 	it("resolves basename-only language ids", () => {

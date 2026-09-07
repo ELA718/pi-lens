@@ -13,6 +13,10 @@ the basename after canonical separator folding, so nested POSIX/Windows paths
 agree; ordinary JSON stays strict. This shared language ID governs didOpen,
 rename reopen, and workspace diagnostics, not diagnostic suppression. (refs #6)
 
+PowerShell `.ps1`, `.psm1`, and `.psd1` documents use the `powershell` LSP
+language ID. Keep this map aligned with `KIND_EXTENSIONS["powershell"]`; server
+selection alone is insufficient because didOpen otherwise sends `plaintext`.
+
 Advisory caches must carry immutable capture provenance and validate it again
 at every delivery surface. A finding is current only when session/turn state
 matches and every affected file is SHA-256-confirmed (size+mtime is only the
