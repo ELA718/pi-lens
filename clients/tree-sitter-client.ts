@@ -2083,7 +2083,13 @@ export class TreeSitterClient {
 					[
 						"function_declaration",
 						"generator_function_declaration",
+						"function_expression",
+						"generator_function",
 						"class_declaration",
+						"abstract_class_declaration",
+						"class",
+						"enum_declaration",
+						"internal_module",
 					].includes(node.type)
 				)
 					return node.childForFieldName?.("name")?.text === name;
