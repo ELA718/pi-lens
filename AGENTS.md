@@ -1,5 +1,11 @@
 # pi-lens — agent context
 
+Versionless diagnostic pushes bind only to an unchanged first-open generation
+on that client. Record the exact sent hash; a duplicate send of identical bytes
+may advance its version. A real edit, pre-open publication, or close/reopen
+permanently invalidates this proof for the client lifetime, even if later disk
+bytes match. Authoritative versioned and pull bindings retain their contracts. (refs #6)
+
 Advertise diagnostic pull support and use a primary server's advertised pull
 contract while preserving auxiliary push waits. A missing or failed primary
 pull stays incomplete; a CSS computation error also invalidates old clean

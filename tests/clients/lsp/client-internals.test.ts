@@ -431,6 +431,7 @@ function createMockState(overrides?: Partial<LSPClientState>): LSPClientState {
 		documentVersions: new Map(),
 		diagnosticDocVersions: new Map(),
 		documentContentHashes: new Map(),
+		versionlessBindingEligibility: new Map(),
 		diagnosticBindings: new Map(),
 		pullResultIds: new Map(),
 		workspacePullResultCache: new Map(),
@@ -1226,6 +1227,104 @@ describe("publishDiagnostics handler — superseded push guard (cache-poisoning 
 
 		expect(state.pushDiagnostics.has(TEST_KEY)).toBe(true);
 		expect(state.diagnosticBindings.has(TEST_KEY)).toBe(false);
+	});
+
+	it("binds a versionless first-open publication to the exact sent content", async () => {
+		const { state, emitPublishDiagnostics } = createCapturingState();
+		const content = "const x = 1;\n";
+		await handleNotifyOpen(state, TEST_FILE, content, "typescript");
+
+		emitPublishDiagnostics({
+			uri: pathToFileURL(TEST_FILE).href,
+			diagnostics: [diagnostic("versionless current diagnostic")],
+		});
+		await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_WAIT_MS));
+
+		expect(state.diagnosticBindings.get(TEST_KEY)).toEqual({
+			version: 0,
+			contentHash: hashDiagnosticContent(content),
+		});
+	});
+
+	it("does not bind a versionless publication after a changed re-edit", async () => {
+		const { state, emitPublishDiagnostics } = createCapturingState();
+		await handleNotifyOpen(state, TEST_FILE, "const x = 1;\n", "typescript");
+		await handleNotifyChange(state, TEST_FILE, "const x = 2;\n");
+
+		emitPublishDiagnostics({
+			uri: pathToFileURL(TEST_FILE).href,
+			diagnostics: [diagnostic("possibly stale diagnostic")],
+		});
+		await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_WAIT_MS));
+
+		expect(state.diagnosticBindings.has(TEST_KEY)).toBe(false);
+	});
+
+	it("does not restore versionless eligibility when a later edit restores the first bytes", async () => {
+		const { state, emitPublishDiagnostics } = createCapturingState();
+		const firstContent = "const x = 1;\n";
+		await handleNotifyOpen(state, TEST_FILE, firstContent, "typescript");
+		await handleNotifyChange(state, TEST_FILE, "const x = 2;\n");
+		await handleNotifyChange(state, TEST_FILE, firstContent);
+
+		emitPublishDiagnostics({
+			uri: pathToFileURL(TEST_FILE).href,
+			diagnostics: [diagnostic("disk-matching but ambiguous diagnostic")],
+		});
+		await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_WAIT_MS));
+
+		expect(state.diagnosticBindings.has(TEST_KEY)).toBe(false);
+	});
+
+	it("does not bind a delayed versionless publication from before close after reopen", async () => {
+		const { state, emitPublishDiagnostics } = createCapturingState();
+		const content = "const x = 1;\n";
+		await handleNotifyOpen(state, TEST_FILE, content, "typescript");
+		await closeDocument(state, TEST_FILE);
+		await handleNotifyOpen(state, TEST_FILE, content, "typescript");
+
+		emitPublishDiagnostics({
+			uri: pathToFileURL(TEST_FILE).href,
+			diagnostics: [diagnostic("delayed diagnostic from the closed generation")],
+		});
+		await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_WAIT_MS));
+
+		expect(state.diagnosticBindings.has(TEST_KEY)).toBe(false);
+	});
+
+	it("does not bind after a versionless publication arrives before first open", async () => {
+		const { state, emitPublishDiagnostics } = createCapturingState();
+		emitPublishDiagnostics({
+			uri: pathToFileURL(TEST_FILE).href,
+			diagnostics: [diagnostic("stale pre-open diagnostic")],
+		});
+		await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_WAIT_MS));
+		await handleNotifyOpen(state, TEST_FILE, "const x = 1;\n", "typescript");
+
+		emitPublishDiagnostics({
+			uri: pathToFileURL(TEST_FILE).href,
+			diagnostics: [diagnostic("ambiguous diagnostic")],
+		});
+		await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_WAIT_MS));
+
+		expect(state.diagnosticBindings.has(TEST_KEY)).toBe(false);
+	});
+
+	it("keeps versionless eligibility across a duplicate same-content warmup send", async () => {
+		const { state, emitPublishDiagnostics } = createCapturingState();
+		const content = "const x = 1;\n";
+		await handleNotifyOpen(state, TEST_FILE, content, "typescript");
+		await handleNotifyOpen(state, TEST_FILE, content, "typescript");
+
+		emitPublishDiagnostics({
+			uri: pathToFileURL(TEST_FILE).href,
+			diagnostics: [diagnostic("same-content diagnostic")],
+		});
+		await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_WAIT_MS));
+
+		expect(state.diagnosticBindings.get(TEST_KEY)?.contentHash).toBe(
+			hashDiagnosticContent(content),
+		);
 	});
 
 	it("binds version but no contentHash when the sent fingerprint is for a different version (I3 fallback → unknown)", async () => {
