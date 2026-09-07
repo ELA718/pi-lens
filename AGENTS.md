@@ -1718,6 +1718,9 @@ removes only constants proven against the exact NAPI or ast-grep LSP content
 snapshot. Unknown bindings, stale or ambiguous ranges, recovered parse errors,
 shadowing, mutation, cycles, and exhausted budgets stay findings. Candidate shape
 is not an exemption, and proven-static candidates never consume the finding cap.
+RegExp receiver proof accepts `globalThis.fetch.bind(globalThis)` only when the
+global fetch receiver and native bind path are direct, unshadowed, unmodified,
+and unescaped; computed or aliased writes retain findings.
 SSRF inspects the destination
 argument, not request options. Private Supabase transport hooks require a sole
 SDK registration and a configured destination; exported or independently called
