@@ -12,6 +12,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 // SHUTDOWN_REQUEST_TIMEOUT_MS is read at MODULE LOAD in client.ts, so the env
 // override must land before the static import below evaluates — vi.hoisted
 // runs this ahead of every import in the file. Shrinks the "cold start
@@ -24,8 +25,8 @@ vi.hoisted(() => {
 });
 import { createLSPClient } from "../../../clients/lsp/client.js";
 import { launchLSP, stopLSP } from "../../../clients/lsp/launch.js";
-import { removeTempDirSync } from "../test-utils.js";
 import { waitFor } from "../interleaving-kit.js";
+import { removeTempDirSync } from "../test-utils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FAKE_SERVER_PATH = path.join(

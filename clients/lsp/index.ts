@@ -1001,6 +1001,8 @@ export class LSPService {
 	 * successful write clears its entry.
 	 */
 	private readonly notifyWriteBackpressureStreak = new Map<string, number>();
+	/** Client teardowns started by eviction after removal from the live map. */
+	private readonly retiringClients = new Set<Promise<void>>();
 	/** LRU clock for capacity eviction, keyed by the canonical server/root key. */
 	private readonly clientLastUsedAt = new Map<string, number>();
 	/**
@@ -1442,7 +1444,9 @@ export class LSPService {
 		}
 		this.notifyWriteBackpressureStreak.delete(key);
 		this.state.broken.set(key, Date.now() + BROKEN_BASE_COOLDOWN_MS);
-		void entry.client.shutdown().catch(() => {});
+		const retirement = entry.client.shutdown().catch(() => {});
+		this.retiringClients.add(retirement);
+		void retirement.then(() => this.retiringClients.delete(retirement));
 		this.state.clients.delete(key);
 		this.state.clientSpawnedAt.delete(key);
 		this.state.demonstratedReady.delete(key);
@@ -5394,6 +5398,9 @@ export class LSPService {
 				Promise.resolve().then(() => client.shutdown(options)),
 			),
 		);
+		if (!options.fast && this.retiringClients.size > 0) {
+			await Promise.allSettled(this.retiringClients);
+		}
 		logLatency({
 			type: "phase",
 			phase: "lsp_service_reset",

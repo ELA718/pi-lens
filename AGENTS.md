@@ -396,7 +396,9 @@ must stay unref'd, reset on reuse, busy-client guarded, and cleared on shutdown.
 LSP shutdown bounds both the `shutdown` request and `exit` notification before
 disposing the JSON-RPC connection and killing the owned process tree. A server
 that stops reading stdin must not retain a backpressured write or keep CLI
-teardown alive indefinitely.
+teardown alive indefinitely. Non-fast service resets await client retirements
+started by backpressure eviction after removal from the live-client map; fast
+resets retain their non-blocking contract.
 
 Rule-id normalization derives its language suffixes from the bundled CodeRabbit rule tree at startup; tests must keep that derived set covered so new vendored language rules cannot silently evade project policy matching.
 
