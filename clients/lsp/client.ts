@@ -1205,16 +1205,18 @@ export function resolveConfigurationSection(
 	initialization: Record<string, unknown> | undefined,
 	section: string | undefined,
 ): unknown {
-	if (!initialization) return {};
-	if (!section) return initialization;
-	let cur: unknown = initialization;
+	const settings = initialization ?? {};
+	if (!section) return settings;
+	let cur: unknown = settings;
 	for (const part of section.split(".")) {
 		if (
 			typeof cur !== "object" ||
 			cur === null ||
 			!Object.prototype.hasOwnProperty.call(cur, part)
 		) {
-			return null;
+			return section === "css" || section === "scss" || section === "less"
+				? {}
+				: null;
 		}
 		cur = (cur as Record<string, unknown>)[part];
 	}
@@ -1495,6 +1497,10 @@ export function setupIncomingHandlers(
 			if (!match) return;
 			try {
 				const normalizedPath = normalizeMapKey(uriToPath(match[1]));
+				if (
+					!state.openDocuments.has(normalizedPath) &&
+					!state.pendingOpens.has(normalizedPath)
+				) return;
 				const previous = state.diagnosticComputationErrors.get(normalizedPath);
 				state.diagnosticComputationErrors.set(normalizedPath, {
 					count: (previous?.count ?? 0) + 1,
@@ -1623,6 +1629,7 @@ async function clientRequestPullDiagnostics(
 
 		const computationError = state.diagnosticComputationErrors.get(normalizedPath);
 		if (computationError && computationError.count > computationErrorBaseline) {
+			clearDiagnosticsForPath(state, normalizedPath);
 			recordPullFailure(
 				state,
 				"textDocument/diagnostic",
