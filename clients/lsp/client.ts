@@ -2238,9 +2238,12 @@ export async function clientShutdown(
 			shutdownRequestTimedOut = true;
 		}
 		try {
-			await safeSendNotification(state.connection, "exit", {});
+			await withTimeout(
+				safeSendNotification(state.connection, "exit", {}),
+				SHUTDOWN_REQUEST_TIMEOUT_MS,
+			);
 		} catch {
-			/* ignore */
+			/* ignore — dispose/kill owns final teardown after bounded notification */
 		}
 	}
 	disposeClientConnection(state);

@@ -91,7 +91,13 @@ function handle(raw) {
 	}
 
 	// Ignore notifications without id
-	if (data.method === "initialized") return;
+	if (data.method === "initialized") {
+		if (process.env.FAKE_LSP_STOP_READING_AFTER_INITIALIZED === "1") {
+			process.stdin.pause();
+			setInterval(() => {}, 1000);
+		}
+		return;
+	}
 	if (data.method === "textDocument/didOpen") {
 		openDocuments.set(
 			data.params?.textDocument?.uri,

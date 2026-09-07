@@ -393,6 +393,11 @@ graceful shutdown, releasing the server-owned language-service programs and
 document registry; the next request rebuilds transparently. The per-root timers
 must stay unref'd, reset on reuse, busy-client guarded, and cleared on shutdown.
 
+LSP shutdown bounds both the `shutdown` request and `exit` notification before
+disposing the JSON-RPC connection and killing the owned process tree. A server
+that stops reading stdin must not retain a backpressured write or keep CLI
+teardown alive indefinitely.
+
 Rule-id normalization derives its language suffixes from the bundled CodeRabbit rule tree at startup; tests must keep that derived set covered so new vendored language rules cannot silently evade project policy matching.
 
 Small process-lifetime memo tables use `clients/bounded-cache.ts` when an
