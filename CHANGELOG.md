@@ -14,6 +14,11 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- JSONC and JSON5 diagnostics no longer wait for an ast-grep publication when
+  the native default grammar does not admit that extension. Explicit native
+  language overrides remain active, and ambiguous configuration stays gated.
+  (refs #6)
+
 - File-major diagnostics yield during synchronous native rule work so abort
   timers can run. Cancelled snapshots retain partial file counts and report
   truncation. (refs #6)

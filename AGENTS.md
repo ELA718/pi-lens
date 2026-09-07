@@ -1,5 +1,11 @@
 # pi-lens — agent context
 
+Ast-grep JSON admission follows its native extension contract: default JSONC
+and JSON5 files use their JSON language server without an unsupported ast-grep
+wait. Preserve explicit languageGlobs and custom-language extensions. Native
+language globs match basenames; ambiguous or unreadable configuration retains
+admission so uncertainty cannot become a clean result. (refs #6)
+
 File-major diagnostic scans use the shared cooperative deadline to yield to
 timers and I/O between files. Synchronously resolved consumers still need a
 macrotask yield. Recheck cancellation and WASM state after yielding; cancelled

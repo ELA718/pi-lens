@@ -7,7 +7,7 @@
  * - Platform-specific handling
  */
 
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import {
 	access,
 	readFile,
@@ -55,6 +55,8 @@ import { createLombokJdtlsArgs } from "./lombok.js";
 import { resolveJavaRuntimeEnv } from "./jvm-runtime.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { getRubyVersionDirNamesSync } from "./ruby-drive-dirs.js";
+import { load as loadYaml } from "../deps/js-yaml.js";
+import { minimatch } from "../deps/minimatch.js";
 
 // --- Types ---
 
@@ -2883,11 +2885,70 @@ const AST_GREP_EXTENSIONS: readonly string[] = Array.from(
 	),
 );
 
+function isAstGrepNativePath(filePath: string): boolean {
+	const extension = path.extname(filePath).toLowerCase();
+	if (extension !== ".jsonc" && extension !== ".json5") return true;
+	const config = findLocalSgconfig(path.dirname(filePath));
+	if (!config) return false;
+	try {
+		const parsed: unknown = loadYaml(readFileSync(config, "utf8"));
+		if (
+			typeof parsed !== "object" ||
+			parsed === null ||
+			Array.isArray(parsed)
+		) return true;
+		const { customLanguages, languageGlobs } = parsed as {
+			customLanguages?: unknown;
+			languageGlobs?: unknown;
+		};
+		if (customLanguages !== undefined) {
+			if (
+				typeof customLanguages !== "object" ||
+				customLanguages === null ||
+				Array.isArray(customLanguages)
+			) return true;
+			for (const language of Object.values(customLanguages)) {
+				if (
+					typeof language !== "object" ||
+					language === null ||
+					Array.isArray(language)
+				) return true;
+				const { extensions } = language as { extensions?: unknown };
+				if (
+					!Array.isArray(extensions) ||
+					extensions.some((value) => typeof value !== "string")
+				) return true;
+				if (extensions.includes(extension.slice(1))) return true;
+			}
+		}
+		if (languageGlobs === undefined) return false;
+		if (
+			typeof languageGlobs !== "object" ||
+			languageGlobs === null ||
+			Array.isArray(languageGlobs)
+		) return true;
+		const configured = Object.entries(languageGlobs).find(
+			([language]) => language.toLowerCase() === "json",
+		)?.[1];
+		if (configured === undefined) return false;
+		if (
+			!Array.isArray(configured) ||
+			configured.some((pattern) => typeof pattern !== "string")
+		) return true;
+		return configured.some(
+			(pattern) => minimatch(path.basename(filePath), pattern, { dot: true }),
+		);
+	} catch {
+		return true;
+	}
+}
+
 export const AstGrepServer: LSPServerInfo = {
 	id: "ast-grep",
 	name: "ast-grep structural linter",
 	role: "auxiliary",
 	extensions: AST_GREP_EXTENSIONS,
+	pathFilter: isAstGrepNativePath,
 	// Attaches everywhere (#239 Phase 2): prefer a project `sgconfig.y[a]ml` root,
 	// else the repo root (.git) or cwd — like Opengrep. When there's no project
 	// sgconfig the spawn launches with `--config <shipped baseline>` so the team's
