@@ -90,6 +90,7 @@ describe("SSRF deployment-configuration provenance", () => {
 		["string instance prototype alias mutation", `const proto = Object.getPrototypeOf(""); proto.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
 		["aliased prototype acquisition mutation", `const getProto = Object.getPrototypeOf; const proto = getProto(""); proto.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
 		["computed instance prototype mutation", `const proto = ""["__proto__"]; proto.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
+		["binding-resolved computed prototype mutation", `const value = ""; const key = "__proto__"; const proto = value[key]; proto.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
 		["dynamic native instance property mutation", `const proto = ""[request.key]; proto.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
 		["computed instance prototype alias mutation", `const proto = ""["__proto__"]; const alias = proto; alias.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
 		["computed global String alias mutation", `const S = globalThis["String"]; S.prototype.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],

@@ -3738,6 +3738,24 @@ export class TreeSitterClient {
 			}
 			return !!current;
 		};
+		const immutableValue = (value: TreeSitterNode | null | undefined, seen = new Set<TreeSitterNode>(), mode?: "allow-property-writes"): TreeSitterNode | null => {
+			if (!value || seen.size > 32) return null;
+			if (["parenthesized_expression", "non_null_expression", "as_expression", "satisfies_expression", "type_assertion"].includes(value.type)) {
+				return immutableValue(value.children.find((child) => child.isNamed), seen, mode);
+			}
+			if (value.type !== "identifier") return value;
+			const binding = bindingFor(value);
+			if (!binding || binding.kind !== "variable" || seen.has(binding.owner)) return null;
+			if (bindingWrites(binding).some((write) => {
+				if (!mode) return true;
+				const target = write.childForFieldName?.("left") ?? write.childForFieldName?.("argument") ?? write.children.find((child) => child.isNamed);
+				return !!target && referencesFor(binding).some((reference) => isTransparentAlias(target, reference));
+			})) return null;
+			const declaration = binding.owner.parent;
+			if (declaration?.type !== "lexical_declaration" || !declaration.children.some((child) => child.type === "const")) return null;
+			seen.add(binding.owner);
+			return immutableValue(binding.owner.childForFieldName?.("value"), seen, mode);
+		};
 		const acquiredBindingIsUnproven = (binding: Binding, seen = new Set<TreeSitterNode>()): boolean => {
 			if (seen.has(binding.owner) || seen.size > 32) return true;
 			seen.add(binding.owner);
@@ -3773,25 +3791,28 @@ export class TreeSitterClient {
 				if (node.type === "member_expression" && ["constructor", "__proto__"].includes(node.childForFieldName?.("property")?.text ?? "")) return true;
 				if (node.type === "subscript_expression") {
 					if (node.childForFieldName?.("object")?.text === "globalThis") return true;
-					const index = node.childForFieldName?.("index");
+					const index = immutableValue(node.childForFieldName?.("index"));
 					const property = index?.type === "string" ? index.children.find((child) => child.type === "string_fragment")?.text : undefined;
-					const object = node.childForFieldName?.("object");
-					const computedNativeInstance = property === undefined && !!object && ["string", "template_string", "array"].includes(object.type);
-					if (computedNativeInstance) return true;
-					if (!["constructor", "prototype", "__proto__"].includes(property ?? "")) return false;
+					const unknownProperty = !index || !["string", "number"].includes(index.type);
+					const object = immutableValue(node.childForFieldName?.("object"), new Set(), "allow-property-writes");
+					const computedNativeInstance = unknownProperty && !!object && ["string", "template_string", "array"].includes(object.type);
 					const declaration = node.parent;
 					const name = declaration?.type === "variable_declarator" && sameNode(declaration.childForFieldName?.("value"), node)
 						? declaration.childForFieldName?.("name")
 						: undefined;
+					if (computedNativeInstance) return true;
 					if (name?.type === "identifier") {
 						const binding = bindingFor(name);
-						if (binding && acquiredBindingIsUnproven(binding)) return true;
+						if (binding && acquiredBindingIsUnproven(binding) && (unknownProperty || ["constructor", "prototype", "__proto__"].includes(property ?? ""))) return true;
 					}
-					return nodes.some((candidate) => {
+					if (!unknownProperty && !["constructor", "prototype", "__proto__"].includes(property ?? "")) return false;
+					if (object?.type === "object") return false;
+					const computedMutation = nodes.some((candidate) => {
 						if (!["assignment_expression", "augmented_assignment_expression", "update_expression"].includes(candidate.type)) return false;
 						const target = candidate.childForFieldName?.("left") ?? candidate.childForFieldName?.("argument");
 						return !!target && contains(target, node);
 					});
+					return computedMutation;
 				}
 				if (node.type === "identifier" && node.text === "globalThis" && isGlobalReference(node)) {
 					const parent = node.parent;
