@@ -230,7 +230,14 @@ describe("OpengrepClient native scan receipts", () => {
 	it("keeps findings and partial-parser evidence from a valid exit-zero report", async () => {
 		mockNativeRun(
 			{
-				results: [{ check_id: "rule-a", path: "a.ts", start: { line: 2 } }],
+				results: [
+					{
+						check_id: "rule-a",
+						path: "a.ts",
+						start: { line: 2 },
+						extra: { severity: "WARNING" },
+					},
+				],
 				errors: [
 					{
 						level: "warn",
@@ -267,7 +274,14 @@ describe("OpengrepClient native scan receipts", () => {
 	it("keeps a valid report but marks a nonzero native exit as failed", async () => {
 		mockNativeRun(
 			{
-				results: [{ check_id: "rule-a", path: "a.ts", start: { line: 2 } }],
+				results: [
+					{
+						check_id: "rule-a",
+						path: "a.ts",
+						start: { line: 2 },
+						extra: { severity: "WARNING" },
+					},
+				],
 				errors: [],
 				paths: { scanned: ["a.ts"] },
 			},
@@ -287,7 +301,14 @@ describe("OpengrepClient native scan receipts", () => {
 	it("keeps a report written before an interrupted native scan", async () => {
 		mockNativeRun(
 			{
-				results: [{ check_id: "rule-a", path: "a.ts", start: { line: 2 } }],
+				results: [
+					{
+						check_id: "rule-a",
+						path: "a.ts",
+						start: { line: 2 },
+						extra: { severity: "WARNING" },
+					},
+				],
 				errors: [],
 				paths: { scanned: ["a.ts"] },
 			},
@@ -308,11 +329,55 @@ describe("OpengrepClient native scan receipts", () => {
 		expect(result.findings).toHaveLength(1);
 	});
 
+	it("keeps findings but marks missing and unknown native severities partial", async () => {
+		mockNativeRun(
+			{
+				results: [
+					{
+						check_id: "missing-severity",
+						path: "a.ts",
+						start: { line: 2 },
+						extra: { severity: null },
+					},
+					{
+						check_id: "unknown-severity",
+						path: "b.ts",
+						start: { line: 3 },
+						extra: { severity: "CRITICAL" },
+					},
+				],
+				errors: [],
+				paths: { scanned: ["a.ts", "b.ts"] },
+			},
+			{ status: 0 },
+		);
+
+		const result = (await scan()) as unknown as {
+			reportIntegrity: string;
+			findings: Array<{ severity: string }>;
+			reportErrors: Array<{ type: string; path?: string }>;
+		};
+		expect(result.reportIntegrity).toBe("partial");
+		expect(result.findings.map((finding) => finding.severity)).toEqual([
+			"WARNING",
+			"CRITICAL",
+		]);
+		expect(result.reportErrors).toEqual([
+			expect.objectContaining({ type: "MalformedSeverity", path: "a.ts" }),
+			expect.objectContaining({ type: "MalformedSeverity", path: "b.ts" }),
+		]);
+	});
+
 	it("marks malformed report-array entries partial while keeping valid findings", async () => {
 		mockNativeRun(
 			{
 				results: [
-					{ check_id: "rule-a", path: "a.ts", start: { line: 2 } },
+					{
+						check_id: "rule-a",
+						path: "a.ts",
+						start: { line: 2 },
+						extra: { severity: "WARNING" },
+					},
 					null,
 					{ check_id: "missing-path", start: { line: 3 } },
 				],

@@ -117,6 +117,7 @@ const EMPTY_RESULT: Omit<OpengrepResult, "scannedAt"> = {
 // scanning; generous budget for a large tree, matching trivy's CVE-DB-fetch
 // allowance rather than the lighter jscpd/gitleaks scans.
 const SCAN_TIMEOUT_MS = 180_000;
+const SUPPORTED_SEVERITIES = new Set(["ERROR", "WARNING", "INFO"]);
 
 // --- Client ---
 
@@ -334,6 +335,22 @@ function parseOpengrepReportEnvelope(
 			continue;
 		}
 		const extra = (e.extra as Record<string, unknown> | undefined) ?? {};
+		const rawSeverity = extra.severity;
+		const severity =
+			typeof rawSeverity === "string" ? rawSeverity.toUpperCase() : "WARNING";
+		if (
+			requireReceipt &&
+			(typeof rawSeverity !== "string" ||
+				!SUPPORTED_SEVERITIES.has(severity))
+		) {
+			reportErrors.push({
+				type: "MalformedSeverity",
+				level: "warn",
+				message: `opengrep finding has unsupported severity: ${String(rawSeverity)}`,
+				path: filePath,
+				line: startLine,
+			});
+		}
 		const metadata =
 			(extra.metadata as Record<string, unknown> | undefined) ?? {};
 		const cwe = Array.isArray(metadata.cwe)
@@ -348,7 +365,7 @@ function parseOpengrepReportEnvelope(
 			endCol: typeof end?.col === "number" ? end.col : 1,
 			message:
 				typeof extra.message === "string" ? extra.message : "opengrep finding",
-			severity: typeof extra.severity === "string" ? extra.severity : "WARNING",
+			severity,
 			cwe,
 		});
 	}
