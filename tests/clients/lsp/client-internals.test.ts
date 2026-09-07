@@ -59,6 +59,7 @@ describe("CLIENT_CAPABILITIES (#278 regression)", () => {
 			"codeAction",
 			"rename",
 			"publishDiagnostics",
+			"diagnostic",
 		]) {
 			expect(td[key], `textDocument.${key} present`).toBeTypeOf("object");
 		}
@@ -72,6 +73,10 @@ describe("CLIENT_CAPABILITIES (#278 regression)", () => {
 			(CLIENT_CAPABILITIES.textDocument.publishDiagnostics as { versionSupport?: boolean })
 				.versionSupport,
 		).toBe(true);
+		expect(CLIENT_CAPABILITIES.textDocument.diagnostic).toEqual({
+			dynamicRegistration: false,
+			relatedDocumentSupport: true,
+		});
 	});
 });
 

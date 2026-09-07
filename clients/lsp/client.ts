@@ -532,6 +532,10 @@ export const CLIENT_CAPABILITIES = {
 			relatedInformation: true,
 			versionSupport: true,
 		},
+		diagnostic: {
+			dynamicRegistration: false,
+			relatedDocumentSupport: true,
+		},
 	},
 } as const;
 const NAV_REQUEST_TIMEOUT_MS = positiveIntFromEnv(
