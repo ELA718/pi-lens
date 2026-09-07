@@ -60,7 +60,37 @@ describe("SSRF deployment-configuration provenance", () => {
 	});
 
 	it.each([
+		["direct deployment config", `fetch(Deno.env.get("URL"));`],
+		["direct process deployment config", `fetch(process.env.URL);`],
+		["direct Bun deployment config", `fetch(Bun.env.URL);`],
+		["direct import.meta deployment config", `fetch(import.meta.env.URL);`],
+		["unrelated URL class shadow", `{ class URL {} void URL; } fetch(new URL(Deno.env.get("URL")));`],
+		["unrelated lexical shadow", `{ const Deno = request.runtime; void Deno; } fetch(Deno.env.get("URL"));`],
+		["unrelated loop binding", `for (const Deno of request.runtimes) { void Deno; } fetch(Deno.env.get("URL"));`],
+		["unrelated catch binding", `try {} catch (Deno) { void Deno; } fetch(Deno.env.get("URL"));`],
+		["unrelated mutable-binding shadow", `const cfg = { url: Deno.env.get("URL") }; function unrelated() { const cfg = { url: request.url }; cfg.url = request.other; } fetch(cfg.url);`],
+		["unrelated class binding", `{ class Deno {} void Deno; } fetch(Deno.env.get("URL"));`],
+	])("removes $0 destinations", async (_label, code) => {
+		expect(await findings(code)).toHaveLength(0);
+	});
+
+	it.each([
 		["request input", `async function send(request: { url: string }) { await fetch(request.url); }`],
+		["object spread override", `const config = { url: Deno.env.get("URL"), ...request.body }; fetch(config.url);`],
+		["computed object override", `const config = { url: Deno.env.get("URL"), [request.key]: request.url }; fetch(config.url);`],
+		["unknown object member", `const config = { url: Deno.env.get("URL"), target() { return request.url; } }; fetch(config.url);`],
+		["binding alias mutation", `const config = { url: Deno.env.get("URL") }; const alias = config; alias.url = request.url; fetch(config.url);`],
+		["environment alias mutation", `const env = Deno.env; env.set("URL", request.url); fetch(Deno.env.get("URL"));`],
+		["direct environment mutation", `Deno.env.set("URL", request.url); fetch(Deno.env.get("URL"));`],
+		["aliased environment method mutation", `const set = Deno.env.set; set("URL", request.url); fetch(Deno.env.get("URL"));`],
+		["imported environment binding", `import Deno from "./runtime"; fetch(Deno.env.get("URL"));`],
+		["destructured environment parameter", `function send({ Deno }: typeof request) { fetch(Deno.env.get("URL")); }`],
+		["arrow environment parameter", `(Deno: typeof request.runtime) => fetch(Deno.env.get("URL"));`],
+		["destructured environment binding", `const { Deno } = request; fetch(Deno.env.get("URL"));`],
+		["environment replacement", `Deno.env = request.env; fetch(Deno.env.get("URL"));`],
+		["Object.assign environment mutation", `Object.assign(process.env, { URL: request.url }); fetch(process.env.URL);`],
+		["closure binding mutation", `const cfg = { url: Deno.env.get("URL") }; function mutate() { cfg.url = request.url; } mutate(); fetch(cfg.url);`],
+		["function parameter write", `function dest(url: string) { url = request.url; return url; } fetch(dest(Deno.env.get("URL")));`],
 		["mixed input", `const base = Deno.env.get("BASE"); function join(a: string, b: string) { return a + b; } async function send(request: { url: string }) { await fetch(join(base!, request.url)); }`],
 		["imported helper", `import { parseEndpoint } from "./config"; async function send() { await fetch(parseEndpoint(Deno.env.get("URL"))); }`],
 		["shadowed environment", `function send(Deno: { env: { get(key: string): string } }) { return fetch(Deno.env.get("URL")); }`],
