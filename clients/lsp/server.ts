@@ -2891,16 +2891,43 @@ function isAstGrepNativePath(filePath: string): boolean {
 	const config = findLocalSgconfig(path.dirname(filePath));
 	if (!config) return false;
 	try {
-		const parsed = loadYaml(readFileSync(config, "utf8")) as {
+		const parsed: unknown = loadYaml(readFileSync(config, "utf8"));
+		if (
+			typeof parsed !== "object" ||
+			parsed === null ||
+			Array.isArray(parsed)
+		) return true;
+		const { customLanguages, languageGlobs } = parsed as {
+			customLanguages?: unknown;
 			languageGlobs?: unknown;
 		};
-		if (parsed?.languageGlobs === undefined) return false;
+		if (customLanguages !== undefined) {
+			if (
+				typeof customLanguages !== "object" ||
+				customLanguages === null ||
+				Array.isArray(customLanguages)
+			) return true;
+			for (const language of Object.values(customLanguages)) {
+				if (
+					typeof language !== "object" ||
+					language === null ||
+					Array.isArray(language)
+				) return true;
+				const { extensions } = language as { extensions?: unknown };
+				if (
+					!Array.isArray(extensions) ||
+					extensions.some((value) => typeof value !== "string")
+				) return true;
+				if (extensions.includes(extension.slice(1))) return true;
+			}
+		}
+		if (languageGlobs === undefined) return false;
 		if (
-			typeof parsed.languageGlobs !== "object" ||
-			parsed.languageGlobs === null ||
-			Array.isArray(parsed.languageGlobs)
+			typeof languageGlobs !== "object" ||
+			languageGlobs === null ||
+			Array.isArray(languageGlobs)
 		) return true;
-		const configured = Object.entries(parsed.languageGlobs).find(
+		const configured = Object.entries(languageGlobs).find(
 			([language]) => language.toLowerCase() === "json",
 		)?.[1];
 		if (configured === undefined) return false;

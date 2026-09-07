@@ -99,6 +99,18 @@ describe("lsp server policy", () => {
 
 		fs.writeFileSync(path.join(tmp, "sgconfig.yml"), "languageGlobs: [\n");
 		expect(AstGrepServer.pathFilter?.(jsonc)).toBe(true);
+
+		for (const ambiguousRoot of ["null\n", "[]\n", "json\n"]) {
+			fs.writeFileSync(path.join(tmp, "sgconfig.yml"), ambiguousRoot);
+			expect(AstGrepServer.pathFilter?.(jsonc)).toBe(true);
+		}
+
+		fs.writeFileSync(
+			path.join(tmp, "sgconfig.yml"),
+			"customLanguages:\n  json-with-comments:\n    libraryPath: json.so\n    extensions: [jsonc, json5]\n",
+		);
+		expect(AstGrepServer.pathFilter?.(jsonc)).toBe(true);
+		expect(AstGrepServer.pathFilter?.(json5)).toBe(true);
 	});
 
 	it("uses the enclosing Gradle settings project instead of a nested module", async () => {
