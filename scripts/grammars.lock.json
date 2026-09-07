@@ -23,13 +23,18 @@
     "tree-sitter-rust.wasm": "sha256:4409921a70d0aa5bec7d1d7ce809a557a8ee1cf6ace901e3ac6a76e62cfea903",
     "tree-sitter-swift.wasm": "sha256:41c4fdb2249a3aa6d87eed0d383081ff09725c2248b4977043a43825980ffcc7",
     "tree-sitter-toml.wasm": "sha256:7849ac8ce9d10a4684ca189ea8ad3654c20c38acb2d674a014a164398cbd37a2",
-    "tree-sitter-tsx.wasm": "sha256:6aa3b2c70e76f5d48eafef1093e9c4de383e13f2fdde2f4e9b98a378f6a8f1b6",
+    "tree-sitter-tsx.wasm": "sha256:79e5da75ea62855a0cd67177685f0164eac87d5f630b3cbe1e0a099751ad30f8",
     "tree-sitter-typescript.wasm": "sha256:8515404dceed38e1ed86aa34b09fcf3379fff1b4ff9dd3967bcd6d1eb5ac3d8f",
     "tree-sitter-vue.wasm": "sha256:6244521bb3fb60f34ce5f677f2af81facb2c38691193985ca5fa85e1b6f29250",
     "tree-sitter-yaml.wasm": "sha256:e752dc21c3591df9b45692fe417d101f45d1828c28c44d79005f4066dc7e4e91",
     "tree-sitter-zig.wasm": "sha256:59cc4531aa661e2de4c5bc04e4045b6bdd5d2bfa75045cbda5f673102d140eef"
   },
   "overrides": {
+    "tree-sitter-tsx.wasm": {
+      "package": "tree-sitter-typescript",
+      "version": "0.23.2",
+      "url": "https://unpkg.com/tree-sitter-typescript@0.23.2/tree-sitter-tsx.wasm"
+    },
     "tree-sitter-lua.wasm": {
       "package": "@tree-sitter-grammars/tree-sitter-lua",
       "version": "0.4.1",

@@ -28,6 +28,11 @@ const PACKAGE = "tree-sitter-wasms";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const MANIFEST_PATH = join(SCRIPT_DIR, "grammars.lock.json");
 export const SOURCE_OVERRIDES = {
+    "tree-sitter-tsx.wasm": {
+        package: "tree-sitter-typescript",
+        version: "0.23.2",
+        url: "https://unpkg.com/tree-sitter-typescript@0.23.2/tree-sitter-tsx.wasm",
+    },
     "tree-sitter-lua.wasm": {
         package: "@tree-sitter-grammars/tree-sitter-lua",
         version: "0.4.1",

@@ -166,6 +166,11 @@ count but health should retain only one updated entry per subject. Both reset
 with the ledger at the session boundary; do not add caller-local duplicate
 sets or count one blocked action at both policy gates. (#1366, #1292)
 
+The TSX runtime and installer source `tree-sitter-tsx.wasm` from the official
+`tree-sitter-typescript` package, not the frozen aggregator: valid quoted JSX
+attributes may contain literal ampersands. Keep runtime/downloader overrides and
+the provenance manifest aligned; malformed JSX must still produce recovery nodes.
+
 ## Maintaining this file (do this on every commit)
 
 AGENTS.md is the durable context handed to every agent that works on pi-lens. **Update it as part of the same commit that changes the world it describes** — never as a follow-up:
