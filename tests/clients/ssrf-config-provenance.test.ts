@@ -64,6 +64,8 @@ describe("SSRF deployment-configuration provenance", () => {
 		["direct process deployment config", `fetch(process.env.URL);`],
 		["direct Bun deployment config", `fetch(Bun.env.URL);`],
 		["direct import.meta deployment config", `fetch(import.meta.env.URL);`],
+		["native URL from deployment config", `fetch(new URL(Deno.env.get("URL")));`],
+		["native URL from trimmed deployment config", `fetch(new URL(Deno.env.get("URL").trim()));`],
 		["unrelated URL class shadow", `{ class URL {} void URL; } fetch(new URL(Deno.env.get("URL")));`],
 		["unrelated lexical shadow", `{ const Deno = request.runtime; void Deno; } fetch(Deno.env.get("URL"));`],
 		["unrelated loop binding", `for (const Deno of request.runtimes) { void Deno; } fetch(Deno.env.get("URL"));`],
@@ -78,6 +80,11 @@ describe("SSRF deployment-configuration provenance", () => {
 
 	it.each([
 		["request input", `async function send(request: { url: string }) { await fetch(request.url); }`],
+		["shadowed private producer", `function configured() { return Deno.env.get("URL"); } function send(configured: () => string) { fetch(configured()); } send(() => request.url);`],
+		["implicit URL coercion mutation", `URL.prototype.toString = function () { return request.url; }; fetch(new URL(Deno.env.get("URL")));`],
+		["implicit URL coercion after trim", `URL.prototype.toString = function () { return request.url; }; fetch(new URL(Deno.env.get("URL").trim()));`],
+		["unknown destructured member alias escape", `function acquire() { return ""; } const { __proto__: proto } = acquire(); const transform = proto.trim; use(transform); fetch(Deno.env.get("URL").trim());`],
+		["destructured constructor prototype alias mutation", `const { constructor: Constructor } = ""; const proto = Constructor.prototype; proto.trim = () => request.url; fetch(Deno.env.get("URL").trim());`],
 		["runtime object alias", `const runtime = Deno; runtime.env.set("URL", request.url); fetch(Deno.env.get("URL"));`],
 		["global runtime member alias", `const runtime = globalThis.Deno; runtime.env.set("URL", request.url); fetch(Deno.env.get("URL"));`],
 		["global runtime computed alias", `const runtime = globalThis["Deno"]; runtime.env.set("URL", request.url); fetch(Deno.env.get("URL"));`],

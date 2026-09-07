@@ -3779,8 +3779,16 @@ export class TreeSitterClient {
 					return !alias || acquiredBindingIsUnproven(alias, seen);
 				}
 				if (parent?.type === "member_expression" && sameNode(parent.childForFieldName?.("object"), value)) {
-					const call = parent.parent;
-					return call?.type === "call_expression" && sameNode(call.childForFieldName?.("function"), parent);
+					const member = outerTransparentExpression(parent);
+					const consumer = member.parent;
+					if (consumer?.type === "call_expression" && sameNode(consumer.childForFieldName?.("function"), member)) return true;
+					if (consumer?.type === "variable_declarator" && sameNode(consumer.childForFieldName?.("value"), member)) {
+						const name = consumer.childForFieldName?.("name");
+						const alias = name?.type === "identifier" ? bindingFor(name) : undefined;
+						return !alias || acquiredBindingIsUnproven(alias, seen);
+					}
+					if (consumer?.type === "assignment_expression" && sameNode(consumer.childForFieldName?.("right"), member)) return true;
+					return ["arguments", "return_statement", "export_statement", "spread_element", "array", "object", "pair"].includes(consumer?.type ?? "");
 				}
 				if (parent?.type === "arguments") {
 					const callee = parent.parent?.childForFieldName?.("function");
@@ -3981,7 +3989,7 @@ export class TreeSitterClient {
 			return null;
 		};
 
-		const privateFunction = (name: string): TreeSitterNode | null => {
+		const privateFunction = (name: string, use: TreeSitterNode): TreeSitterNode | null => {
 			const declarations = nodes.filter(
 				(node) => node.type === "function_declaration" && node.childForFieldName?.("name")?.text === name,
 			);
@@ -3989,6 +3997,8 @@ export class TreeSitterClient {
 			const declaration = declarations[0];
 			if (declaration.parent?.type !== "program") return null;
 			const nameNode = declaration.childForFieldName?.("name");
+			const resolved = bindingFor(use);
+			if (!nameNode || !resolved || !sameNode(resolved.owner, declaration) || !sameNode(resolved.name, nameNode)) return null;
 			for (const node of nodes) {
 				if (node.type !== "identifier" || node.text !== name || sameNode(node, nameNode)) continue;
 				const parent = node.parent;
@@ -4079,7 +4089,7 @@ export class TreeSitterClient {
 				}
 				if (node.type === "new_expression") {
 					const constructor = node.childForFieldName?.("constructor");
-					if (constructor?.text !== "URL" || !globalIsUnbound(constructor)) return false;
+					if (constructor?.text !== "URL" || !globalIsUnbound(constructor) || !nativeTransformIsStable("toString")) return false;
 					const args = node.childForFieldName?.("arguments")?.children.filter((child) => child.isNamed) ?? [];
 					return args.length > 0 && args.every((arg) => trace(arg, undefined, ctx, depth + 1));
 				}
@@ -4097,7 +4107,7 @@ export class TreeSitterClient {
 						return trace(receiver, property, ctx, depth + 1) && args.every((arg) => trace(arg, undefined, ctx, depth + 1));
 					}
 					if (callee?.type !== "identifier") return false;
-					const declaration = privateFunction(callee.text);
+					const declaration = privateFunction(callee.text, callee);
 					if (!declaration) return false;
 					const parameterNodes = declaration.childForFieldName?.("parameters")?.children.filter((child) => child.isNamed) ?? [];
 					if (parameterNodes.length !== args.length) return false;
@@ -5303,9 +5313,18 @@ export class TreeSitterClient {
 					/^(exec|execSync)$/.test(captures.FN?.text ?? "")
 				);
 			case "ts_ssrf_sink": {
+				let unprovenDynamicDestination = false;
 				if (rootNode && captures.URL) {
 					try { if (this.isProvenExactOriginGuardedFetch(captures.URL, rootNode)) return false; } catch { /* Unknown guards retain the finding. */ }
-					try { if (this.isDeploymentConfigOnlyUrl(captures.URL, rootNode)) return false; } catch { /* Unknown provenance retains the finding. */ }
+					try {
+						if (this.isDeploymentConfigOnlyUrl(captures.URL, rootNode)) {
+							const callee = captures.URL.childForFieldName?.("function");
+							const method = callee?.type === "member_expression" ? callee.childForFieldName?.("property")?.text : undefined;
+							if (method !== "toString") return false;
+						} else {
+							unprovenDynamicDestination = ["call_expression", "new_expression"].includes(captures.URL.type);
+						}
+					} catch { unprovenDynamicDestination = true; }
 				}
 				if (rootNode && filePath && captures.URL) {
 					try { if (this.isPrivateSdkFetchHook(captures.URL, rootNode, filePath)) return false; } catch { /* Unknown hooks retain the finding. */ }
@@ -5352,6 +5371,7 @@ export class TreeSitterClient {
 						return false;
 					}
 				}
+				if (unprovenDynamicDestination) return true;
 				// Only flag when the URL argument looks like it could carry external
 				// input: member expressions (req.url, ctx.query.x) or identifiers
 				// whose names suggest user/external provenance. Plain generic names
