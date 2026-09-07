@@ -2264,6 +2264,24 @@ export class TreeSitterClient {
 			const right = staticString(candidate.childForFieldName?.("right"), stringDepth + 1);
 			return left === undefined || right === undefined ? undefined : left + right;
 		};
+		const isHarmlessMetaObjectReference = (
+			candidate: TreeSitterNode,
+			name: "Object" | "Reflect",
+		) => {
+			const access = candidate.parent;
+			if (
+				(access?.type !== "member_expression" && access?.type !== "subscript_expression") ||
+				!isSameNode(access.childForFieldName?.("object"), candidate)
+			) return false;
+			const property = access.type === "member_expression"
+				? access.childForFieldName?.("property")?.text
+				: staticString(access.childForFieldName?.("index"));
+			if (!property) return false;
+			const unsafe = name === "Object"
+				? ["assign", "defineProperties", "defineProperty", "getPrototypeOf", "setPrototypeOf"]
+				: ["defineProperty", "deleteProperty", "getPrototypeOf", "set", "setPrototypeOf"];
+			return !unsafe.includes(property);
+		};
 		const isProvenNativeGlobalFetchBind = (call: TreeSitterNode | null | undefined) => {
 			if (
 				!directGlobalFetchBindCall(call) ||
@@ -2314,6 +2332,12 @@ export class TreeSitterClient {
 				) && ["RegExp", "globalThis", "fetch", "Function"].includes(
 					candidate.childForFieldName?.("name")?.text ?? "",
 				)
+			) ||
+			(references.get("Object") ?? []).some(
+				(candidate) => !isHarmlessMetaObjectReference(candidate, "Object"),
+			) ||
+			(references.get("Reflect") ?? []).some(
+				(candidate) => !isHarmlessMetaObjectReference(candidate, "Reflect"),
 			) ||
 			(references.get("RegExp") ?? []).some(
 				(candidate) => !isNativeRegExpConstructorReference(candidate),
