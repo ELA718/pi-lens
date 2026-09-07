@@ -2638,12 +2638,95 @@ export class TreeSitterClient {
 					const method = captures.NAME?.text ?? "";
 					if (!method || captures.RECURSE?.text !== method) return false;
 					const call = captures.CALL;
-					const declaration = call
+					const declaration = (call
 						? this.navigator.findParent(call, ["method_declaration"])
-						: undefined;
-					if (!declaration) return true;
+						: undefined) as TreeSitterNode | undefined;
+					if (!call || !declaration) return true;
+
+					const containingType = this.navigator.findParent(declaration, [
+						"class_declaration",
+						"interface_declaration",
+						"enum_declaration",
+						"record_declaration",
+					]) as TreeSitterNode | null;
+					if (!containingType) return true;
+					const syntaxStack = [containingType];
+					for (
+						let visited = 0;
+						syntaxStack.length > 0 &&
+							visited < NO_NESTED_ANCHOR_VISIT_CAP;
+						visited++
+					) {
+						const node = syntaxStack.pop();
+						if (!node) break;
+						if (
+							node.type === "ERROR" ||
+							(node as TreeSitterNode & { isMissing?: boolean }).isMissing
+						) {
+							return true;
+						}
+						syntaxStack.push(...(node.children ?? []));
+					}
+					if (syntaxStack.length > 0) return true;
+
+					const receiver = call.childForFieldName?.("object");
+					const typeName = containingType.childForFieldName?.("name")?.text;
+					const receiverIsLocal =
+						!receiver ||
+						receiver.type === "this" ||
+						(receiver.type === "identifier" && receiver.text === typeName);
+					const argumentsNode = call.childForFieldName?.("arguments");
+					const typeBody = containingType.childForFieldName?.("body");
+					if (receiverIsLocal && argumentsNode && typeBody) {
+						const callArity = argumentsNode.children.filter(
+							(node) => node.isNamed,
+						).length;
+						const currentIsStatic = /\bstatic\b/.test(
+							declaration.children.find((node) => node.type === "modifiers")
+								?.text ?? "",
+						);
+						const receiverRequiresStatic =
+							currentIsStatic ||
+							(receiver?.type === "identifier" && receiver.text === typeName);
+						const overloads = typeBody.children.filter((candidate) => {
+							if (
+								(candidate.startIndex === declaration.startIndex &&
+									candidate.endIndex === declaration.endIndex) ||
+								candidate.type !== "method_declaration" ||
+								candidate.childForFieldName?.("name")?.text !== method
+							) {
+								return false;
+							}
+							const parameters = candidate.childForFieldName?.("parameters");
+							if (
+								!parameters ||
+								parameters.children.some(
+									(node) => node.isNamed && node.type !== "formal_parameter",
+								)
+							) {
+								return false;
+							}
+							if (receiverRequiresStatic) {
+								const modifiers = candidate.children.find(
+									(node) => node.type === "modifiers",
+								)?.text;
+								if (!modifiers || !/\bstatic\b/.test(modifiers)) return false;
+							}
+							return (
+								parameters.children.filter(
+									(node) => node.type === "formal_parameter",
+								).length === callArity
+							);
+						});
+						if (overloads.length === 1) return false;
+					}
+
 					const stack = [declaration];
-					for (let visited = 0; stack.length > 0 && visited < 10_000; visited++) {
+					for (
+						let visited = 0;
+						stack.length > 0 && visited < NO_NESTED_ANCHOR_VISIT_CAP;
+						visited++
+					) {
 						const node = stack.pop();
 						if (!node) break;
 						// Any conditional or loop construct is a plausible base-case
@@ -2664,11 +2747,8 @@ export class TreeSitterClient {
 						}
 						stack.push(...(node.children ?? []));
 					}
-					// Cap exhausted without a verdict: this rule is BLOCKING, so a
-					// >10k-node method whose guard sits beyond the budget must not
-					// become a silent blocking FP — suppress instead (#956 review;
-					// the advisory filters keep their keep-the-diagnostic default).
-					return stack.length > 0 ? false : true;
+					// Cap exhaustion cannot prove a base case, so retain the finding.
+					return true;
 				} catch {
 					return true;
 				}
