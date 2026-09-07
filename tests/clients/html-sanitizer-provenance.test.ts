@@ -142,6 +142,8 @@ describe("HTML sanitizer provenance", () => {
 		"const view = <div dangerouslySetInnerHTML={{__html: `<img src=x onerror=alert(1)>`}} />;",
 		"import purifier from 'dompurify'; const tags = ['p']; mutate({tags}); const view = <div dangerouslySetInnerHTML={{__html: purifier.sanitize(input, {ALLOWED_TAGS: tags})}} />;",
 		"import purifier from 'dompurify'; class Set { constructor(tags) { tags.push('script'); } } const tags = ['p']; new Set(tags); const view = <div dangerouslySetInnerHTML={{__html: purifier.sanitize(input, {ALLOWED_TAGS: tags})}} />;",
+		"import purifier from 'dompurify'; function View(Set) { const attrs = ['class']; new Set(attrs); return <div dangerouslySetInnerHTML={{__html: purifier.sanitize(input, {ALLOWED_ATTR: attrs})}} />; }",
+		"import purifier from 'dompurify'; const html = purifier.sanitize(input); function View() { for (var html of unsafeValues) {} return <div dangerouslySetInnerHTML={{__html: html}} />; }",
 		"import purifier from 'dompurify'; const view = <div dangerouslySetInnerHTML={{__html: flag ? purifier.sanitize(input) : '<img src=x onerror=alert(1)>'}} />;",
 	])(
 		"retains mutation, escape, dynamic configuration, names, uncertain imports, and malformed syntax: %s",

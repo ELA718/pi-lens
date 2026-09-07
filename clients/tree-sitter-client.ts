@@ -2017,6 +2017,80 @@ export class TreeSitterClient {
 			right: TreeSitterNode,
 		) =>
 			left?.startIndex === right.startIndex && left.endIndex === right.endIndex;
+		const functionTypes = new Set([
+			"function_declaration",
+			"function_expression",
+			"generator_function",
+			"generator_function_declaration",
+			"arrow_function",
+			"method_definition",
+		]);
+		const enclosingFunction = (node: TreeSitterNode) => {
+			let current = node.parent;
+			while (current && !functionTypes.has(current.type)) current = current.parent;
+			return current;
+		};
+		const hasCompetingBinding = (
+			reference: TreeSitterNode,
+			name: string,
+			nodes: readonly TreeSitterNode[],
+			treeRoot: TreeSitterNode,
+			allowedDeclarator?: TreeSitterNode,
+		) => {
+			if (
+				this.isImportedBinding(name, treeRoot) ||
+				this.isShadowedByEnclosingParam(reference, name)
+			)
+				return true;
+			const referenceFunction = enclosingFunction(reference);
+			const sameFunction = (node: TreeSitterNode) => {
+				const owner = enclosingFunction(node);
+				return owner
+					? referenceFunction != null && sameNode(owner, referenceFunction)
+					: referenceFunction == null;
+			};
+			return nodes.some((node) => {
+				if (!sameFunction(node)) return false;
+				if (node.type === "variable_declarator") {
+					return (
+						(allowedDeclarator == null || !sameNode(node, allowedDeclarator)) &&
+						this.bindingNames(node.childForFieldName?.("name") ?? undefined).has(
+							name,
+						)
+					);
+				}
+				if (node.type === "for_in_statement")
+					return this.bindingNames(
+						node.childForFieldName?.("left") ?? undefined,
+					).has(name);
+				if (
+					["assignment_expression", "augmented_assignment_expression"].includes(
+						node.type,
+					)
+				)
+					return this.bindingNames(
+						node.childForFieldName?.("left") ?? undefined,
+					).has(name);
+				if (
+					[
+						"function_declaration",
+						"generator_function_declaration",
+						"class_declaration",
+					].includes(node.type)
+				)
+					return node.childForFieldName?.("name")?.text === name;
+				if (node.type === "catch_clause") {
+					const parameter = node.childForFieldName?.("parameter");
+					return (
+						parameter != null &&
+						reference.startIndex >= node.startIndex &&
+						reference.endIndex <= node.endIndex &&
+						this.bindingNames(parameter).has(name)
+					);
+				}
+				return false;
+			});
+		};
 		const prove = (
 			candidate: TreeSitterNode | undefined,
 			treeRoot: TreeSitterNode,
@@ -2081,14 +2155,19 @@ export class TreeSitterClient {
 				);
 			}
 			if (candidate.type === "identifier") {
-				if (this.isShadowedByEnclosingParam(candidate, candidate.text))
-					return false;
 				const initializer = this.resolveFileConstValueNode(
 					candidate.text,
 					treeRoot,
 				);
 				return (
 					initializer !== null &&
+					!hasCompetingBinding(
+						candidate,
+						candidate.text,
+						nodes,
+						treeRoot,
+						initializer.parent ?? undefined,
+					) &&
 					prove(initializer, treeRoot, sourceFile, depth + 1)
 				);
 			}
@@ -2254,13 +2333,6 @@ export class TreeSitterClient {
 									item.type,
 								) && item.text === arrayName,
 						);
-						const nativeSet = !nodes.some(
-							(item) =>
-								(item.type === "class_declaration" ||
-									item.type === "function_declaration" ||
-									item.type === "variable_declarator") &&
-								item.childForFieldName?.("name")?.text === "Set",
-						);
 						if (
 							references.some((reference) => {
 								if (
@@ -2288,12 +2360,17 @@ export class TreeSitterClient {
 										member.childForFieldName?.("property")?.text !== "sanitize"
 									);
 								}
-								return (
-									!nativeSet ||
+								if (
 									parent?.type !== "arguments" ||
-									parent.parent?.type !== "new_expression" ||
-									parent.parent.childForFieldName?.("constructor")?.text !==
-										"Set"
+									parent.parent?.type !== "new_expression"
+								)
+									return true;
+								const constructor =
+									parent.parent.childForFieldName?.("constructor");
+								return (
+									constructor?.type !== "identifier" ||
+									constructor.text !== "Set" ||
+									hasCompetingBinding(constructor, "Set", nodes, treeRoot)
 								);
 							})
 						)
