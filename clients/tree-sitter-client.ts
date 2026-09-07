@@ -3844,18 +3844,19 @@ export class TreeSitterClient {
 					const property = staticStringValue(index);
 					const unknownProperty = !index || (index.type === "string" ? property === undefined : index.type !== "number");
 					const object = immutableValue(node.childForFieldName?.("object"), new Set(), "allow-property-writes");
+					const sensitiveProperty = ["constructor", "prototype", "__proto__"].includes(property ?? "");
 					const computedNativeInstance = unknownProperty && !!object && ["string", "template_string", "array"].includes(object.type);
 					const acquisition = outerTransparentExpression(node);
 					const declaration = acquisition.parent;
 					const name = declaration?.type === "variable_declarator" && sameNode(declaration.childForFieldName?.("value"), acquisition)
 						? declaration.childForFieldName?.("name")
 						: undefined;
-					if (computedNativeInstance) return true;
+					if (sensitiveProperty || computedNativeInstance) return true;
 					if (name?.type === "identifier") {
 						const binding = bindingFor(name);
-						if (binding && acquiredBindingIsUnproven(binding) && (unknownProperty || ["constructor", "prototype", "__proto__"].includes(property ?? ""))) return true;
+						if (binding && acquiredBindingIsUnproven(binding) && unknownProperty) return true;
 					}
-					if (!unknownProperty && !["constructor", "prototype", "__proto__"].includes(property ?? "")) return false;
+					if (!unknownProperty) return false;
 					if (object?.type === "object") return false;
 					const computedMutation = nodes.some((candidate) => {
 						if (!["assignment_expression", "augmented_assignment_expression", "update_expression"].includes(candidate.type)) return false;
