@@ -106,6 +106,7 @@ const TREE_SITTER_SQL_ADAPTER: SqlSyntaxAdapter<TreeSitterNode> = {
 	parent: node => node.parent ?? null,
 	isNamed: node => node.isNamed,
 	key: node => `${node.type}:${node.startIndex}:${node.endIndex}`,
+	start: node => node.startIndex,
 };
 
 interface TreeSitterParserInstance {

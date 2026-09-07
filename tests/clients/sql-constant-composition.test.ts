@@ -15,7 +15,61 @@ async function findings(code: string, language = "typescript") {
 	return getSharedTreeSitterClient()!.runQueryOnFile(query, filePath, language);
 }
 
+const privateCallbackSql = [
+	"export {};",
+	"async function asActor(fn: (sql: (text: string, values?: unknown[]) => Promise<unknown>) => Promise<unknown>) {",
+	"\treturn fn((text, values) => client.query(text, values));",
+	"}",
+	"asActor(async (sql) => {",
+	"\tawait sql('SELECT 1');",
+	"\tawait sql('SELECT * FROM users WHERE id = $1', [id]);",
+	"});",
+].join("\n");
+
 describe("SQL composition provenance", () => {
+	it.each(["typescript", "tsx"])("accepts bounded private callback SQL in %s", async language => {
+		const code = language === "tsx" ? `${privateCallbackSql}\nconst view = <div />;` : privateCallbackSql;
+		expect(await findings(code, language)).toHaveLength(0);
+	});
+
+	it.each([
+		["dynamic caller SQL", privateCallbackSql.replace("await sql('SELECT 1');", "await sql(request.body.sql);")],
+		["missing caller proof", privateCallbackSql.replace(/asActor\(async[\s\S]*$/, "")],
+		["exported helper", privateCallbackSql.replace("async function asActor", "export async function asActor")],
+		["helper escape", `${privateCallbackSql}\nconsume(asActor);`],
+		["helper alias", `${privateCallbackSql}\nconst run = asActor;`],
+		["helper reassignment", `${privateCallbackSql}\nasActor = other;`],
+		["hoisted helper call", `${privateCallbackSql.slice(privateCallbackSql.indexOf("asActor(async"))}\n${privateCallbackSql.slice(0, privateCallbackSql.indexOf("asActor(async"))}`],
+		["helper shadow", `${privateCallbackSql}\nfunction shadow(asActor) { asActor(async (sql) => sql('SELECT 2')); }`],
+		["spread caller", privateCallbackSql.replace(/asActor\(async[\s\S]*$/, "const callbacks = [async (sql) => sql('SELECT 1')];\nasActor(...callbacks);")],
+		["recursive helper", privateCallbackSql.replace("\treturn fn", "\tasActor(fn);\n\treturn fn")],
+		["callback escape", privateCallbackSql.replace("\treturn fn", "\tconsume(fn);\n\treturn fn")],
+		["SQL parameter escape", privateCallbackSql.replace("client.query(text, values)", "(consume(text), client.query(text, values))")],
+		["destructured callback", privateCallbackSql.replace("async (sql) =>", "async ({ sql }) =>")],
+		["malformed source", `${privateCallbackSql}}`],
+	])("retains private callback finding for %s", async (_name, code) => {
+		expect((await findings(code)).length).toBeGreaterThan(0);
+	});
+
+	it.each([
+		["helper shorthand escape", `${privateCallbackSql}\nglobalThis.leaked = { asActor };\nglobalThis.leaked.asActor(sql => sql(request.body.sql));`],
+		["forwarded SQL shorthand escape", privateCallbackSql.replace(
+			"await sql('SELECT 1');",
+			"globalThis.leaked = { sql };\n\tawait sql('SELECT 1');",
+		) + "\nglobalThis.leaked.sql(request.body.sql);"],
+		["var for-of callback binding", privateCallbackSql.replace("await sql('SELECT 1');", "for (var QUERY of unsafeValues) {}\n\tawait sql(QUERY);")],
+		["let for-in callback binding", privateCallbackSql.replace("await sql('SELECT 1');", "for (let QUERY in unsafeValues) await sql(QUERY);")],
+		["const object for-of callback binding", privateCallbackSql.replace("await sql('SELECT 1');", "for (const { query: QUERY } of unsafeValues) await sql(QUERY);")],
+		["let array for-of callback binding", privateCallbackSql.replace("await sql('SELECT 1');", "for (let [QUERY] of unsafeValues) await sql(QUERY);")],
+		["global script helper", `${privateCallbackSql.replace("export {};\n", "")}\nglobalThis['asActor'](sql => sql(request.body.sql));`],
+	])("retains private callback finding for parent-review adversary: %s", async (_name, code) => {
+		expect((await findings(code)).length).toBeGreaterThan(0);
+	});
+
+	it("retains private callback finding when proof exceeds the node budget", async () => {
+		const code = `${"const filler = 0;".repeat(10_001)}\n${privateCallbackSql}`;
+		expect((await findings(code)).length).toBeGreaterThan(0);
+	});
 	it.each([
 		"db.query('SELECT id FROM records WHERE tag = $1', [tag]);",
 		"const TAG = 'fixture'; function cleanup() { const rows = `SELECT id FROM records WHERE tag = '${TAG}'`; db.query(`DELETE FROM records WHERE id IN (${rows})`); }",
@@ -59,6 +113,13 @@ describe("SQL composition provenance", () => {
 		"const TAG = 'fixture'; TAG = request.query.tag; db.query(`SELECT '${TAG}'`);",
 		"function other() { const TAG = 'fixture'; } db.query(`SELECT '${TAG}'`);",
 		"const a = b; const b = a; db.query(`SELECT '${a}'`);",
+		"const QUERY = 'SELECT 1'; for (var QUERY of unsafeValues) {} db.query(QUERY);",
+		"const QUERY = 'SELECT 1'; for (var QUERY in unsafeValues) {} db.query(QUERY);",
+		"const QUERY = 'SELECT 1'; for (let QUERY of unsafeValues) db.query(QUERY);",
+		"const QUERY = 'SELECT 1'; for (const QUERY in unsafeValues) db.query(QUERY);",
+		"const QUERY = 'SELECT 1'; for (const { query: QUERY } of unsafeValues) db.query(QUERY);",
+		"const QUERY = 'SELECT 1'; for (const { QUERY } of unsafeValues) db.query(QUERY);",
+		"const QUERY = 'SELECT 1'; for (let [QUERY] of unsafeValues) db.query(QUERY);",
 		"const rows = `SELECT '${request.query.tag}'`; db.query(`DELETE FROM records WHERE id IN (${rows})`);",
 	])("retains dynamic, shadowed, cyclic or inaccessible values: %s", async code => {
 		expect((await findings(code)).length).toBeGreaterThan(0);
