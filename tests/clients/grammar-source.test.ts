@@ -33,6 +33,18 @@ const scriptGrammars = [
 	),
 ];
 
+const manifestOverrides = (
+	JSON.parse(
+		readFileSync(
+			path.resolve(
+				path.dirname(fileURLToPath(import.meta.url)),
+				"../../scripts/grammars.lock.json",
+			),
+			"utf8",
+		),
+	) as { overrides: Record<string, unknown> }
+).overrides;
+
 describe("grammar-source ↔ download-grammars stay in sync", () => {
 	it("pins the same tree-sitter-wasms version", () => {
 		expect(scriptVersion).toBe(TREE_SITTER_WASMS_VERSION);
@@ -48,16 +60,26 @@ describe("grammar-source ↔ download-grammars stay in sync", () => {
 		);
 	});
 
-	it("mirrors the same source overrides in download-grammars.js", () => {
-		for (const o of Object.values(GRAMMAR_SOURCE_OVERRIDES)) {
+	it("mirrors source overrides in the downloader and provenance manifest", () => {
+		for (const [filename, o] of Object.entries(GRAMMAR_SOURCE_OVERRIDES)) {
 			// The mirror lists each override's url (which embeds package + version).
 			expect(scriptSrc).toContain(o.url);
 			expect(o.url).toContain(o.version);
+			expect(manifestOverrides[filename]).toEqual(o);
 		}
 	});
 });
 
-describe("GRAMMAR_SOURCE_OVERRIDES (#255)", () => {
+describe("GRAMMAR_SOURCE_OVERRIDES", () => {
+	it("routes TSX to the official maintained grammar", () => {
+		const o = GRAMMAR_SOURCE_OVERRIDES["tree-sitter-tsx.wasm"];
+		expect(o).toMatchObject({
+			package: "tree-sitter-typescript",
+			version: "0.23.2",
+		});
+		expect(grammarSourceUrl("tree-sitter-tsx.wasm")).toBe(o?.url);
+	});
+
 	it("routes lua to the @tree-sitter-grammars build, not the aggregator", () => {
 		const o = GRAMMAR_SOURCE_OVERRIDES["tree-sitter-lua.wasm"];
 		expect(o?.package).toBe("@tree-sitter-grammars/tree-sitter-lua");

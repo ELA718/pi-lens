@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
+const killProcessTree = vi.fn();
 
 vi.mock("../../../clients/lsp/config.js", () => ({
 	getServersForFileWithConfig,
@@ -13,12 +14,14 @@ vi.mock("../../../clients/lsp/config.js", () => ({
 }));
 
 vi.mock("../../../clients/lsp/client.js", () => ({
+	killProcessTree,
 	createLSPClient,
 }));
 
 describe("LSPService spawn-shutdown race (#706)", () => {
 	beforeEach(() => {
 		vi.resetModules();
+		killProcessTree.mockReset();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 	});
@@ -38,6 +41,13 @@ describe("LSPService spawn-shutdown race (#706)", () => {
 		});
 
 		const mockKill = vi.fn();
+		let finishTreeKill!: () => void;
+		killProcessTree.mockImplementation(
+			() =>
+				new Promise<void>((resolve) => {
+					finishTreeKill = resolve;
+				}),
+		);
 		let spawnEntered = false;
 		const spawn = vi.fn(async () => {
 			spawnEntered = true;
@@ -82,16 +92,23 @@ describe("LSPService spawn-shutdown race (#706)", () => {
 		}
 
 		// Shut down the service while server.spawn is still pending.
-		const shutdownPromise = service.shutdown();
+		let shutdownSettled = false;
+		const shutdownPromise = service.shutdown().then(() => {
+			shutdownSettled = true;
+		});
 
 		// Let the spawn resolve — service is already destroyed at this point.
 		resolveSpawn(undefined);
 
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(killProcessTree).toHaveBeenCalledWith(expect.anything(), 999, {});
+		expect(shutdownSettled).toBe(false);
+		finishTreeKill();
 		await shutdownPromise;
 		await spawnPromise;
 
-		// The raw process should have been killed (Guard 1)
-		expect(mockKill).toHaveBeenCalled();
+		// Guard 1 must use and await the process-tree seam, not kill only the wrapper.
+		expect(mockKill).not.toHaveBeenCalled();
 		// createLSPClient should not have been called at all since guard fires first
 		expect(createLSPClient).not.toHaveBeenCalled();
 		// state.clients must remain empty
@@ -157,7 +174,13 @@ describe("LSPService spawn-shutdown race (#706)", () => {
 			resolveClient = res;
 		});
 
-		const clientShutdown = vi.fn().mockResolvedValue(undefined);
+		let finishClientShutdown!: () => void;
+		const clientShutdown = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					finishClientShutdown = resolve;
+				}),
+		);
 		createLSPClient.mockImplementation(async () => {
 			await clientGate;
 			return {
@@ -199,11 +222,24 @@ describe("LSPService spawn-shutdown race (#706)", () => {
 		}
 
 		// Now shut down while createLSPClient is still pending (Guard 2 path)
-		const shutdownPromise = service.shutdown();
+		let shutdownSettled = false;
+		const shutdownPromise = service.shutdown().then(() => {
+			shutdownSettled = true;
+		});
+
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(killProcessTree).toHaveBeenCalledWith(expect.anything(), 998, {});
+		expect(clientShutdown).not.toHaveBeenCalled();
+		expect(service.getAliveClientCount()).toBe(0);
+		expect(shutdownSettled).toBe(false);
 
 		// Release createLSPClient — service is already destroyed
 		resolveClient(undefined);
 
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(clientShutdown).toHaveBeenCalledWith({});
+		expect(shutdownSettled).toBe(false);
+		finishClientShutdown();
 		await shutdownPromise;
 		await spawnPromise;
 

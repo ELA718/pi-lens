@@ -84,11 +84,20 @@ function handle(raw) {
 				},
 			},
 		});
+		if (process.env.FAKE_LSP_SEND_PARTIAL_AFTER_INITIALIZE === "1") {
+			process.stdout.write("Content-Length: 1000\r\n\r\n{");
+		}
 		return;
 	}
 
 	// Ignore notifications without id
-	if (data.method === "initialized") return;
+	if (data.method === "initialized") {
+		if (process.env.FAKE_LSP_STOP_READING_AFTER_INITIALIZED === "1") {
+			process.stdin.pause();
+			setInterval(() => {}, 1000);
+		}
+		return;
+	}
 	if (data.method === "textDocument/didOpen") {
 		openDocuments.set(
 			data.params?.textDocument?.uri,

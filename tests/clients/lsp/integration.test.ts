@@ -5,12 +5,14 @@
  * Validates the full wire protocol: message framing, initialize handshake,
  * request/response round-trips, and shutdown lifecycle.
  */
-
+import { createHook } from "node:async_hooks";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 // SHUTDOWN_REQUEST_TIMEOUT_MS is read at MODULE LOAD in client.ts, so the env
 // override must land before the static import below evaluates — vi.hoisted
 // runs this ahead of every import in the file. Shrinks the "cold start
@@ -23,6 +25,7 @@ vi.hoisted(() => {
 });
 import { createLSPClient } from "../../../clients/lsp/client.js";
 import { launchLSP, stopLSP } from "../../../clients/lsp/launch.js";
+import { waitFor } from "../interleaving-kit.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -68,6 +71,53 @@ describe("LSP Client Integration", () => {
 	it("initializes and reports connected", () => {
 		expect(client).toBeDefined();
 		expect(client!.isAlive()).toBe(true);
+	});
+
+	it("disposes the JSON-RPC reader partial-frame timer on shutdown", async () => {
+		await client!.shutdown();
+		client = undefined;
+		await stopLSP(proc!);
+		proc = undefined;
+
+		const partialTimers = new Set<number>();
+		const hook = createHook({
+			init(asyncId, type) {
+				if (
+					type === "Timeout" &&
+					new Error().stack?.includes("setPartialMessageTimer")
+				) {
+					partialTimers.add(asyncId);
+				}
+			},
+			destroy(asyncId) {
+				partialTimers.delete(asyncId);
+			},
+		});
+		hook.enable();
+		try {
+			proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+				cwd: process.cwd(),
+				env: {
+					...process.env,
+					FAKE_LSP_SEND_PARTIAL_AFTER_INITIALIZE: "1",
+				},
+			});
+			client = await createLSPClient({
+				serverId: "fake-partial-frame",
+				process: proc,
+				root: process.cwd(),
+			});
+			await waitFor(() => partialTimers.size, (count) => count > 0, {
+				timeoutMs: 2_000,
+			});
+
+			await client.shutdown();
+			client = undefined;
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(partialTimers.size).toBe(0);
+		} finally {
+			hook.disable();
+		}
 	});
 
 	it("detects operation capabilities from initialize result", () => {
@@ -222,6 +272,61 @@ describe("LSP Client Integration — cold start", () => {
 				cwd: process.cwd(),
 			}),
 		).rejects.toThrow();
+	});
+
+	it("bounds exit notification when an initialized server stops reading stdin", async () => {
+		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+			cwd: process.cwd(),
+			env: {
+				...process.env,
+				FAKE_LSP_STOP_READING_AFTER_INITIALIZED: "1",
+			},
+		});
+		const client = await createLSPClient({
+			serverId: "fake-stopped-reader",
+			process: proc,
+			root: process.cwd(),
+		});
+		const unrelated = spawn(
+			process.execPath,
+			["-e", "setInterval(() => {}, 1000)"],
+			{ stdio: "ignore" },
+		);
+
+		try {
+			void client.notify
+				.open(
+					path.join(process.cwd(), "backpressured.ts"),
+					"x".repeat(8 * 1024 * 1024),
+					"typescript",
+				)
+				.catch(() => {});
+			await new Promise((resolve) => setTimeout(resolve, 100));
+
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			await expect(
+				Promise.race([
+					client.shutdown(),
+					new Promise<void>((_, reject) => {
+						timer = setTimeout(
+							() => reject(new Error("shutdown remained backpressured")),
+							2_000,
+						);
+					}),
+				]).finally(() => {
+					if (timer) clearTimeout(timer);
+				}),
+			).resolves.toBeUndefined();
+			await waitFor(
+				() => proc.process.exitCode ?? proc.process.signalCode,
+				(exit) => exit !== null,
+				{ timeoutMs: 2_000 },
+			);
+			expect(() => process.kill(unrelated.pid!, 0)).not.toThrow();
+		} finally {
+			await stopLSP(proc);
+			unrelated.kill();
+		}
 	});
 
 	it("shutdown falls back to process kill when server ignores shutdown", async () => {

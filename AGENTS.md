@@ -1,5 +1,11 @@
 # pi-lens — agent context
 
+Standalone diagnostics await LSP generation teardown before emitting results.
+Track spawned processes during initialization, await abandoned startup cleanup,
+and terminate only the owned process tree. Dispose partial-frame reader timers
+when the connection closes; a completed shutdown must not retain protocol timers. Preserve fast shutdown for existing
+callers and natural CLI exit; unrelated processes must survive. (refs #6)
+
 Java JDBC index checks inspect the first argument only. Same-name Java calls
 are excluded as overload delegation only when the current method is fixed-arity,
 the call has a different arity, and a unique local fixed-arity overload exists.
@@ -159,6 +165,11 @@ site/subject that represents one user-visible degradation, and
 count but health should retain only one updated entry per subject. Both reset
 with the ledger at the session boundary; do not add caller-local duplicate
 sets or count one blocked action at both policy gates. (#1366, #1292)
+
+The TSX runtime and installer source `tree-sitter-tsx.wasm` from the official
+`tree-sitter-typescript` package, not the frozen aggregator: valid quoted JSX
+attributes may contain literal ampersands. Keep runtime/downloader overrides and
+the provenance manifest aligned; malformed JSX must still produce recovery nodes.
 
 ## Maintaining this file (do this on every commit)
 
@@ -386,6 +397,13 @@ TypeScript LSP clients are evicted after `PI_LENS_TS_IDLE_EVICT_MS` of inactivit
 graceful shutdown, releasing the server-owned language-service programs and
 document registry; the next request rebuilds transparently. The per-root timers
 must stay unref'd, reset on reuse, busy-client guarded, and cleared on shutdown.
+
+LSP shutdown bounds both the `shutdown` request and `exit` notification before
+disposing the JSON-RPC connection and killing the owned process tree. A server
+that stops reading stdin must not retain a backpressured write or keep CLI
+teardown alive indefinitely. Non-fast service resets await client retirements
+started by backpressure eviction after removal from the live-client map; fast
+resets retain their non-blocking contract.
 
 Rule-id normalization derives its language suffixes from the bundled CodeRabbit rule tree at startup; tests must keep that derived set covered so new vendored language rules cannot silently evade project policy matching.
 

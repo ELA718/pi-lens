@@ -56,7 +56,7 @@ import {
 	recordLspMutation,
 	type LspMutationContext,
 } from "../lsp-mutation.js";
-import { createLSPClient } from "./client.js";
+import { createLSPClient, killProcessTree } from "./client.js";
 import {
 	bindingStateLabel,
 	composeBoundToCurrentDisk,
@@ -69,6 +69,7 @@ import {
 } from "./diagnostic-binding.js";
 import { getServersForFileWithConfig, getServerInitOverride } from "./config.js";
 import { getLanguageId } from "./language.js";
+import type { LSPProcess } from "./launch.js";
 import type { LSPServerInfo } from "./server.js";
 import {
 	LSP_SERVERS,
@@ -1000,6 +1001,8 @@ export class LSPService {
 	 * successful write clears its entry.
 	 */
 	private readonly notifyWriteBackpressureStreak = new Map<string, number>();
+	/** Client teardowns started by eviction after removal from the live map. */
+	private readonly retiringClients = new Set<Promise<void>>();
 	/** LRU clock for capacity eviction, keyed by the canonical server/root key. */
 	private readonly clientLastUsedAt = new Map<string, number>();
 	/**
@@ -1008,6 +1011,8 @@ export class LSPService {
 	 * entered the client. Eviction skips any key with an outstanding lease.
 	 */
 	private readonly clientLeases = new Map<string, number>();
+	/** Raw spawned processes still completing the initialize handshake. */
+	private readonly startingProcesses = new Map<string, LSPProcess>();
 	/**
 	 * Per-root idle eviction for TypeScript's large, rebuildable program graph.
 	 * Timers are unref'd so an idle language service cannot keep a one-shot host
@@ -1022,6 +1027,7 @@ export class LSPService {
 	private clientSpawnGate: Promise<void> = Promise.resolve();
 	/** True after shutdown() has been called; blocks new operations */
 	private isDestroyed = false;
+	private shutdownOptions: LSPShutdownOptions = {};
 	/**
 	 * #850: teardown completion for every singleton generation retired before
 	 * this service was published. Only replacement services receive one; direct
@@ -1438,7 +1444,9 @@ export class LSPService {
 		}
 		this.notifyWriteBackpressureStreak.delete(key);
 		this.state.broken.set(key, Date.now() + BROKEN_BASE_COOLDOWN_MS);
-		void entry.client.shutdown().catch(() => {});
+		const retirement = entry.client.shutdown().catch(() => {});
+		this.retiringClients.add(retirement);
+		void retirement.then(() => this.retiringClients.delete(retirement));
 		this.state.clients.delete(key);
 		this.state.clientSpawnedAt.delete(key);
 		this.state.demonstratedReady.delete(key);
@@ -2071,10 +2079,12 @@ export class LSPService {
 			// Kill the raw process — no LSPClient exists yet — and bail out without
 			// marking the key broken (this is not a server failure).
 			if (this.isDestroyed) {
-				try {
-					spawned?.process?.process?.kill();
-				} catch {
-					// pi-lens-ignore: missing-error-propagation — best-effort kill on aborted spawn
+				if (spawned?.process) {
+					await killProcessTree(
+						spawned.process.process,
+						spawned.process.pid,
+						this.shutdownOptions,
+					);
 				}
 				logSessionStart(
 					`lsp spawn ${server.id}: aborted (service shut down mid-spawn)`,
@@ -2127,19 +2137,27 @@ export class LSPService {
 				override?.initializationOptions,
 			);
 
-			const client = await createLSPClient({
-				serverId: server.id,
-				process: spawned.process,
-				root,
-				initialization: mergedInit,
-				initializeTimeoutMs: server.initializeTimeoutMs,
-				launchVariant: spawned.launchVariant,
-			});
+			this.startingProcesses.set(key, spawned.process);
+			let client: Awaited<ReturnType<typeof createLSPClient>>;
+			try {
+				client = await createLSPClient({
+					serverId: server.id,
+					process: spawned.process,
+					root,
+					initialization: mergedInit,
+					initializeTimeoutMs: server.initializeTimeoutMs,
+					launchVariant: spawned.launchVariant,
+				});
+			} finally {
+				if (this.startingProcesses.get(key) === spawned.process) {
+					this.startingProcesses.delete(key);
+				}
+			}
 
 			// Guard 2: service was shut down while we were completing the initialize
 			// handshake. Shut down the live client best-effort and do not register it.
 			if (this.isDestroyed) {
-				client.shutdown({ fast: true }).catch(() => {});
+				await client.shutdown(this.shutdownOptions);
 				logSessionStart(
 					`lsp spawn ${server.id}: aborted (service shut down mid-initialize)`,
 				);
@@ -5337,9 +5355,17 @@ export class LSPService {
 		const resetStartedAt = Date.now();
 		if (this.checkDestroyed()) return;
 		this.isDestroyed = true;
+		this.shutdownOptions = options;
 		for (const key of this.typeScriptIdleTimers.keys()) {
 			this.clearTypeScriptIdleTimer(key);
 		}
+
+		await Promise.allSettled(
+			Array.from(this.startingProcesses.values(), (process) =>
+				killProcessTree(process.process, process.pid, options),
+			),
+		);
+		this.startingProcesses.clear();
 
 		// Belt-and-braces: wait for any in-flight spawns so that Guard 1/2 in
 		// spawnClient can observe isDestroyed and clean up. Skip on the
@@ -5372,6 +5398,9 @@ export class LSPService {
 				Promise.resolve().then(() => client.shutdown(options)),
 			),
 		);
+		if (!options.fast && this.retiringClients.size > 0) {
+			await Promise.allSettled(this.retiringClients);
+		}
 		logLatency({
 			type: "phase",
 			phase: "lsp_service_reset",
@@ -5573,10 +5602,12 @@ export async function isAuxiliaryLspAlive(
 	return getLSPService().isServerAliveForFile(serverId, filePath);
 }
 
-export function resetLSPService(options: LSPShutdownOptions = {}): void {
+export function resetLSPService(
+	options: LSPShutdownOptions = {},
+): Promise<void> {
 	const retiringService = globalLSPService;
 	globalLSPService = null;
-	if (!retiringService) return;
+	if (!retiringService) return globalLSPGenerationHandoff ?? Promise.resolve();
 
 	// shutdown() marks the service destroyed synchronously before its first
 	// await. Include both that teardown and every earlier pending generation:
@@ -5594,6 +5625,7 @@ export function resetLSPService(options: LSPShutdownOptions = {}): void {
 			globalLSPGenerationHandoff = undefined;
 		}
 	});
+	return handoff;
 }
 
 /**

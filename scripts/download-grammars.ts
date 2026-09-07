@@ -34,9 +34,8 @@ const MANIFEST_PATH = join(SCRIPT_DIR, "grammars.lock.json");
 /**
  * Per-grammar source override — a grammar pulled from a different package than the
  * `tree-sitter-wasms` aggregator because the aggregator's frozen build is broken for
- * it. Mirrors `GRAMMAR_SOURCE_OVERRIDES` in clients/grammar-source.ts. tree-sitter-lua
- * corrupts once a 2nd grammar loads the shared WASM Module (#255); pull the maintained
- * @tree-sitter-grammars build instead.
+ * it. Mirrors `GRAMMAR_SOURCE_OVERRIDES` in clients/grammar-source.ts; each defective
+ * aggregator grammar comes from its maintained package build instead.
  */
 export interface SourceOverride {
 	package: string;
@@ -45,6 +44,11 @@ export interface SourceOverride {
 }
 
 export const SOURCE_OVERRIDES: Record<string, SourceOverride> = {
+	"tree-sitter-tsx.wasm": {
+		package: "tree-sitter-typescript",
+		version: "0.23.2",
+		url: "https://unpkg.com/tree-sitter-typescript@0.23.2/tree-sitter-tsx.wasm",
+	},
 	"tree-sitter-lua.wasm": {
 		package: "@tree-sitter-grammars/tree-sitter-lua",
 		version: "0.4.1",
