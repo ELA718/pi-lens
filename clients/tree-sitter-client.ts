@@ -3782,8 +3782,35 @@ export class TreeSitterClient {
 					const call = parent.parent;
 					return call?.type === "call_expression" && sameNode(call.childForFieldName?.("function"), parent);
 				}
+				if (parent?.type === "arguments") {
+					const callee = parent.parent?.childForFieldName?.("function");
+					const owner = callee?.type === "member_expression" ? callee.childForFieldName?.("object") : undefined;
+					const operation = callee?.type === "member_expression" ? callee.childForFieldName?.("property")?.text : undefined;
+					if (owner?.type === "identifier" && owner.text === "Number" && isGlobalReference(owner) && ["isFinite", "isInteger", "isNaN", "isSafeInteger"].includes(operation ?? "")) return false;
+					return true;
+				}
 				return ["arguments", "return_statement", "export_statement", "spread_element", "array", "object", "pair"].includes(parent?.type ?? "");
 			});
+		};
+		const acquiredPatternNames = (pattern: TreeSitterNode): TreeSitterNode[] => {
+			const names: TreeSitterNode[] = [];
+			const stack = [pattern];
+			while (stack.length > 0) {
+				const current = stack.pop();
+				if (!current || ["rest_pattern", "rest_pattern_element"].includes(current.type)) continue;
+				if (current.type === "identifier" || current.type === "shorthand_property_identifier_pattern") {
+					names.push(current);
+					continue;
+				}
+				if (["property_identifier", "type_identifier", "computed_property_name"].includes(current.type)) continue;
+				if (["assignment_pattern", "object_assignment_pattern"].includes(current.type)) {
+					const left = current.childForFieldName?.("left");
+					if (left) stack.push(left);
+					continue;
+				}
+				stack.push(...(current.children ?? []));
+			}
+			return names;
 		};
 		const nativeTransformIsStable = (method: string): boolean => {
 			if (!globalOwnerAccessIsStable()) return false;
@@ -3796,15 +3823,11 @@ export class TreeSitterClient {
 						: undefined;
 					if (node.text !== "Object" || operation !== "is" || call?.type !== "call_expression" || !sameNode(call.childForFieldName?.("function"), member)) return true;
 				}
-				if (["variable_declarator", "assignment_expression"].includes(node.type)) {
-					const pattern = node.childForFieldName?.(node.type === "variable_declarator" ? "name" : "left");
-					const source = immutableValue(node.childForFieldName?.(node.type === "variable_declarator" ? "value" : "right"), new Set(), "allow-property-writes");
-					if (pattern && ["object_pattern", "array_pattern"].includes(pattern.type) && source && ["string", "template_string", "array"].includes(source.type)) {
-						return bindingNameNodes(pattern).some((name) => {
-							const binding = bindingFor(name);
-							return !binding || acquiredBindingIsUnproven(binding);
-						});
-					}
+				if (["object_pattern", "array_pattern"].includes(node.type)) {
+					return acquiredPatternNames(node).some((name) => {
+						const binding = bindingFor(name);
+						return !binding || acquiredBindingIsUnproven(binding);
+					});
 				}
 				if (node.type === "member_expression" && ["constructor", "__proto__"].includes(node.childForFieldName?.("property")?.text ?? "")) return true;
 				if (node.type === "subscript_expression") {
