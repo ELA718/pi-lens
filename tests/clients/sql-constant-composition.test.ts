@@ -111,6 +111,8 @@ describe("SQL composition provenance", () => {
 		"const matcher = /x/; function f() { if (flag) { var matcher = db; } matcher.exec(input); }",
 		"const matcher = /x/; function f({ matcher }) { matcher.exec(input); }",
 		"const patterns = [/x/]; for (const matcher in patterns) matcher.exec(input);",
+		"const matcher = /x/; function f() { for (var matcher of values) {} matcher.exec(input); }",
+		"const matcher = /x/; function f() { for (var matcher in values) {} matcher.exec(input); }",
 		"db.exec(request.body.sql);",
 		"db.exec(request.body.sql);",
 	])("retains unproven, mutable, shadowed, hoisted, or SQL exec calls: %s", async code => {

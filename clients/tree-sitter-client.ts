@@ -2074,10 +2074,23 @@ export class TreeSitterClient {
 					contains(forStatement.childForFieldName?.("left") ?? forStatement, name) &&
 					forBody
 				) {
+					let scope = forBody;
+					if (forStatement.children.some((child) => child.type === "var")) {
+						let container = forStatement.parent;
+						while (
+							container?.parent &&
+							!["program", "function_declaration", "function_expression", "arrow_function", "method_definition"].includes(
+								container.type,
+							)
+						) container = container.parent;
+						scope = container?.type === "program"
+							? container
+							: container?.childForFieldName?.("body") ?? root;
+					}
 					candidates.push({
 						name,
 						owner: forStatement,
-						scope: forBody,
+						scope,
 						kind: "for",
 					});
 					continue;
@@ -2354,6 +2367,11 @@ export class TreeSitterClient {
 		const binding = bindingFor(node);
 		if (!binding) return false;
 		if (binding.kind === "for") {
+			const body = binding.owner.childForFieldName?.("body");
+			if (
+				binding.owner.children.some((child) => child.type === "var") &&
+				(!body || !contains(body, node))
+			) return false;
 			if (!binding.owner.children.some((child) => child.type === "of")) return false;
 			if (
 				bindingReferences(binding).some(
