@@ -85,13 +85,13 @@ describe("SQL scanner applicability through production project dispatch", () => 
 		expect(rules).toContain("sql-injection");
 	});
 
-	it("applies the NAPI match cap after proven-static candidates", async () => {
-		const file = path.join(env.tmpDir, "after-static-cap.ts");
-		const content = "const SQL = 'SELECT 1';\nclient.query(SQL);\nclient.query(request.body.sql);";
+	it("applies the TSX NAPI match cap after proven-static candidates without twin diagnostics", async () => {
+		const file = path.join(env.tmpDir, "after-static-cap.tsx");
+		const content = "const SQL = 'SELECT 1';\nclient.query(SQL);\nclient.query(request.body.sql);\nexport const View = () => <div />;";
 		fs.writeFileSync(file, content);
 		const sg = await loadAstGrepNapi();
-		const diagnostics = evaluateAstGrepRules(file, sg.ts.parse(content).root(), env.tmpDir, "jsts", { maxMatchesPerRule: 1 });
-		expect(diagnostics.filter(diagnostic => diagnostic.rule === "no-sql-in-code").map(diagnostic => diagnostic.line)).toEqual([3]);
+		const diagnostics = evaluateAstGrepRules(file, sg.tsx.parse(content).root(), env.tmpDir, "jsts", { maxMatchesPerRule: 1 });
+		expect(diagnostics.filter(diagnostic => diagnostic.rule?.startsWith("no-sql-in-code")).map(diagnostic => [diagnostic.rule, diagnostic.line])).toEqual([["no-sql-in-code", 3]]);
 	});
 
 	it.each(["mts", "cts", "mjs", "cjs", "jsx"])("admits .%s to the real NAPI scan", async extension => {
@@ -101,11 +101,46 @@ describe("SQL scanner applicability through production project dispatch", () => 
 		expect(result.diagnostics.some(diagnostic => diagnostic.rule?.startsWith("no-sql-in-code"))).toBe(true);
 	});
 
-	it("keeps the existing explicit TSX rule-language boundary", async () => {
-		const file = path.join(env.tmpDir, "dynamic.tsx");
-		fs.writeFileSync(file, "client.query(sql);\n");
-		const result = await scanProjectDiagnostics({ cwd: env.tmpDir, tier: "cheap", files: [file], maxFiles: 1 });
-		expect(result.diagnostics.some(diagnostic => diagnostic.rule?.startsWith("no-sql-in-code"))).toBe(false);
+	it("scans real TSX syntax while preserving static and parameterized SQL exclusions", async () => {
+		const unsafeFile = path.join(env.tmpDir, "dynamic.tsx");
+		const safeFile = path.join(env.tmpDir, "static.tsx");
+		fs.writeFileSync(unsafeFile, [
+			"let mutableSql = 'SELECT 1';",
+			"export function View({ sql }: { sql: string }) {",
+			"  const shadowedSql = 'SELECT 1';",
+			"  return <button onClick={() => {",
+			"    const shadowedSql = sql; client.query(shadowedSql);",
+			"    mutableSql = sql; client.query(mutableSql);",
+			"    client.query(sql);",
+			"  }}>Run</button>;",
+			"}",
+		].join("\n"));
+		fs.writeFileSync(safeFile, [
+			"const SQL = 'SELECT 1';",
+			"const TABLE = 'users';",
+			"client.query(SQL);",
+			"client.query('SELECT * FROM users WHERE id = $1', [id]);",
+			"client.query(`SELECT * FROM ${TABLE}`);",
+			"export const View = () => <div />;",
+		].join("\n"));
+		const result = await scanProjectDiagnostics({ cwd: env.tmpDir, tier: "cheap", files: [unsafeFile, safeFile], maxFiles: 2 });
+		const sql = result.diagnostics.filter(diagnostic => diagnostic.rule?.startsWith("no-sql-in-code"));
+		expect(sql.filter(diagnostic => diagnostic.filePath === unsafeFile).map(diagnostic => diagnostic.line)).toEqual([5, 6, 7]);
+		expect(sql.filter(diagnostic => diagnostic.filePath === safeFile)).toEqual([]);
+	});
+
+	it("retains recovered and budget-exhausted TSX SQL candidates", async () => {
+		const recoveredFile = path.join(env.tmpDir, "recovered.tsx");
+		const recovered = "export const View = () => <div />;\nconst SQL = 'SELECT 1'; client.query(SQL); }\n";
+		fs.writeFileSync(recoveredFile, recovered);
+		const recoveredResult = await scanProjectDiagnostics({ cwd: env.tmpDir, tier: "cheap", files: [recoveredFile], maxFiles: 1 });
+		expect(recoveredResult.diagnostics.filter(diagnostic => diagnostic.rule?.startsWith("no-sql-in-code")).map(diagnostic => diagnostic.line)).toEqual([2]);
+
+		const budgetFile = path.join(env.tmpDir, "budget.tsx");
+		const budgeted = `${Array.from({ length: 17_000 }, (_, i) => `const value${i} = ${i};`).join("\n")}\nconst SQL = 'SELECT 1';\nclient.query(SQL);\nexport const View = () => <div />;`;
+		const sg = await loadAstGrepNapi();
+		const budgetDiagnostics = evaluateAstGrepRules(budgetFile, sg.tsx.parse(budgeted).root(), env.tmpDir, "jsts");
+		expect(budgetDiagnostics.filter(diagnostic => diagnostic.rule?.startsWith("no-sql-in-code")).map(diagnostic => diagnostic.rule)).toEqual(["no-sql-in-code"]);
 	});
 });
 

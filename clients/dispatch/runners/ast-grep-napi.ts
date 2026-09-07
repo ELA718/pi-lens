@@ -461,10 +461,14 @@ export function evaluateAstGrepRules(
 				}
 				continue;
 			}
-			// Scope TypeScript/JavaScript-tagged rules to the file's actual
-			// grammar (#657) — otherwise a `-js` twin sharing generic node
-			// kinds with its TS sibling double-fires on every .ts file.
-			if (lang && fileLang && lang !== fileLang) {
+			// Scope language-tagged rules to the file's actual grammar (#657).
+			// The TypeScript SQL rule alone also runs against the real TSX root.
+			if (
+				lang &&
+				fileLang &&
+				lang !== fileLang &&
+				!(rule.id === "no-sql-in-code" && lang === "typescript" && fileLang === "tsx")
+			) {
 				continue;
 			}
 
