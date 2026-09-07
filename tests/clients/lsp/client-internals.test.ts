@@ -422,6 +422,7 @@ function createMockState(overrides?: Partial<LSPClientState>): LSPClientState {
 		documentPullDiagnostics: new Map(),
 		documentPullDiagnosticTimestamps: new Map(),
 		pullFailureHistory: [],
+		diagnosticComputationErrors: new Map(),
 		pendingDiagnostics: new Map(),
 		diagnosticPublicationCounts: new Map(),
 		documentOpenedAt: new Map(),
@@ -510,8 +511,8 @@ describe("resolveConfigurationSection (#983)", () => {
 		expect(resolveConfigurationSection(initialization, "scan.nope")).toBe(null);
 	});
 
-	it("returns null for an unknown section when initialization is undefined", () => {
-		expect(resolveConfigurationSection(undefined, "anything")).toBe(null);
+	it("returns an empty supported default when initialization is undefined", () => {
+		expect(resolveConfigurationSection(undefined, "css")).toEqual({});
 	});
 });
 
@@ -1327,6 +1328,35 @@ describe("clientWaitForDiagnostics — pull mode (#240)", () => {
 		const start = Date.now();
 		await clientWaitForDiagnostics(state, TEST_FILE, 1000);
 		expect(Date.now() - start).toBeLessThan(80);
+	});
+
+	it("does not accept an empty pull when the server reports diagnostic computation failure", async () => {
+		const state = pullState();
+		let logHandler: ((params: { type: number; message: string }) => void) | undefined;
+		(
+			state.connection.onNotification as unknown as ReturnType<typeof vi.fn>
+		).mockImplementation(
+			(method: string, handler: (params: { type: number; message: string }) => void) => {
+				if (method === "window/logMessage") logHandler = handler;
+			},
+		);
+		setupIncomingHandlers(state, undefined);
+		expect(logHandler).toBeDefined();
+		state.connection.sendRequest = vi.fn().mockImplementation(async () => {
+			logHandler?.({
+				type: 1,
+				message: `Error while computing diagnostics for ${pathToFileURL(TEST_FILE).href}: validation failed`,
+			});
+			return { kind: "full", items: [] };
+		});
+
+		await clientWaitForDiagnostics(state, TEST_FILE, 50, { pullOnly: true });
+
+		expect(state.documentPullDiagnostics.has(TEST_KEY)).toBe(false);
+		expect(state.diagnosticBindings.has(TEST_KEY)).toBe(false);
+		expect(state.pullFailureHistory.at(-1)?.message).toContain(
+			"Error while computing diagnostics",
+		);
 	});
 
 	it("resolves immediately when the pull returns diagnostics (found)", async () => {
