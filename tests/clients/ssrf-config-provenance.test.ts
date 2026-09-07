@@ -69,6 +69,7 @@ describe("SSRF deployment-configuration provenance", () => {
 		["unrelated loop binding", `for (const Deno of request.runtimes) { void Deno; } fetch(Deno.env.get("URL"));`],
 		["unrelated catch binding", `try {} catch (Deno) { void Deno; } fetch(Deno.env.get("URL"));`],
 		["unrelated mutable-binding shadow", `const cfg = { url: Deno.env.get("URL") }; function unrelated() { const cfg = { url: request.url }; cfg.url = request.other; } fetch(cfg.url);`],
+		["later safe property read", `const cfg = { url: Deno.env.get("URL") }; function send() { fetch(cfg.url); } function inspect() { return cfg.url; } send();`],
 		["unrelated class binding", `{ class Deno {} void Deno; } fetch(Deno.env.get("URL"));`],
 	])("removes $0 destinations", async (_label, code) => {
 		expect(await findings(code)).toHaveLength(0);
@@ -76,6 +77,19 @@ describe("SSRF deployment-configuration provenance", () => {
 
 	it.each([
 		["request input", `async function send(request: { url: string }) { await fetch(request.url); }`],
+		["for-var environment shadow", `function send() { for (var Deno of request.runtimes) {} fetch(Deno.env.get("URL")); }`],
+		["for-const environment shadow", `for (const Deno of request.runtimes) { fetch(Deno.env.get("URL")); }`],
+		["destructured config shadow", `const cfg = { url: Deno.env.get("URL") }; function send() { const { cfg } = request; fetch(cfg.url); }`],
+		["later closure alias", `const cfg = { url: Deno.env.get("URL") }; function send() { fetch(cfg.url); } const alias = cfg; alias.url = request.url; send();`],
+		["named class-expression URL", `const C = class URL { constructor() { this.value = request.url; } toString() { return this.value; } send() { fetch(new URL(Deno.env.get("URL")).toString()); } };`],
+		["named function-expression URL", `const send = function URL() { fetch(new URL(Deno.env.get("URL")).toString()); };`],
+		["renamed destructured environment", `const { runtime: Deno } = request; fetch(Deno.env.get("URL"));`],
+		["array destructured environment", `const [Deno] = request.runtimes; fetch(Deno.env.get("URL"));`],
+		["global environment assignment", `Deno = request.runtime; fetch(Deno.env.get("URL"));`],
+		["global destructured environment assignment", `({ Deno } = request); fetch(Deno.env.get("URL"));`],
+		["bare for environment assignment", `for (Deno of request.runtimes) {} fetch(Deno.env.get("URL"));`],
+		["object embedding alias", `const cfg = { url: Deno.env.get("URL") }; function send() { fetch(cfg.url); } const holder = { cfg }; holder.cfg.url = request.url; send();`],
+		["array embedding alias", `const cfg = { url: Deno.env.get("URL") }; function send() { fetch(cfg.url); } const holder = [cfg]; holder[0].url = request.url; send();`],
 		["object spread override", `const config = { url: Deno.env.get("URL"), ...request.body }; fetch(config.url);`],
 		["computed object override", `const config = { url: Deno.env.get("URL"), [request.key]: request.url }; fetch(config.url);`],
 		["unknown object member", `const config = { url: Deno.env.get("URL"), target() { return request.url; } }; fetch(config.url);`],
@@ -91,6 +105,8 @@ describe("SSRF deployment-configuration provenance", () => {
 		["Object.assign environment mutation", `Object.assign(process.env, { URL: request.url }); fetch(process.env.URL);`],
 		["closure binding mutation", `const cfg = { url: Deno.env.get("URL") }; function mutate() { cfg.url = request.url; } mutate(); fetch(cfg.url);`],
 		["function parameter write", `function dest(url: string) { url = request.url; return url; } fetch(dest(Deno.env.get("URL")));`],
+		["function object-parameter escape", `function dest(config: { url: string }) { mutate(config); return config.url; } fetch(dest({ url: Deno.env.get("URL")! }));`],
+		["function object-parameter alias", `function dest(config: { url: string }) { const alias = config; alias.url = request.url; return config.url; } fetch(dest({ url: Deno.env.get("URL")! }));`],
 		["mixed input", `const base = Deno.env.get("BASE"); function join(a: string, b: string) { return a + b; } async function send(request: { url: string }) { await fetch(join(base!, request.url)); }`],
 		["imported helper", `import { parseEndpoint } from "./config"; async function send() { await fetch(parseEndpoint(Deno.env.get("URL"))); }`],
 		["shadowed environment", `function send(Deno: { env: { get(key: string): string } }) { return fetch(Deno.env.get("URL")); }`],
