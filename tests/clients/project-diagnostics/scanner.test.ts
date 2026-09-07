@@ -157,6 +157,59 @@ describe("scanProjectDiagnostics home ceiling (#747/#250)", () => {
 		expect(snapshot.runners.length).toBeGreaterThan(0);
 	});
 
+	it("flags scanTruncated only when a native maxFiles cap omits an eligible file", async () => {
+		const fakeHome = path.join(tmp, "home", "user");
+		const project = path.join(fakeHome, "code", "app");
+		fs.mkdirSync(project, { recursive: true });
+		fs.writeFileSync(path.join(project, "a.ts"), "export const a = 1;\n");
+		fs.writeFileSync(path.join(project, "b.ts"), "export const b = 1;\n");
+
+		const exact = await scanProjectDiagnostics({
+			cwd: project,
+			tier: "cheap",
+			homeDir: fakeHome,
+			maxFiles: 2,
+		});
+		expect(exact.filesScanned).toBe(2);
+		expect(exact.scanTruncated).toBeUndefined();
+
+		fs.writeFileSync(path.join(project, "c.ts"), "export const c = 1;\n");
+		const overflow = await scanProjectDiagnostics({
+			cwd: project,
+			tier: "cheap",
+			homeDir: fakeHome,
+			maxFiles: 2,
+		});
+		expect(overflow.filesScanned).toBe(2);
+		expect(overflow.scanTruncated).toBe(true);
+	});
+
+	it("flags scanTruncated when an explicit file list exceeds maxFiles", async () => {
+		const files = ["a.ts", "b.ts", "c.ts"].map((name) => {
+			const file = path.join(tmp, name);
+			fs.writeFileSync(file, "export {};\n");
+			return file;
+		});
+
+		const exact = await scanProjectDiagnostics({
+			cwd: tmp,
+			tier: "cheap",
+			files: files.slice(0, 2),
+			maxFiles: 2,
+		});
+		expect(exact.filesScanned).toBe(2);
+		expect(exact.scanTruncated).toBeUndefined();
+
+		const overflow = await scanProjectDiagnostics({
+			cwd: tmp,
+			tier: "cheap",
+			files,
+			maxFiles: 2,
+		});
+		expect(overflow.filesScanned).toBe(2);
+		expect(overflow.scanTruncated).toBe(true);
+	});
+
 	it("omits scanTruncated entirely on an untruncated scan", async () => {
 		const fakeHome = path.join(tmp, "home", "user");
 		const project = path.join(fakeHome, "code", "app");

@@ -426,11 +426,14 @@ export async function scanProjectDiagnostics(
 	// so callers don't read the partial result as a complete sweep.
 	// #1107 phase 2: typed as the full `SourceCollectionResult` (not just its
 	// `{files, entryBudgetExceeded}` shape) so the generated-skip counters
-	// below are readable through the ternary — the `options.files` branch
-	// legitimately never walked, so it leaves them `undefined`, same
-	// convention as `entryBudgetExceeded: false` above it.
+	// below are readable through the ternary. The explicit-list branch knows its
+	// full input length, so it can account for file-budget overflow without a walk.
 	const collected: SourceCollectionResult = options.files
-		? { files: options.files.slice(0, maxFiles), entryBudgetExceeded: false }
+		? {
+				files: options.files.slice(0, maxFiles),
+				entryBudgetExceeded: false,
+				fileBudgetExceeded: options.files.length > maxFiles,
+			}
 		: await collectSourceFilesWithBudgetAsync(cwd, {
 				maxFiles,
 				maxScanEntries: options.maxScanEntries,
@@ -466,9 +469,11 @@ export async function scanProjectDiagnostics(
 		filesScanned,
 		runners,
 	};
-	// #760: only present when true — keeps existing snapshots/serializations
-	// byte-identical for the untruncated (normal) case.
-	if (collected.entryBudgetExceeded) snapshot.scanTruncated = true;
+	// Only present when true — keeps untruncated snapshots byte-identical while
+	// making either independent collection budget visible.
+	if (collected.entryBudgetExceeded || collected.fileBudgetExceeded) {
+		snapshot.scanTruncated = true;
+	}
 	// #1107 phase 2: only present when nonzero, same convention as the
 	// truncation flag above — a healthy scan with no generated-name skips
 	// produces a byte-identical snapshot to before this change.

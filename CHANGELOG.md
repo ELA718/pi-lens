@@ -14,6 +14,10 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- Project diagnostics now report truncation when a file limit omits eligible
+  files. Exact-size exhausted inventories remain complete, and entry-budget
+  exhaustion stays independently visible. (refs #6)
+
 - Workspace diagnostics warm the selected primary language server without
   waiting for unused alternatives. Selected fallbacks still warm normally,
   and unavailable or unresponsive providers remain incomplete. (refs #6)

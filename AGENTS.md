@@ -1,5 +1,11 @@
 # pi-lens — agent context
 
+Project scan coverage distinguishes file-budget overflow from entry-budget
+exhaustion. Collectors inspect one additional eligible file to prove overflow;
+an exhausted inventory exactly at the cap remains complete. Explicit file
+lists use their known length. Both budget flags propagate to scanTruncated,
+while cancellation and code-first selection retain their existing contracts. (refs #6)
+
 Workspace warm-up gates the canonical primary provider actually selected for
 the representative file. Registered alternatives remain selectable fallbacks;
 an unselected fallback cannot mark a healthy primary cold. Preserve the selected

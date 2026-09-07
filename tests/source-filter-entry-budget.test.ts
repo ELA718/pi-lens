@@ -56,6 +56,7 @@ describe("collect walk entry budget (#760)", () => {
 
 		const result = collectSourceFilesWithBudget(dir, { maxScanEntries: 10 });
 		expect(result.entryBudgetExceeded).toBe(true);
+		expect(result.fileBudgetExceeded).toBe(false);
 		expect(result.files.length).toBeLessThan(full.length);
 		// Best-effort truncation, not garbage: everything kept is a real result.
 		for (const f of result.files) expect(full).toContain(f);
@@ -115,16 +116,83 @@ describe("collect walk entry budget (#760)", () => {
 		const capped = collectSourceFilesWithBudget(dir, { maxFiles: 2 });
 		expect(capped.files.length).toBe(2);
 		expect(capped.entryBudgetExceeded).toBe(false);
+		expect(capped.fileBudgetExceeded).toBe(true);
 
 		const cappedAsync = await collectSourceFilesWithBudgetAsync(dir, {
 			maxFiles: 2,
 		});
 		expect(cappedAsync.files.length).toBe(2);
 		expect(cappedAsync.entryBudgetExceeded).toBe(false);
+		expect(cappedAsync.fileBudgetExceeded).toBe(true);
 
 		// The plain string[] collectors keep their existing contract verbatim.
 		expect(collectSourceFiles(dir, { maxFiles: 2 }).length).toBe(2);
 		expect((await collectSourceFilesAsync(dir, { maxFiles: 2 })).length).toBe(2);
+	});
+
+	it("distinguishes exhausted inventories from maxFiles overflow in sync and async walks", async () => {
+		for (const fileCount of [1, 2, 3]) {
+			const dir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "source-filter-file-cap-"),
+			);
+			cleanups.push(() => removeTempDirSync(dir));
+			for (let i = 0; i < fileCount; i++) {
+				fs.writeFileSync(path.join(dir, `${i}.ts`), "export {};\n");
+			}
+
+			const sync = collectSourceFilesWithBudget(dir, { maxFiles: 2 });
+			const async = await collectSourceFilesWithBudgetAsync(dir, {
+				maxFiles: 2,
+			});
+
+			expect(sync.files.length).toBe(Math.min(fileCount, 2));
+			expect(async.files).toEqual(sync.files);
+			expect(sync.fileBudgetExceeded).toBe(fileCount > 2);
+			expect(async.fileBudgetExceeded).toBe(sync.fileBudgetExceeded);
+			expect(sync.entryBudgetExceeded).toBe(false);
+			expect(async.entryBudgetExceeded).toBe(false);
+		}
+	});
+
+	it("counts only eligible files toward overflow and preserves priority ordering", async () => {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "source-filter-file-cap-policy-"),
+		);
+		cleanups.push(() => removeTempDirSync(dir));
+		fs.writeFileSync(path.join(dir, ".gitignore"), "ignored.ts\n");
+		fs.writeFileSync(path.join(dir, "ignored.ts"), "export {};\n");
+		fs.mkdirSync(path.join(dir, "generated"));
+		fs.writeFileSync(path.join(dir, "generated", "hidden.ts"), "export {};\n");
+		fs.writeFileSync(path.join(dir, "data.json"), "{}\n");
+		fs.mkdirSync(path.join(dir, "src"));
+		fs.writeFileSync(path.join(dir, "src", "a.ts"), "export {};\n");
+
+		const exact = collectSourceFilesWithBudget(dir, {
+			maxFiles: 2,
+			prioritizeCodeKinds: true,
+		});
+		expect(exact.fileBudgetExceeded).toBe(false);
+		expect(exact.files.map((file) => path.basename(file))).toEqual([
+			"a.ts",
+			"data.json",
+		]);
+
+		fs.writeFileSync(path.join(dir, "src", "b.ts"), "export {};\n");
+		const sync = collectSourceFilesWithBudget(dir, {
+			maxFiles: 2,
+			prioritizeCodeKinds: true,
+		});
+		const async = await collectSourceFilesWithBudgetAsync(dir, {
+			maxFiles: 2,
+			prioritizeCodeKinds: true,
+		});
+		expect(sync.fileBudgetExceeded).toBe(true);
+		expect(async.fileBudgetExceeded).toBe(true);
+		expect(sync.files.map((file) => path.basename(file))).toEqual([
+			"a.ts",
+			"b.ts",
+		]);
+		expect(async.files).toEqual(sync.files);
 	});
 
 	it("plain collectors return the same (possibly truncated) list as the budget core", async () => {
