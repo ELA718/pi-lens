@@ -1613,8 +1613,10 @@ credential rules and opaque values remain active, including in tests. SQL
 scanners allow static statements and separately bound values. Ast-grep emits
 conservative argument-1 candidates, then the shared bounded provenance filter
 removes only constants proven against the exact NAPI or ast-grep LSP content
-snapshot. Unknown bindings, stale or ambiguous ranges, parse errors, shadowing,
-mutation, cycles, and exhausted budgets stay findings. SSRF inspects the destination
+snapshot. Unknown bindings, stale or ambiguous ranges, recovered parse errors,
+shadowing, mutation, cycles, and exhausted budgets stay findings. Candidate shape
+is not an exemption, and proven-static candidates never consume the finding cap.
+SSRF inspects the destination
 argument, not request options. Private Supabase transport hooks require a sole
 SDK registration and a configured destination; exported or independently called
 hooks remain unproven. HTML exemptions require an imported DOMPurify sanitizer

@@ -4,10 +4,9 @@ message: "SQL injection risk — parameterize dynamic query values"
 severity: error
 note: |
   Static SQL and placeholders with separately bound values are safe.
-  This syntax rule reports SQL composed directly from member access,
-  calls, indexing, or other dynamic expressions in argument 1. The
-  tree-sitter SQL rule handles bare-identifier provenance and accepts
-  only visible, unique, immutable constants.
+  This syntax rule reports non-literal expressions in argument 1. Production
+  runners discard only expressions proven to be visible immutable constants;
+  raw CLI output remains conservative when provenance is unavailable.
 rule:
   all:
     - any:
@@ -15,13 +14,13 @@ rule:
         - pattern: $DB.query($SQL, $$$REST)
 constraints:
   SQL:
-    all:
-      - any:
-          - kind: identifier
-          - kind: call_expression
-          - kind: member_expression
-          - kind: subscript_expression
-          - kind: binary_expression
-          - kind: template_string
+    not:
+      any:
+        - kind: string
+        - kind: number
+        - kind: arrow_function
+        - kind: function_expression
+        - kind: template_string
+          not:
             has:
               kind: template_substitution

@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { loadAstGrepNapi } from "../../../../clients/deps/ast-grep-napi.js";
+import { evaluateAstGrepRules } from "../../../../clients/dispatch/runners/ast-grep-napi.js";
 import { scanProjectDiagnostics } from "../../../../clients/project-diagnostics/scanner.js";
 import { __filterClientSqlDiagnosticsForTest } from "../../../../clients/lsp/index.js";
 import { filterBoundAstGrepSqlDiagnostics } from "../../../../clients/sql-provenance.js";
@@ -41,6 +42,7 @@ describe("SQL scanner applicability through production project dispatch", () => 
 				'client.query("SELECT * FROM users WHERE id = $1", [id]);',
 				'client.query("status", ["SELECT * FROM audit_log"]);',
 				'const TABLE = "users"; client.query(`SELECT * FROM ${TABLE}`);',
+				'client.query(("SELECT 1"));',
 			].join("\n"),
 		);
 		fs.writeFileSync(
@@ -49,6 +51,11 @@ describe("SQL scanner applicability through production project dispatch", () => 
 				"client.query(`SELECT * FROM users WHERE id = ${request.params.id}`);",
 				'client.query("SELECT * FROM users WHERE id = " + request.params.id);',
 				"const part = 'fixed'; consume(part => client.query('SELECT ' + part));",
+				"client.query((request.body.sql));",
+				"client.query(flag ? request.body.sql : 'SELECT 1');",
+				"client.query(await getSql());",
+				"client.query(request.body.sql as string);",
+				"client.query(<string>request.body.sql);",
 			].join("\n"),
 		);
 
@@ -65,8 +72,26 @@ describe("SQL scanner applicability through production project dispatch", () => 
 		expect(result.filesScanned).toBe(2);
 		expect(sql.filter(diagnostic => diagnostic.filePath === staticFile)).toEqual([]);
 		expect(sql.filter(diagnostic => diagnostic.filePath === dynamicFile).map(diagnostic => diagnostic.line)).toEqual(
-			expect.arrayContaining([1, 2, 3]),
+			expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8]),
 		);
+	});
+
+	it("retains recovered-error candidates in both production SQL detectors", async () => {
+		const file = path.join(env.tmpDir, "malformed.ts");
+		fs.writeFileSync(file, "const SQL = 'SELECT 1'; client.query(SQL); }\n");
+		const result = await scanProjectDiagnostics({ cwd: env.tmpDir, tier: "cheap", files: [file], maxFiles: 1 });
+		const rules = result.diagnostics.map(diagnostic => diagnostic.rule);
+		expect(rules).toContain("no-sql-in-code");
+		expect(rules).toContain("sql-injection");
+	});
+
+	it("applies the NAPI match cap after proven-static candidates", async () => {
+		const file = path.join(env.tmpDir, "after-static-cap.ts");
+		const content = "const SQL = 'SELECT 1';\nclient.query(SQL);\nclient.query(request.body.sql);";
+		fs.writeFileSync(file, content);
+		const sg = await loadAstGrepNapi();
+		const diagnostics = evaluateAstGrepRules(file, sg.ts.parse(content).root(), env.tmpDir, "jsts", { maxMatchesPerRule: 1 });
+		expect(diagnostics.filter(diagnostic => diagnostic.rule === "no-sql-in-code").map(diagnostic => diagnostic.line)).toEqual([3]);
 	});
 
 	it.each(["mts", "cts", "mjs", "cjs", "jsx"])("admits .%s to the real NAPI scan", async extension => {

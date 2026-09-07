@@ -18,7 +18,9 @@ All notable changes to pi-lens will be documented in this file.
 
 - SQL injection scanning now allows static and parameterized SQL while retaining
   dynamic argument-1 findings. Ast-grep NAPI now covers `.mts`, `.cts`, `.mjs`,
-  and `.cjs`, and production ast-grep paths use exact-snapshot provenance.
+  and `.cjs`, and production ast-grep paths use exact-snapshot provenance. Recovered
+  parse errors and unknown expression shapes fail closed, and safe candidates do
+  not consume the per-rule finding cap.
 
 ## [4.0.0] - 2026-08-14
 

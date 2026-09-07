@@ -506,9 +506,8 @@ export function evaluateAstGrepRules(
 					);
 				}
 
-				const limitedMatches = matches.slice(0, maxMatchesPerRule);
-
-				for (const match of limitedMatches) {
+				let keptMatches = 0;
+				for (const match of matches) {
 					if (diagnostics.length >= maxTotalDiagnostics) break;
 
 					const node = match as SgNode & {
@@ -518,6 +517,8 @@ export function evaluateAstGrepRules(
 						(rule.id === "no-sql-in-code" || rule.id === "no-sql-in-code-js") &&
 						isProvenStaticSqlNapiMatch(node)
 					) continue;
+					if (keptMatches >= maxMatchesPerRule) break;
+					keptMatches++;
 					const range = node.range();
 					const severity = rule.severity === "error" ? "error" : "warning";
 					const semantic = severity === "error" ? "blocking" : "warning";

@@ -8,8 +8,14 @@ valid:
   - 'db.query("UPDATE users SET x = 1")'
   - 'db.query("SELECT * FROM users WHERE id = $1", [id])'
   - 'db.query("status", ["SELECT * FROM audit_log"])'
+  - 'db.query(() => "SELECT 1")'
 invalid:
 
   - 'db.query(sql)'
   - 'db.query(`SELECT * FROM users WHERE id = ${request.params.id}`)'
   - 'db.query("SELECT * FROM users WHERE id = " + request.params.id)'
+  - 'db.query((request.body.sql))'
+  - 'db.query(flag ? request.body.sql : "SELECT 1")'
+  - 'db.query(await getSql())'
+  - 'db.query(request.body.sql as string)'
+  - 'db.query(<string>request.body.sql)'

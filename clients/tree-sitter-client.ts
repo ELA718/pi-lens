@@ -3358,10 +3358,8 @@ export class TreeSitterClient {
 				if (!rootNode) return true;
 				{
 					const sqlArg = captures.SQL_ARG ?? captures.INTERPOLATION?.children.find(child => child.isNamed);
-					if (!sqlArg || ![
-						"identifier", "binary_expression", "template_string",
-						"call_expression", "member_expression", "subscript_expression",
-					].includes(sqlArg.type)) return false;
+					if (!sqlArg) return true;
+					if (["arrow_function", "function_expression"].includes(sqlArg.type)) return false;
 					return !this.isStaticSqlExpression(sqlArg, rootNode);
 				}
 			case "ts_command_injection_sink":

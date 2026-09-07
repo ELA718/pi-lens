@@ -97,28 +97,43 @@ function resolveVisibleConst<Node>(
 	return null;
 }
 
-export function isStaticSqlExpression<Node>(
+function hasParseErrorOrExhaustedBudget<Node>(
+	root: Node,
+	adapter: SqlSyntaxAdapter<Node>,
+	budget: ResolutionBudget,
+): boolean {
+	const stack = [root];
+	while (stack.length > 0) {
+		if (!spend(budget)) return true;
+		const node = stack.pop()!;
+		if (adapter.kind(node) === "ERROR") return true;
+		stack.push(...adapter.children(node));
+	}
+	return false;
+}
+
+function resolveStaticSqlExpression<Node>(
 	node: Node | null,
 	root: Node,
 	adapter: SqlSyntaxAdapter<Node>,
 	seen = new Set<string>(),
-	budget: ResolutionBudget = { remaining: MAX_TRAVERSED_NODES },
+	budget: ResolutionBudget,
 	depth = 0,
 ): boolean {
 	if (!node || depth > MAX_RESOLUTION_DEPTH || !spend(budget)) return false;
 	const kind = adapter.kind(node);
 	if (kind === "string" || kind === "number") return true;
 	if (kind === "parenthesized_expression") {
-		return isStaticSqlExpression(adapter.children(node).find(adapter.isNamed) ?? null, root, adapter, seen, budget, depth + 1);
+		return resolveStaticSqlExpression(adapter.children(node).find(adapter.isNamed) ?? null, root, adapter, seen, budget, depth + 1);
 	}
 	if (kind === "binary_expression") {
 		if (!adapter.children(node).some(child => !adapter.isNamed(child) && adapter.text(child) === "+")) return false;
-		return isStaticSqlExpression(adapter.field(node, "left"), root, adapter, new Set(seen), budget, depth + 1) &&
-			isStaticSqlExpression(adapter.field(node, "right"), root, adapter, new Set(seen), budget, depth + 1);
+		return resolveStaticSqlExpression(adapter.field(node, "left"), root, adapter, new Set(seen), budget, depth + 1) &&
+			resolveStaticSqlExpression(adapter.field(node, "right"), root, adapter, new Set(seen), budget, depth + 1);
 	}
 	if (kind === "template_string") {
 		for (const child of adapter.children(node).filter(part => adapter.kind(part) === "template_substitution")) {
-			if (!isStaticSqlExpression(adapter.children(child).find(adapter.isNamed) ?? null, root, adapter, new Set(seen), budget, depth + 1)) return false;
+			if (!resolveStaticSqlExpression(adapter.children(child).find(adapter.isNamed) ?? null, root, adapter, new Set(seen), budget, depth + 1)) return false;
 		}
 		return true;
 	}
@@ -128,7 +143,17 @@ export function isStaticSqlExpression<Node>(
 	const value = resolveVisibleConst(name, node, root, adapter, budget);
 	if (!value) return false;
 	seen.add(name);
-	return isStaticSqlExpression(value, root, adapter, seen, budget, depth + 1);
+	return resolveStaticSqlExpression(value, root, adapter, seen, budget, depth + 1);
+}
+
+export function isStaticSqlExpression<Node>(
+	node: Node | null,
+	root: Node,
+	adapter: SqlSyntaxAdapter<Node>,
+): boolean {
+	const budget = { remaining: MAX_TRAVERSED_NODES };
+	return !hasParseErrorOrExhaustedBudget(root, adapter, budget) &&
+		resolveStaticSqlExpression(node, root, adapter, new Set(), budget);
 }
 
 const napiAdapter: SqlSyntaxAdapter<SgNode> = {
@@ -204,7 +229,6 @@ export async function filterBoundAstGrepSqlDiagnostics(
 		const language = languageForFile(sg, filePath);
 		if (!language) return diagnostics;
 		const root = language.parse(content).root();
-		if (root.findAll({ rule: { kind: "ERROR" } } as never).length > 0) return diagnostics;
 		const calls = root.findAll({ rule: { kind: "call_expression" } } as never);
 		return diagnostics.filter(diagnostic => {
 			if (!isSqlCandidate(diagnostic)) return true;
