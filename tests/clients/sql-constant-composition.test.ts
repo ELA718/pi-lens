@@ -31,6 +31,8 @@ describe("SQL composition provenance", () => {
 		"new RegExp(pattern).exec(input);",
 		"RegExp(pattern).exec(input);",
 		"const matcher = /^fixed$/; matcher.exec(input);",
+		"const matcher = /^fixed$/g; const match = matcher.exec(input);",
+		"const matcher = /^fixed$/g; let match; while ((match = matcher.exec(input)) !== null) {}",
 		"const matcher = /^fixed$/g; matcher.lastIndex = 0; matcher.exec(input);",
 	])("accepts only source-proven RegExp execution: %s", async code => {
 		expect(await findings(code)).toHaveLength(0);
@@ -82,13 +84,31 @@ describe("SQL composition provenance", () => {
 		"type RegExp = SqlExecutor; (value as RegExp).exec(input);",
 		"const matcher = /^fixed$/; let alias; alias = matcher; alias.exec = sql.exec; matcher.exec(input);",
 		"const matcher = /^fixed$/; Object.defineProperty(matcher, 'exec', { value: sql.exec }); matcher.exec(input);",
+		"RegExp.prototype.exec = db.exec; /x/.exec(userInput);",
+		"const matcher = /x/; RegExp.prototype.exec = db.exec; matcher.exec(userInput);",
+		"const matcher = /x/; const box = { matcher }; box.matcher.exec = db.exec; matcher.exec(userInput);",
+		"const matcher = /x/; const list = [matcher]; list[0].exec = db.exec; matcher.exec(userInput);",
+		"const matcher = /x/; const alias = (matcher); alias.exec = db.exec; matcher.exec(userInput);",
+		"const proto = RegExp.prototype; proto.exec = db.exec; /x/.exec(input);",
+		"Object.assign(RegExp.prototype, { exec: db.exec }); /x/.exec(input);",
+		"const globals = globalThis; globals.RegExp.prototype.exec = db.exec; /x/.exec(input);",
+		"globalThis['RegExp'].prototype.exec = db.exec; /x/.exec(input);",
 		"db.exec(request.body.sql);",
 	])("retains unproven, mutable, shadowed, hoisted, or SQL exec calls: %s", async code => {
 		expect((await findings(code)).length).toBeGreaterThan(0);
 	});
 
+	it("fails closed on missing syntax nodes", async () => {
+		expect((await findings("const matcher = /x/; matcher.exec(input); function broken() {")).length).toBeGreaterThan(0);
+	});
+
 	it("fails closed when RegExp proof exceeds its node budget", async () => {
 		const code = `${"const filler = 0;".repeat(10_001)} const matcher = /x/; matcher.exec(input);`;
+		expect((await findings(code)).length).toBeGreaterThan(0);
+	});
+
+	it("fails closed before queueing a root wider than its node budget", async () => {
+		const code = `const wide = [${Array.from({ length: 10_001 }, () => "0").join(",")}]; /x/.exec(input);`;
 		expect((await findings(code)).length).toBeGreaterThan(0);
 	});
 

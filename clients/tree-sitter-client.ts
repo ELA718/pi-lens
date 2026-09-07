@@ -88,6 +88,7 @@ interface TreeSitterNode {
 	children: TreeSitterNode[];
 	parent?: TreeSitterNode | null;
 	isNamed: boolean;
+	isMissing?: boolean;
 	childCount: number;
 	startPosition: { row: number; column: number };
 	startIndex: number;
@@ -1989,23 +1990,33 @@ export class TreeSitterClient {
 		if (!nodes) {
 			const collected: TreeSitterNode[] = [];
 			const pending = [root];
-			while (pending.length > 0 && collected.length < NO_NESTED_ANCHOR_VISIT_CAP) {
+			while (pending.length > 0) {
 				const current = pending.pop();
 				if (!current) continue;
 				collected.push(current);
-				pending.push(...current.children);
+				const remaining = NO_NESTED_ANCHOR_VISIT_CAP - collected.length - pending.length;
+				if (current.childCount > remaining) return false;
+				const children = current.children;
+				if (children.length > remaining) return false;
+				for (const child of children) pending.push(child);
 			}
-			if (pending.length > 0 || collected.some((candidate) => candidate.type === "ERROR")) {
+			if (collected.some((candidate) => candidate.type === "ERROR" || candidate.isMissing)) {
 				return false;
 			}
 			nodes = collected;
 		}
 
+		const references = new Map<string, TreeSitterNode[]>();
+		for (const candidate of nodes) {
+			if (!["identifier", "shorthand_property_identifier"].includes(candidate.type)) continue;
+			const bucket = references.get(candidate.text) ?? [];
+			bucket.push(candidate);
+			references.set(candidate.text, bucket);
+		}
+
 		const containsIdentifier = (container: TreeSitterNode, name: string) =>
-			nodes!.some(
+			(references.get(name) ?? []).some(
 				(candidate) =>
-					candidate.type === "identifier" &&
-					candidate.text === name &&
 					candidate.startIndex >= container.startIndex &&
 					candidate.endIndex <= container.endIndex,
 			);
@@ -2022,6 +2033,34 @@ export class TreeSitterClient {
 						: container;
 			return !!binding && containsIdentifier(binding, name);
 		};
+		const isSameNode = (left: TreeSitterNode | null | undefined, right: TreeSitterNode) =>
+			left?.startIndex === right.startIndex && left.endIndex === right.endIndex;
+		const isNativeRegExpConstructorReference = (candidate: TreeSitterNode) => {
+			if (candidate.type !== "identifier" || candidate.text !== "RegExp") return false;
+			const parent = candidate.parent;
+			if (parent?.type === "new_expression") {
+				return isSameNode(parent.childForFieldName?.("constructor"), candidate);
+			}
+			return parent?.type === "call_expression" &&
+				isSameNode(parent.childForFieldName?.("function"), candidate);
+		};
+		const unsafeRegExpEnvironment = [
+			...(references.get("RegExp") ?? []),
+			...(references.get("globalThis") ?? []),
+		].some((candidate) => {
+			if (candidate.text === "RegExp") return !isNativeRegExpConstructorReference(candidate);
+			const parent = candidate.parent;
+			if (!parent || !isSameNode(parent.childForFieldName?.("object"), candidate)) return true;
+			if (parent.type === "member_expression") {
+				return parent.childForFieldName?.("property")?.text === "RegExp";
+			}
+			if (parent.type !== "subscript_expression") return true;
+			const index = parent.childForFieldName?.("index");
+			if (index?.type !== "string") return true;
+			return index.text.slice(1, -1) === "RegExp";
+		});
+		if (unsafeRegExpEnvironment) return false;
+
 		if (node.type === "regex") return true;
 		if (node.type === "parenthesized_expression") {
 			return this.isProvenRegExpReceiver(
@@ -2036,20 +2075,41 @@ export class TreeSitterClient {
 				node.type === "new_expression" ? "constructor" : "function",
 			);
 			if (constructor?.type !== "identifier" || constructor.text !== "RegExp") return false;
-			const shadowsOrWritesGlobal = nodes.some((candidate) => {
-				const name = candidate.childForFieldName?.("name");
-				const left = candidate.childForFieldName?.("left")?.text ?? "";
-				return (
-					(["variable_declarator", "function_declaration", "class_declaration", "type_alias_declaration"].includes(candidate.type) && name?.text === "RegExp") ||
-					(["import_clause", "import_specifier", "namespace_import"].includes(candidate.type) && containsIdentifier(candidate, "RegExp")) ||
-					(["formal_parameters", "catch_clause", "object_pattern", "array_pattern", "for_in_statement"].includes(candidate.type) && bindingContainsIdentifier(candidate, "RegExp")) ||
-					(["assignment_expression", "augmented_assignment_expression"].includes(candidate.type) && /^(?:RegExp|globalThis\.RegExp|RegExp\.prototype(?:\.|$))/.test(left)) ||
-					(candidate.type === "call_expression" && /^(?:Object\.)?defineProperty\((?:RegExp(?:\.prototype)?|globalThis\s*,\s*["']RegExp["'])/.test(candidate.text))
-				);
-			});
-			return !shadowsOrWritesGlobal;
+			return true;
 		}
 		if (node.type !== "identifier") return false;
+		const isLocalReceiverReference = (candidate: TreeSitterNode) => {
+			let expression = candidate;
+			let wrappers = 0;
+			while (
+				expression.parent?.type === "parenthesized_expression" &&
+				expression.parent.children.some(
+					(child) => child.isNamed && isSameNode(child, expression),
+				)
+			) {
+				if (++wrappers > 8) return false;
+				expression = expression.parent;
+			}
+			const member = expression.parent;
+			if (
+				member?.type !== "member_expression" ||
+				!isSameNode(member.childForFieldName?.("object"), expression)
+			) {
+				return false;
+			}
+			const property = member.childForFieldName?.("property")?.text;
+			if (property === "lastIndex") return true;
+			return property === "exec" &&
+				member.parent?.type === "call_expression" &&
+				isSameNode(member.parent.childForFieldName?.("function"), member);
+		};
+		const containsEscapingIdentifier = (container: TreeSitterNode, name: string) =>
+			(references.get(name) ?? []).some(
+				(candidate) =>
+					candidate.startIndex >= container.startIndex &&
+					candidate.endIndex <= container.endIndex &&
+					!isLocalReceiverReference(candidate),
+			);
 
 		const declarators = nodes.filter(
 			(candidate) =>
@@ -2082,18 +2142,20 @@ export class TreeSitterClient {
 				return true;
 			}
 			if (candidate.type === "variable_declarator" && candidate !== declarator) {
-				return candidate.childForFieldName?.("value")?.text === node.text;
+				const value = candidate.childForFieldName?.("value");
+				return !!value && containsEscapingIdentifier(value, node.text);
 			}
 			if (
 				candidate.type === "call_expression" &&
 				candidate.childForFieldName?.("arguments")?.children.some(
-					(argument) => argument.isNamed && argument.text === node.text,
+					(argument) => argument.isNamed && containsEscapingIdentifier(argument, node.text),
 				)
 			) {
 				return true;
 			}
 			if (!["assignment_expression", "augmented_assignment_expression"].includes(candidate.type)) return false;
-			if (candidate.childForFieldName?.("right")?.text === node.text) return true;
+			const right = candidate.childForFieldName?.("right");
+			if (right && containsEscapingIdentifier(right, node.text)) return true;
 			const left = candidate.childForFieldName?.("left");
 			if (left?.type === "identifier" && left.text === node.text) return true;
 			if (left?.childForFieldName?.("object")?.text !== node.text) return false;
