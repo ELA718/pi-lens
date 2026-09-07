@@ -1,4 +1,5 @@
 import path from "node:path";
+import { toPosix } from "../path-utils.js";
 
 /**
  * Language ID Mappings for LSP
@@ -208,12 +209,17 @@ export const LANGUAGE_EXTENSIONS: Record<string, string> = {
  * Get language ID for a file path
  */
 export function getLanguageId(filePath: string): string | undefined {
+	const base = path.posix.basename(toPosix(filePath));
+	// TypeScript/JavaScript project configs allow comments even with a .json
+	// extension. The document language must match before didOpen validation.
+	if (/^(?:tsconfig|jsconfig)(?:\.[^/]+)?\.json$/i.test(base)) {
+		return "jsonc";
+	}
 	const ext = path.extname(filePath).toLowerCase();
 	if (ext && LANGUAGE_EXTENSIONS[ext]) {
 		return LANGUAGE_EXTENSIONS[ext];
 	}
 
-	const base = path.basename(filePath);
 	return LANGUAGE_EXTENSIONS[base] ?? LANGUAGE_EXTENSIONS[base.toLowerCase()];
 }
 

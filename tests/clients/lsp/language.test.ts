@@ -16,6 +16,26 @@ describe("lsp language mapping", () => {
 		expect(getLanguageId("src/CMakeLists.txt")).toBe("cmake");
 	});
 
+	it.each([
+		"tsconfig.json", "tsconfig.app.json", "tsconfig.build.strict.json",
+		"jsconfig.json", "jsconfig.test.json", "config/tsconfig.node.json",
+		"config\\tsconfig.node.json", "config/TSCONFIG.APP.JSON",
+	])("opens compiler config %s as JSONC", (filePath) => {
+		expect(getLanguageId(filePath)).toBe("jsonc");
+	});
+
+	it.each([
+		"package.json", "data.json", "tsconfig-data.json", "mytsconfig.json",
+		"tsconfig.json/data.json", "config\\tsconfig.json\\data.json",
+		"tsconfig.json.template", "tsconfig.app.json.ts",
+	])("does not relax unrelated file %s to JSONC", (filePath) => {
+		expect(getLanguageId(filePath)).not.toBe("jsonc");
+	});
+
+	it("keeps explicit JSONC extension support", () => {
+		expect(getLanguageId("settings.jsonc")).toBe("jsonc");
+	});
+
 	it("returns undefined when no mapping exists", () => {
 		expect(getLanguageId("README")).toBeUndefined();
 	});

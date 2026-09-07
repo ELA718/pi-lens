@@ -1,5 +1,11 @@
 # pi-lens — agent context
 
+LSP document language selection treats `tsconfig.json`, `jsconfig.json`, and
+their dot-qualified `.json` variants as JSONC before extension lookup. Match
+the basename after canonical separator folding, so nested POSIX/Windows paths
+agree; ordinary JSON stays strict. This shared language ID governs didOpen,
+rename reopen, and workspace diagnostics, not diagnostic suppression. (refs #6)
+
 Advisory caches must carry immutable capture provenance and validate it again
 at every delivery surface. A finding is current only when session/turn state
 matches and every affected file is SHA-256-confirmed (size+mtime is only the
