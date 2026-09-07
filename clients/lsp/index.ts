@@ -4339,10 +4339,11 @@ export class LSPService {
 	 * merely still indexing is not broken and must not be cooldown-banned across
 	 * the whole session — it just wasn't ready for THIS sweep.
 	 *
-	 * "Failed warm-up" is measured per non-auxiliary server via the SAME
-	 * `demonstratedReady` signal `touchFile` marks on a confirmed round trip: a
-	 * server whose key is still absent from `demonstratedReady` after both
-	 * attempts never proved it can answer diagnostics. Warm-up stays
+	 * "Failed warm-up" is measured for the canonical primary that
+	 * `getClientForFile` actually selects, via the SAME `demonstratedReady`
+	 * signal `touchFile` marks on a confirmed round trip. Ordered alternatives
+	 * are fallbacks, not parallel diagnostic contributors, so an unselected
+	 * fallback cannot condemn a healthy selected provider. Warm-up stays
 	 * `clientScope:"primary"` (not the sweep's `"all"`) on purpose: `"all"`
 	 * would additionally spawn the sweep-EXCLUDED auxiliaries
 	 * (`WORKSPACE_SWEEP_EXCLUDED_SERVER_IDS`), and because `touchFile`'s
@@ -4368,38 +4369,40 @@ export class LSPService {
 		if (this.checkDestroyed() || options.signal?.aborted) {
 			return { performedWarmup: false, failedServerIds: [] };
 		}
-		const servers = getServersForFileWithConfig(representativeFile).filter(
+		const candidates = getServersForFileWithConfig(representativeFile).filter(
 			(s) => s.role !== "auxiliary",
 		);
-		if (servers.length === 0) {
+		if (candidates.length === 0) {
 			return { performedWarmup: false, failedServerIds: [] };
 		}
-
-		// A server with no resolvable root never spawns a client for this file
-		// either way, so it can't block "already warm" — only servers that WILL
-		// actually be used count toward the readiness check. Same key
-		// derivation `touchFile` uses to mark readiness (`demonstratedReadyKeyFor`)
-		// so this lines up exactly regardless of what a client instance itself
-		// reports as its `.root`.
-		const keys = await Promise.all(
-			servers.map((server) =>
-				this.demonstratedReadyKeyFor(server, representativeFile),
-			),
+		const timeoutMs = options.timeoutMs ?? warmupTimeoutMs();
+		const selected = await this.getClientForFile(
+			representativeFile,
+			timeoutMs,
+			timeoutMs,
 		);
+		if (!selected) {
+			return {
+				performedWarmup: false,
+				failedServerIds: [candidates[0].id],
+			};
+		}
+		const servers = [selected.info];
+
+		// Use the exact selected server/root identity that touchFile uses for
+		// readiness. Registered alternatives are not part of this warm-up.
+		const keys = [await this.clientKeyFor(selected, representativeFile)];
 		const alreadyWarm = keys.every(
 			(key) => key === undefined || this.state.demonstratedReady.has(key),
 		);
 		if (alreadyWarm) return { performedWarmup: false, failedServerIds: [] };
 
-		// #799: negative cache. Every server that still needs warming (not
+		// #799: negative cache. The selected provider still needs warming (not
 		// already `demonstratedReady`) was ALSO left cold by a warm-up earlier
 		// this session (`demonstratedCold`, populated below when a warm-up's
 		// initial attempt + retry both fail) — skip straight to the group-skip
 		// accounting the caller already has for `failedServerIds`, instead of
-		// re-paying the initial-attempt + retry round trip all over again. A
-		// MIXED group (one server cached cold, another never tried) still runs
-		// the real warm-up — the never-tried server deserves its fair shot, and
-		// `touchFile`'s multi-server spawn already covers both in one call.
+		// re-paying the initial-attempt + retry round trip all over again.
 		const cachedColdServerIds: string[] = [];
 		let allNonWarmCached = true;
 		for (let i = 0; i < servers.length; i++) {
@@ -4438,13 +4441,8 @@ export class LSPService {
 			return { performedWarmup: false, failedServerIds: [] };
 		}
 
-		const timeoutMs = options.timeoutMs ?? warmupTimeoutMs();
-
-		// A non-auxiliary server that WILL spawn for this file (resolvable key)
-		// but whose key is still absent from `demonstratedReady` after an attempt
-		// never proved it can answer diagnostics — that's a failed warm-up. A
-		// server with an unresolvable key never spawns here, so it can't fail this
-		// way and is excluded (never skipped by the caller for this file).
+		// The selected provider's key still absent from `demonstratedReady` after
+		// an attempt means it never proved it can answer diagnostics.
 		const stillColdServerIds = (): string[] => {
 			const cold: string[] = [];
 			for (let i = 0; i < servers.length; i++) {

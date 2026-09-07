@@ -185,6 +185,98 @@ describe("LSPService.ensureWarmForSweep (#667)", () => {
 	});
 });
 
+describe("LSPService.ensureWarmForSweep canonical primary selection", () => {
+	let tmp: string;
+	beforeEach(() => {
+		vi.resetModules();
+		getServersForFileWithConfig.mockReset();
+		createLSPClient.mockReset();
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-warmup-primary-"));
+		process.env.PI_LENS_LSP_DIAGNOSTICS_MAX_WAIT_MS = "50";
+		process.env.PI_LENS_LSP_WARMUP_RETRY_BACKOFF_MS = "0";
+	});
+	afterEach(() => {
+		delete process.env.PI_LENS_LSP_DIAGNOSTICS_MAX_WAIT_MS;
+		delete process.env.PI_LENS_LSP_WARMUP_RETRY_BACKOFF_MS;
+		removeTempDirSync(tmp);
+	});
+
+	function pythonCandidates(filePath: string) {
+		const preferred = makeServer("python", ".py", tmp);
+		const fallback = makeServer("python-jedi", ".py", tmp);
+		getServersForFileWithConfig.mockImplementation((fp: string) =>
+			fp === filePath ? [preferred, fallback] : [],
+		);
+		return { preferred, fallback };
+	}
+
+	it("warms the selected preferred provider without gating on an unselected fallback", async () => {
+		const filePath = path.join(tmp, "healthy.py");
+		fs.writeFileSync(filePath, "value = 1\n");
+		pythonCandidates(filePath);
+		const preferred = makeControlledClient("python", tmp, ["warm"]);
+		createLSPClient.mockImplementation(async (options: { serverId: string }) =>
+			options.serverId === "python" ? preferred.client : undefined,
+		);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const result = await new LSPService().ensureWarmForSweep(filePath);
+
+		expect(result.failedServerIds).toEqual([]);
+		expect(preferred.waitCalls).toHaveLength(1);
+		expect(createLSPClient).not.toHaveBeenCalledWith(
+			expect.objectContaining({ serverId: "python-jedi" }),
+		);
+	});
+
+	it("fails closed when the selected preferred provider stays cold", async () => {
+		const filePath = path.join(tmp, "cold.py");
+		fs.writeFileSync(filePath, "value = 1\n");
+		pythonCandidates(filePath);
+		const preferred = makeControlledClient("python", tmp, ["timeout"]);
+		const fallback = makeControlledClient("python-jedi", tmp, ["warm"]);
+		createLSPClient.mockImplementation(async (options: { serverId: string }) =>
+			options.serverId === "python" ? preferred.client : fallback.client,
+		);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const result = await new LSPService().ensureWarmForSweep(filePath);
+
+		expect(result.failedServerIds).toEqual(["python"]);
+		expect(preferred.waitCalls).toHaveLength(2);
+		expect(fallback.waitCalls).toHaveLength(0);
+	});
+
+	it("warms the fallback when it is the provider canonical selection actually starts", async () => {
+		const filePath = path.join(tmp, "fallback.py");
+		fs.writeFileSync(filePath, "value = 1\n");
+		pythonCandidates(filePath);
+		const fallback = makeControlledClient("python-jedi", tmp, ["warm"]);
+		createLSPClient.mockImplementation(async (options: { serverId: string }) =>
+			options.serverId === "python-jedi" ? fallback.client : undefined,
+		);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const result = await new LSPService().ensureWarmForSweep(filePath);
+
+		expect(result.failedServerIds).toEqual([]);
+		expect(fallback.waitCalls).toHaveLength(1);
+	});
+
+	it("fails the configured primary group when no provider starts", async () => {
+		const filePath = path.join(tmp, "unavailable.py");
+		fs.writeFileSync(filePath, "value = 1\n");
+		pythonCandidates(filePath);
+		createLSPClient.mockResolvedValue(undefined);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const result = await new LSPService().ensureWarmForSweep(filePath);
+
+		expect(result.performedWarmup).toBe(false);
+		expect(result.failedServerIds).toEqual(["python"]);
+	});
+});
+
 describe("runWorkspaceDiagnostics sweep-level warm-up behavior (#667)", () => {
 	let tmp: string;
 	beforeEach(() => {
