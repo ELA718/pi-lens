@@ -2242,6 +2242,28 @@ export class TreeSitterClient {
 			) ?? [];
 			return args.length === 1 && args[0].type === "identifier" && args[0].text === "globalThis";
 		};
+		const staticString = (
+			candidate: TreeSitterNode | null | undefined,
+			stringDepth = 0,
+		): string | undefined => {
+			if (!candidate || stringDepth > 8) return undefined;
+			if (candidate.type === "string") {
+				return candidate.text.includes("\\") ? undefined : candidate.text.slice(1, -1);
+			}
+			if (candidate.type === "parenthesized_expression") {
+				return staticString(
+					candidate.children.find((child) => child.isNamed),
+					stringDepth + 1,
+				);
+			}
+			if (
+				candidate.type !== "binary_expression" ||
+				!candidate.children.some((child) => child.text === "+")
+			) return undefined;
+			const left = staticString(candidate.childForFieldName?.("left"), stringDepth + 1);
+			const right = staticString(candidate.childForFieldName?.("right"), stringDepth + 1);
+			return left === undefined || right === undefined ? undefined : left + right;
+		};
 		const isProvenNativeGlobalFetchBind = (call: TreeSitterNode | null | undefined) => {
 			if (
 				!directGlobalFetchBindCall(call) ||
@@ -2250,7 +2272,7 @@ export class TreeSitterClient {
 				(references.get("eval")?.length ?? 0) > 0
 			) return false;
 			return nodes.every((candidate) => {
-				if (candidate.type === "string" && candidate.text.slice(1, -1) === "bind") return false;
+				if (staticString(candidate) === "bind") return false;
 				if (candidate.type !== "member_expression" && candidate.type !== "subscript_expression") {
 					return true;
 				}

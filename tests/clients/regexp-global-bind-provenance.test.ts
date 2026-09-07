@@ -64,6 +64,8 @@ describe("RegExp global bind provenance", () => {
 		"Function.prototype.bind = evil; globalThis.fetch.bind(globalThis);",
 		"Function.prototype['bind'] = evil; globalThis.fetch.bind(globalThis);",
 		"const proto = Function.prototype; proto.bind = evil; globalThis.fetch.bind(globalThis);",
+		"const proto = Object.getPrototypeOf(function() {}); proto['b' + 'ind'] = evil; globalThis.fetch.bind(globalThis);",
+		"const proto = Object.getPrototypeOf(function() {}); Reflect.set(proto, 'b' + 'ind', evil); globalThis.fetch.bind(globalThis);",
 		"function run(globalThis) { globalThis.fetch.bind(globalThis); const matcher = /x/; matcher.exec(input); }",
 		"const run = function globalThis() { globalThis.fetch.bind(globalThis); const matcher = /x/; matcher.exec(input); };",
 		"const Run = class globalThis { method() { globalThis.fetch.bind(globalThis); const matcher = /x/; matcher.exec(input); } };",
