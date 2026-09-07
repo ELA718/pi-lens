@@ -221,12 +221,11 @@ export interface SourceCollectionOptions {
 	/** Inspect a small header prefix for generated-code banners (default: true) */
 	inspectGeneratedHeaders?: boolean;
 	/**
-	 * Hard cap on the number of source files collected. When set, the walk stops
-	 * as soon as this many files are kept — so an over-broad root (e.g. one that
-	 * climbed to $HOME) can't enumerate the whole tree before a caller decides to
-	 * bail on count. Callers that only need "are there more than N?" should pass
-	 * `N + 1`. Unset = {@link DEFAULT_MAX_SOURCE_FILES} (a finite structural cap,
-	 * never unbounded). Refs #250/#747.
+	 * Hard cap on the number of source files returned. The budget-aware collectors
+	 * admit one extra eligible sentinel internally so they can distinguish an
+	 * exhausted exact-size inventory from a truncated one. Unset =
+	 * {@link DEFAULT_MAX_SOURCE_FILES} (a finite structural cap, never unbounded).
+	 * Refs #250/#747.
 	 */
 	maxFiles?: number;
 	/**
@@ -257,43 +256,53 @@ export interface SourceCollectionOptions {
 /**
  * Kept-files accumulator shared by the sync/async collectors, so the
  * `prioritizeCodeKinds` policy (#894 review) lives in one place. In the
- * default mode it is a plain array with the pre-existing `maxFiles` stop
- * check; in prioritized mode code-kind files alone satisfy the cap and
- * non-code files only fill whatever budget the code files leave unused.
+ * default mode it is a plain array with one overflow sentinel; in prioritized
+ * mode code-kind files retain precedence while the same sentinel proves that
+ * at least one eligible file was omitted.
  */
 function createKeptFilesAccumulator(
 	maxFiles: number,
 	prioritizeCodeKinds: boolean,
-): { push(file: string): void; isFull(): boolean; list(): string[] } {
+): {
+	push(file: string): void;
+	shouldStop(): boolean;
+	fileBudgetExceeded(): boolean;
+	list(): string[];
+} {
 	if (!prioritizeCodeKinds) {
 		const files: string[] = [];
 		return {
 			push: (file) => void files.push(file),
-			isFull: () => files.length >= maxFiles,
-			list: () => files,
+			shouldStop: () => files.length > maxFiles,
+			fileBudgetExceeded: () => files.length > maxFiles,
+			list: () => files.slice(0, maxFiles),
 		};
 	}
 	const codeFiles: string[] = [];
 	const otherFiles: string[] = [];
+	let eligibleFiles = 0;
 	return {
 		push(file) {
+			eligibleFiles += 1;
 			if (isCodeKindFile(file)) codeFiles.push(file);
 			else if (otherFiles.length < maxFiles) otherFiles.push(file);
 		},
-		isFull: () => codeFiles.length >= maxFiles,
+		shouldStop: () => codeFiles.length >= maxFiles && eligibleFiles > maxFiles,
+		fileBudgetExceeded: () => eligibleFiles > maxFiles,
 		list: () => [...codeFiles, ...otherFiles].slice(0, maxFiles),
 	};
 }
 
 /**
  * Result of a budget-aware collect walk (#760). `files` is the same list the
- * plain collectors return; `entryBudgetExceeded` is true when the walk stopped
- * because it visited `maxScanEntries` directory entries — the list is then a
- * truncated best-effort view of the tree, not a complete enumeration.
+ * plain collectors return. The two budget flags independently report whether
+ * the walk omitted eligible files or exhausted its directory-entry budget.
  */
 export interface SourceCollectionResult {
 	files: string[];
 	entryBudgetExceeded: boolean;
+	/** True when at least one eligible source file was omitted by `maxFiles`. */
+	fileBudgetExceeded?: boolean;
 	/**
 	 * Observability counters for #1107 (phase 1 — counting only, no behavior
 	 * change; the content-probe escape hatch for name-only matches is phase 2).
@@ -754,13 +763,9 @@ export function collectSourceFilesWithBudget(
 	// #1107: per-walk skip counters, discarded on return like the probe cache.
 	const skipCounters = createSourceWalkSkipCounters();
 
-	// #761: immediate-descent recursion driver (result-array order preserved),
-	// with both caps kept as this walker's own per-entry policy: the hard
-	// `maxFiles` results cap (#250) is checked BEFORE charging the entry budget
-	// (#760), and a file that reaches `maxFiles` is the last one kept — the cap
-	// then trips on the following entry, matching the pre-#761 loop exactly.
+	// Admit one extra eligible file as an overflow sentinel. Reaching maxFiles
+	// alone is not evidence of truncation: an exact-size project is complete.
 	walkTreeRecursiveSync(rootDir, (entry, fullPath) => {
-		if (kept.isFull()) return "stop"; // hard cap (#250)
 		if (!chargeEntryBudget(budget)) return "stop"; // entry budget (#760)
 		const { recurseInto, keepFile } = classifyEntry(
 			entry,
@@ -770,13 +775,17 @@ export function collectSourceFilesWithBudget(
 			skipCounters,
 		);
 		if (recurseInto) return "recurse";
-		if (keepFile) kept.push(keepFile);
+		if (keepFile) {
+			kept.push(keepFile);
+			if (kept.shouldStop()) return "stop"; // hard cap + sentinel (#250)
+		}
 		return "skip";
 	});
 	logSourceWalkSkipsIfAny(rootDir, skipCounters);
 	return {
 		files: kept.list(),
 		entryBudgetExceeded: budget.exceeded,
+		fileBudgetExceeded: kept.fileBudgetExceeded(),
 		generatedOrArtifactSkips: skipCounters.generatedOrArtifactSkips,
 		buildArtifactSkips: skipCounters.buildArtifactSkips,
 		generatedDirSkips: skipCounters.generatedDirSkips,
@@ -835,11 +844,8 @@ export async function collectSourceFilesWithBudgetAsync(
 	// #1107: per-walk skip counters, discarded on return like the probe cache.
 	const skipCounters = createSourceWalkSkipCounters();
 
-	// #761: shared depth-first stack driver (its reverse-push mirrors the sync
-	// collector's left-to-right recursion). The async collector charges the
-	// entry budget (#760) FIRST, then checks the `maxFiles` cap immediately
-	// after keeping a file — subtly different from the sync collector's ordering
-	// but preserved verbatim, so both stay byte-identical to their pre-#761 form.
+	// Shared sentinel contract with the sync collector: only an eligible file
+	// beyond maxFiles proves file-budget truncation.
 	await walkTreeStackAsync(
 		rootDir,
 		(entry, fullPath) => {
@@ -855,7 +861,7 @@ export async function collectSourceFilesWithBudgetAsync(
 			if (recurseInto) return "recurse";
 			if (keepFile) {
 				kept.push(keepFile);
-				if (kept.isFull()) return "stop"; // hard cap (#250)
+				if (kept.shouldStop()) return "stop"; // hard cap + sentinel (#250)
 			}
 			return "skip";
 		},
@@ -876,6 +882,7 @@ export async function collectSourceFilesWithBudgetAsync(
 	return {
 		files: kept.list(),
 		entryBudgetExceeded: budget.exceeded,
+		fileBudgetExceeded: kept.fileBudgetExceeded(),
 		generatedOrArtifactSkips: skipCounters.generatedOrArtifactSkips,
 		buildArtifactSkips: skipCounters.buildArtifactSkips,
 		generatedDirSkips: skipCounters.generatedDirSkips,
