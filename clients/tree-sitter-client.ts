@@ -3796,6 +3796,16 @@ export class TreeSitterClient {
 						: undefined;
 					if (node.text !== "Object" || operation !== "is" || call?.type !== "call_expression" || !sameNode(call.childForFieldName?.("function"), member)) return true;
 				}
+				if (["variable_declarator", "assignment_expression"].includes(node.type)) {
+					const pattern = node.childForFieldName?.(node.type === "variable_declarator" ? "name" : "left");
+					const source = immutableValue(node.childForFieldName?.(node.type === "variable_declarator" ? "value" : "right"), new Set(), "allow-property-writes");
+					if (pattern && ["object_pattern", "array_pattern"].includes(pattern.type) && source && ["string", "template_string", "array"].includes(source.type)) {
+						return bindingNameNodes(pattern).some((name) => {
+							const binding = bindingFor(name);
+							return !binding || acquiredBindingIsUnproven(binding);
+						});
+					}
+				}
 				if (node.type === "member_expression" && ["constructor", "__proto__"].includes(node.childForFieldName?.("property")?.text ?? "")) return true;
 				if (node.type === "subscript_expression") {
 					if (node.childForFieldName?.("object")?.text === "globalThis") return true;
