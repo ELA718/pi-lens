@@ -34,6 +34,10 @@ describe("SQL composition provenance", () => {
 		"const matcher = /^fixed$/g; const match = matcher.exec(input);",
 		"const matcher = /^fixed$/g; let match; while ((match = matcher.exec(input)) !== null) {}",
 		"const matcher = /^fixed$/g; matcher.lastIndex = 0; matcher.exec(input);",
+		"const patterns = [/a/g, /b/g]; for (const pattern of patterns) pattern.exec(input);",
+		"function scan(input, patterns) { for (const pattern of patterns) pattern.exec(input); } scan(input, [/a/g]); scan(input, [/b/g]);",
+		"const make = (source) => new RegExp(source, 'g'); const matcher = make('x'); matcher.exec(input);",
+		"function one() { const matcher = /a/g; matcher.exec(input); } function two() { const matcher = /b/g; matcher.exec(input); }",
 	])("accepts only source-proven RegExp execution: %s", async code => {
 		expect(await findings(code)).toHaveLength(0);
 	});
@@ -97,6 +101,19 @@ describe("SQL composition provenance", () => {
 		"const matcher = /x/; new Mutator(matcher); matcher.exec(input);",
 		"const matcher = /x/; (matcher).exec = db.exec; matcher.exec(input);",
 		"globalThis['\\x52egExp'].prototype.exec = db.exec; /x/.exec(input);",
+		"const patterns = [/x/g]; mutate(patterns); for (const pattern of patterns) pattern.exec(input);",
+		"function scan(input, patterns) { for (const pattern of patterns) pattern.exec(input); } consume(scan); scan(input, [/x/g]);",
+		"const make = (source) => new RegExp(source, 'g'); consume(make); const matcher = make('x'); matcher.exec(input);",
+		"const patterns = other; const other = patterns; for (const pattern of patterns) pattern.exec(input);",
+		"const make = () => make(); const matcher = make(); matcher.exec(input);",
+		"function bind(fetchImpl) { const resolved = fetchImpl ?? globalThis.fetch; return resolved.bind(globalThis); } const matcher = /x/g; matcher.exec(input);",
+		"const evil = { bind(g) { g.RegExp.prototype.exec = db.exec; } }; evil.bind(globalThis); const matcher = /x/; matcher.exec(input);",
+		"const matcher = /x/; function f() { if (flag) { var matcher = db; } matcher.exec(input); }",
+		"const matcher = /x/; function f({ matcher }) { matcher.exec(input); }",
+		"const patterns = [/x/]; for (const matcher in patterns) matcher.exec(input);",
+		"const matcher = /x/; function f() { for (var matcher of values) {} matcher.exec(input); }",
+		"const matcher = /x/; function f() { for (var matcher in values) {} matcher.exec(input); }",
+		"db.exec(request.body.sql);",
 		"db.exec(request.body.sql);",
 	])("retains unproven, mutable, shadowed, hoisted, or SQL exec calls: %s", async code => {
 		expect((await findings(code)).length).toBeGreaterThan(0);
