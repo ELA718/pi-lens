@@ -3319,6 +3319,32 @@ export class TreeSitterClient {
 			node.childForFieldName?.("property")?.text === property;
 		const argumentsOf = (node: TreeSitterNode) =>
 			named(node.childForFieldName?.("arguments"));
+		const declarationContainsUse = (
+			value: TreeSitterNode,
+			use: TreeSitterNode,
+		): boolean => {
+			const declarator = value.parent;
+			const declaration = declarator?.parent;
+			const scope = declaration?.parent;
+			if (
+				declarator?.type !== "variable_declarator" ||
+				declarator.childForFieldName?.("value")?.startIndex !== value.startIndex ||
+				declaration?.type !== "lexical_declaration" ||
+				!scope ||
+				!["program", "statement_block"].includes(scope.type) ||
+				declaration.startIndex >= use.startIndex
+			) return false;
+			let current: TreeSitterNode | null | undefined = use;
+			while (
+				current &&
+				!(
+					current.type === scope.type &&
+					current.startIndex === scope.startIndex &&
+					current.endIndex === scope.endIndex
+				)
+			) current = current.parent;
+			return current !== null && current !== undefined;
+		};
 		const hasCompetingBinding = (
 			name: string,
 			allowedValue: TreeSitterNode,
@@ -3395,7 +3421,11 @@ export class TreeSitterClient {
 		) return false;
 
 		const urlInit = this.resolveFileConstValueNode(urlName, root);
-		if (!urlInit || urlInit.type !== "new_expression") return false;
+		if (
+			!urlInit ||
+			urlInit.type !== "new_expression" ||
+			!declarationContainsUse(urlInit, destination)
+		) return false;
 		const urlCtor = urlInit.childForFieldName?.("constructor");
 		const urlArgs = argumentsOf(urlInit);
 		if (urlCtor?.type !== "identifier" || urlCtor.text !== "URL" || urlArgs.length !== 2) return false;
@@ -3424,7 +3454,8 @@ export class TreeSitterClient {
 		const expectedOrigin = this.resolveFileConstValueNode(right.text, root);
 		if (
 			expectedOrigin?.type !== "member_expression" ||
-			expectedOrigin.childForFieldName?.("property")?.text !== "origin"
+			expectedOrigin.childForFieldName?.("property")?.text !== "origin" ||
+			!declarationContainsUse(expectedOrigin, right)
 		) return false;
 		if (
 			this.isShadowedByEnclosingParam(right, right.text) ||
@@ -3447,6 +3478,7 @@ export class TreeSitterClient {
 			if (
 				!baseValue ||
 				!this.isFixedUrlLiteralExpr(baseValue) ||
+				!declarationContainsUse(baseValue, base) ||
 				hasCompetingBinding(base.text, baseValue)
 			) return false;
 		}

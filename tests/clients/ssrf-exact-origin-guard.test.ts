@@ -200,6 +200,35 @@ ${guardedFetch()}`)).toBe(false);
 		expect(await provesExactOriginGuard(code)).toBe(false);
 	});
 
+	it.each([
+		["URL instance", `
+const BASE = "https://api.example.com";
+const EXPECTED_ORIGIN = new URL(BASE).origin;
+function unrelated(path: string) { const url = new URL(path, BASE); }
+async function send() {
+  if (url.origin !== EXPECTED_ORIGIN) throw new Error("origin mismatch");
+  return fetch(url.toString(), { redirect: "error" });
+}`],
+		["expected origin", `
+const BASE = "https://api.example.com";
+{ const EXPECTED_ORIGIN = new URL(BASE).origin; }
+async function send(path: string) {
+  const url = new URL(path, BASE);
+  if (url.origin !== EXPECTED_ORIGIN) throw new Error("origin mismatch");
+  return fetch(url.toString(), { redirect: "error" });
+}`],
+		["fixed base", `
+{ const BASE = "https://api.example.com"; }
+const EXPECTED_ORIGIN = new URL(BASE).origin;
+async function send(path: string) {
+  const url = new URL(path, BASE);
+  if (url.origin !== EXPECTED_ORIGIN) throw new Error("origin mismatch");
+  return fetch(url.toString(), { redirect: "error" });
+}`],
+	])("rejects an out-of-scope %s declaration", async (_label, code) => {
+		expect(await provesExactOriginGuard(code)).toBe(false);
+	});
+
 	it("rejects a guard derived from a different base", async () => {
 		expect(await provesExactOriginGuard(guardedFetch().replace(
 		"new URL(BASE).origin",
