@@ -254,7 +254,7 @@ export class TrivyClient extends SecurityScanClient<TrivyResult> {
 	 * the session_start task. Re-entrancy safe: concurrent calls against the
 	 * same root share a single process.
 	 */
-	async scan(cwd: string): Promise<TrivyResult> {
+	async scan(cwd: string, signal?: AbortSignal): Promise<TrivyResult> {
 		const targetDir = path.resolve(cwd);
 		const scannedAt = new Date().toISOString();
 
@@ -273,10 +273,10 @@ export class TrivyClient extends SecurityScanClient<TrivyResult> {
 			return { ...EMPTY_RESULT, scannedAt, summary: "trivy not installed" };
 		}
 
-		return this.dedupeScan(targetDir, () => this.runScan(targetDir));
+		return this.dedupeScan(targetDir, () => this.runScan(targetDir, signal));
 	}
 
-	private async runScan(cwd: string): Promise<TrivyResult> {
+	private async runScan(cwd: string, signal?: AbortSignal): Promise<TrivyResult> {
 		const scannedAt = new Date().toISOString();
 		const bin = this.binaryPath ?? "trivy";
 		const severities = resolveSeverityFloor(cwd);
@@ -303,7 +303,7 @@ export class TrivyClient extends SecurityScanClient<TrivyResult> {
 					"--no-progress",
 					cwd,
 				],
-				{ cwd, timeout: SCAN_TIMEOUT_MS },
+				{ cwd, timeout: SCAN_TIMEOUT_MS, signal },
 			);
 
 			if (result.error) {

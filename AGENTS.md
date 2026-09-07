@@ -1,5 +1,13 @@
 # pi-lens — agent context
 
+Full diagnostic cancellation belongs to the request that starts an analyzer.
+Pass its signal through each new run; joining an incumbent run must not change
+that run's lifetime. Already-aborted requests start no analyzers. POSIX
+`safeSpawnAsync` children own separate process groups. Keep TERM-to-KILL
+escalation active while descendants remain, even after the wrapper closes.
+Never signal the caller's group or unrelated processes. Preserve truthful
+incomplete results and natural CLI exit; do not force `process.exit`. (refs #6)
+
 The TypeScript `no-sql-in-code` NAPI rule also applies to `.tsx` files parsed
 with the real TSX grammar. Other rules retain exact language boundaries. Keep
 SQL provenance and finding-cap behavior identical across these two grammars;

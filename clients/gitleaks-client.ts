@@ -197,7 +197,7 @@ export class GitleaksClient extends SecurityScanClient<GitleaksResult> {
 	 */
 	async scan(
 		cwd: string,
-		options?: { requireSignal?: boolean },
+		options?: { requireSignal?: boolean; signal?: AbortSignal },
 	): Promise<GitleaksResult> {
 		const targetDir = path.resolve(cwd);
 		const scannedAt = new Date().toISOString();
@@ -220,10 +220,15 @@ export class GitleaksClient extends SecurityScanClient<GitleaksResult> {
 			};
 		}
 
-		return this.dedupeScan(targetDir, () => this.runScan(targetDir));
+		return this.dedupeScan(targetDir, () =>
+			this.runScan(targetDir, options?.signal),
+		);
 	}
 
-	private async runScan(cwd: string): Promise<GitleaksResult> {
+	private async runScan(
+		cwd: string,
+		signal?: AbortSignal,
+	): Promise<GitleaksResult> {
 		const scannedAt = new Date().toISOString();
 		const bin = this.binaryPath ?? "gitleaks";
 		const outDir = mkdtempSync(path.join(os.tmpdir(), "pi-lens-gitleaks-"));
@@ -244,7 +249,7 @@ export class GitleaksClient extends SecurityScanClient<GitleaksResult> {
 					"0",
 					"--no-banner",
 				],
-				{ cwd, timeout: SCAN_TIMEOUT_MS },
+				{ cwd, timeout: SCAN_TIMEOUT_MS, signal },
 			);
 
 			if (result.error) {

@@ -199,7 +199,11 @@ export class KnipClient {
 	 * Re-entrancy safe: concurrent calls resolving to the same project
 	 * root share a single knip process via `inFlight`.
 	 */
-	async analyze(cwd?: string, _ignore?: string[]): Promise<KnipResult> {
+	async analyze(
+		cwd?: string,
+		_ignore?: string[],
+		signal?: AbortSignal,
+	): Promise<KnipResult> {
 		const targetDir = this.resolveProjectRoot(cwd || process.cwd());
 		if (!targetDir) {
 			// No package.json / knip config anywhere up the tree. Running knip
@@ -229,14 +233,17 @@ export class KnipClient {
 			return existing;
 		}
 
-		const promise = this.runAnalyze(key).finally(() => {
+		const promise = this.runAnalyze(key, signal).finally(() => {
 			this.inFlight.delete(key);
 		});
 		this.inFlight.set(key, promise);
 		return promise;
 	}
 
-	private async runAnalyze(targetDir: string): Promise<KnipResult> {
+	private async runAnalyze(
+		targetDir: string,
+		signal?: AbortSignal,
+	): Promise<KnipResult> {
 		// Cache dir is routed through pi-lens's project-data-dir convention (NOT
 		// knip's own default `./node_modules/.cache/knip`) so it lives alongside
 		// every other project cache (see cache-manager.ts, call-graph.ts) and is
@@ -278,6 +285,7 @@ export class KnipClient {
 			timeout: ANALYSIS_TIMEOUT_MS,
 			cwd: targetDir,
 			env: await getManagedToolEnvironment("knip", targetDir),
+			signal,
 		});
 
 		if (result.error) {

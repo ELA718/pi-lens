@@ -14,6 +14,11 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- Full diagnostic cancellation now reaches analyzer processes started by that
+  request. POSIX cleanup stops wrapper descendants, including children that
+  ignore TERM after their wrapper exits. Joined runs retain their original
+  owner, and incomplete CLI results exit naturally. (refs #6)
+
 ### Security
 
 - The existing TypeScript SQL rule now scans `.tsx` with the TSX parser. Static

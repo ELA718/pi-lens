@@ -6,6 +6,7 @@ import type { BootstrapClients } from "../../../clients/bootstrap.js";
 import { snapshotAdvisoryProvenance } from "../../../clients/advisory-provenance.js";
 import { fetchFreshProjectDiagnostics } from "../../../clients/project-diagnostics/fresh-fetch.js";
 import { RuntimeCoordinator } from "../../../clients/runtime-coordinator.js";
+import { SecurityScanClient } from "../../../clients/security-scan-client.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 // fetchFreshProjectDiagnostics calls each client through the plain
@@ -14,6 +15,20 @@ import { removeTempDirSync } from "../test-utils.js";
 // static gates (GitleaksClient.hasGitRepo — #608's mode=full smart-default,
 // GovulncheckClient.hasGoModule, TrivyClient.shouldScan) run for real, against
 // a real tmp-dir fixture.
+
+class DedupeProbe extends SecurityScanClient<string> {
+	constructor() {
+		super("probe");
+	}
+
+	protected doEnsureAvailable(): Promise<boolean> {
+		return Promise.resolve(true);
+	}
+
+	run(key: string, start: () => Promise<string>): Promise<string> {
+		return this.dedupeScan(key, start);
+	}
+}
 
 let tmp: string;
 
@@ -287,6 +302,7 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 			undefined,
 			undefined,
 			true,
+			{ signal: undefined },
 		);
 		expect(cacheManager.writeCache).toHaveBeenCalledWith(
 			"jscpd-ts",
@@ -313,7 +329,10 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 
 		const result = await fetchFreshProjectDiagnostics(cacheManager, tmp, clients);
 
-		expect(clients.depChecker.scanProject).toHaveBeenCalledWith(path.resolve(tmp));
+		expect(clients.depChecker.scanProject).toHaveBeenCalledWith(
+			path.resolve(tmp),
+			undefined,
+		);
 		expect(cacheManager.writeCache).toHaveBeenCalledWith(
 			"madge",
 			madgeResult,
@@ -367,7 +386,7 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 		expect(clients.gitleaksClient.scan).toHaveBeenCalledTimes(1);
 		expect(clients.gitleaksClient.scan).toHaveBeenCalledWith(
 			path.resolve(tmp),
-			{ requireSignal: false },
+			{ requireSignal: false, signal: undefined },
 		);
 		expect(cacheManager.writeCache).toHaveBeenCalledWith(
 			"gitleaks",
@@ -464,7 +483,10 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 		// Structurally always-on: no static project gate, only an availability
 		// probe — the scan runs even on a bare tmp dir with no manifest/marker.
 		expect(clients.opengrepClient.scan).toHaveBeenCalledTimes(1);
-		expect(clients.opengrepClient.scan).toHaveBeenCalledWith(path.resolve(tmp));
+		expect(clients.opengrepClient.scan).toHaveBeenCalledWith(
+			path.resolve(tmp),
+			undefined,
+		);
 		expect(cacheManager.writeCache).toHaveBeenCalledWith(
 			"opengrep",
 			expect.objectContaining({ success: true }),
@@ -706,6 +728,52 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 		expect(elapsed).toBeLessThan(100);
 	});
 
+	it("does not start analyzers when the request signal is already aborted", async () => {
+		const cacheManager = makeCacheManager();
+		const clients = makeClients({ jscpdAvailable: true, madgeAvailable: true });
+		const controller = new AbortController();
+		controller.abort();
+
+		const result = await fetchFreshProjectDiagnostics(
+			cacheManager,
+			tmp,
+			clients,
+			controller.signal,
+		);
+
+		expect(result.aborted).toBe(true);
+		expect(result.abortedIds).toEqual(result.cold);
+		expect(clients.knipClient.analyze).not.toHaveBeenCalled();
+		expect(clients.jscpdClient.ensureAvailable).not.toHaveBeenCalled();
+		expect(clients.depChecker.ensureAvailable).not.toHaveBeenCalled();
+		expect(clients.opengrepClient.ensureAvailable).not.toHaveBeenCalled();
+		expect(cacheManager.writeCache).not.toHaveBeenCalled();
+	});
+
+	it("does not let an aborting joiner cancel an incumbent scan", async () => {
+		const client = new DedupeProbe();
+		let finishIncumbent: ((value: string) => void) | undefined;
+		const incumbent = client.run(
+			"root",
+			() =>
+				new Promise((resolve) => {
+					finishIncumbent = resolve;
+				}),
+		);
+		const controller = new AbortController();
+		let joinerStarted = false;
+		const joined = client.run("root", async () => {
+			joinerStarted = true;
+			throw new Error(`joining signal: ${controller.signal.aborted}`);
+		});
+
+		controller.abort();
+		expect(joined).toBe(incumbent);
+		expect(joinerStarted).toBe(false);
+		finishIncumbent?.("incumbent-result");
+		await expect(joined).resolves.toBe("incumbent-result");
+	});
+
 	it("returns promptly with partial results when the signal aborts mid-scan, instead of waiting for every analyzer (#585 follow-up)", async () => {
 		fs.writeFileSync(path.join(tmp, "tsconfig.json"), "{}");
 		const cacheManager = makeCacheManager();
@@ -750,6 +818,13 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 		expect(elapsed).toBeLessThan(500);
 		expect(result.aborted).toBe(true);
 		expect(result.abortedIds).toContain("jscpd");
+		expect(clients.jscpdClient.scan).toHaveBeenCalledWith(
+			path.resolve(tmp),
+			undefined,
+			undefined,
+			true,
+			{ signal: controller.signal },
+		);
 		// knip had time to settle before the abort fired.
 		expect(result.abortedIds).not.toContain("knip");
 		// Aborted analyzers are folded into `cold` too, so a caller that only

@@ -126,7 +126,7 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 	 * Re-entrancy safe: concurrent calls against the same root share a single
 	 * opengrep process (mirrors `GitleaksClient`/`JscpdClient`).
 	 */
-	async scan(cwd: string): Promise<OpengrepResult> {
+	async scan(cwd: string, signal?: AbortSignal): Promise<OpengrepResult> {
 		const targetDir = path.resolve(cwd);
 		const scannedAt = new Date().toISOString();
 
@@ -138,10 +138,13 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 			};
 		}
 
-		return this.dedupeScan(targetDir, () => this.runScan(targetDir));
+		return this.dedupeScan(targetDir, () => this.runScan(targetDir, signal));
 	}
 
-	private async runScan(cwd: string): Promise<OpengrepResult> {
+	private async runScan(
+		cwd: string,
+		signal?: AbortSignal,
+	): Promise<OpengrepResult> {
 		const scannedAt = new Date().toISOString();
 		const bin = this.binaryPath ?? "opengrep";
 		const resolved = OpengrepClient.resolveConfig(cwd);
@@ -164,7 +167,7 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 					"--disable-version-check",
 					cwd,
 				],
-				{ cwd, timeout: SCAN_TIMEOUT_MS },
+				{ cwd, timeout: SCAN_TIMEOUT_MS, signal },
 			);
 
 			if (result.error) {

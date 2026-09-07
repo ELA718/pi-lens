@@ -975,6 +975,7 @@ export class DependencyChecker {
 	 */
 	async scanProject(
 		cwd?: string,
+		signal?: AbortSignal,
 	): Promise<{ circular: CircularDep[]; count: number }> {
 		const projectRoot = path.resolve(cwd || process.cwd());
 
@@ -1001,7 +1002,7 @@ export class DependencyChecker {
 		// does, and the two overlap (runtime-session, fresh-fetch), so it takes a
 		// generation too — claimed before the spawn, as late as a scan can.
 		const gen = ++this.opGeneration;
-		const promise = this.runScanProject(projectRoot, gen).finally(() => {
+		const promise = this.runScanProject(projectRoot, gen, signal).finally(() => {
 			this.scanInFlight.delete(projectRoot);
 		});
 		this.scanInFlight.set(projectRoot, promise);
@@ -1011,6 +1012,7 @@ export class DependencyChecker {
 	private async runScanProject(
 		projectRoot: string,
 		gen: number,
+		signal?: AbortSignal,
 	): Promise<{ circular: CircularDep[]; count: number }> {
 		try {
 			const { cmd, prefix } = await this.resolveMadge(projectRoot);
@@ -1020,6 +1022,7 @@ export class DependencyChecker {
 				{
 					timeout: 30000,
 					cwd: projectRoot,
+					signal,
 				},
 			);
 

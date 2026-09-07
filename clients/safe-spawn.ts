@@ -316,9 +316,15 @@ function killPidTreeSync(pid: number): void {
 		return;
 	}
 	try {
-		process.kill(pid, "SIGKILL");
+		// Every POSIX child started by safeSpawnAsync is its own process-group
+		// leader. Signal only that owned group, never our inherited group.
+		process.kill(-pid, "SIGKILL");
 	} catch {
-		// Child already exited.
+		try {
+			process.kill(pid, "SIGKILL");
+		} catch {
+			// Child already exited.
+		}
 	}
 }
 
@@ -1207,6 +1213,7 @@ export async function safeSpawnAsync(
 		try {
 			child = spawn(spawnCmd, spawnArgs, {
 				cwd: spawnCwd,
+				detached: !isWindows,
 				env: spawnEnv,
 				windowsHide: true,
 				shell: false,
@@ -1238,6 +1245,31 @@ export async function safeSpawnAsync(
 			installLifetimeCleanup();
 			lifetimeState.pids.add(child.pid);
 		}
+
+		const ownedProcessGroupPid =
+			!isWindows && child.pid && child.pid > 0 && child.spawnfile
+				? child.pid
+				: undefined;
+		const ownedProcessGroupIsAlive = (): boolean => {
+			if (!ownedProcessGroupPid) return false;
+			try {
+				process.kill(-ownedProcessGroupPid, 0);
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		const signalOwnedProcessTree = (signal: NodeJS.Signals): void => {
+			if (ownedProcessGroupPid) {
+				try {
+					process.kill(-ownedProcessGroupPid, signal);
+					return;
+				} catch {
+					// The group exited between the close check and signal.
+				}
+			}
+			child.kill(signal);
+		};
 
 		// #620: bracket this spawn's lifetime with a short-interval CPU/RSS poll
 		// (started right here, stopped in the "close" handler below) so transient
@@ -1282,9 +1314,16 @@ export async function safeSpawnAsync(
 					child.kill("SIGKILL");
 				}
 			} else {
-				child.kill("SIGTERM");
+				// POSIX children are detached above into a new process group owned by
+				// this call. Signal only that group so wrappers cannot orphan children.
+				signalOwnedProcessTree("SIGTERM");
 				escalationTimer = setTimeout(() => {
-					if (!closed) child.kill("SIGKILL");
+					if (!closed || ownedProcessGroupIsAlive()) {
+						signalOwnedProcessTree("SIGKILL");
+					}
+					if (ownedProcessGroupPid) {
+						lifetimeState.pids.delete(ownedProcessGroupPid);
+					}
 				}, 1000);
 			}
 		};
@@ -1360,12 +1399,15 @@ export async function safeSpawnAsync(
 			closed = true;
 			clearTimeout(timeoutId);
 			abortSignal?.removeEventListener("abort", onAbort);
-			if (child.pid) lifetimeState.pids.delete(child.pid);
+			if (child.pid && !ownedProcessGroupIsAlive()) {
+				lifetimeState.pids.delete(child.pid);
+			}
 			await killPromise;
-			// #1109: the child has exited — if killTree armed the non-Windows
-			// SIGTERM→SIGKILL escalation timer and it hasn't fired yet, clear it
-			// so it doesn't linger as a ref'd handle after this promise resolves.
-			if (escalationTimer) clearTimeout(escalationTimer);
+			// Clear the escalation only after the whole owned group exits. A wrapper
+			// can close on SIGTERM while one of its descendants still ignores it.
+			if (escalationTimer && !ownedProcessGroupIsAlive()) {
+				clearTimeout(escalationTimer);
+			}
 			const resourceUsage = finishResourceUsage();
 
 			const outputInfo = outputTruncated ? { outputTruncated: true } : {};
@@ -1417,8 +1459,12 @@ export async function safeSpawnAsync(
 			closed = true;
 			clearTimeout(timeoutId);
 			abortSignal?.removeEventListener("abort", onAbort);
-			if (escalationTimer) clearTimeout(escalationTimer);
-			if (child.pid) lifetimeState.pids.delete(child.pid);
+			if (escalationTimer && !ownedProcessGroupIsAlive()) {
+				clearTimeout(escalationTimer);
+			}
+			if (child.pid && !ownedProcessGroupIsAlive()) {
+				lifetimeState.pids.delete(child.pid);
+			}
 			const resourceUsage = finishResourceUsage();
 			let failure: SpawnFailureKind = "spawn";
 			if (aborted) failure = "aborted";
