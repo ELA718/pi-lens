@@ -184,7 +184,7 @@ describe("generic-api-key source hash provenance", () => {
 		expect(await historicalScan(env.tmpDir, bigFile, `big.test.ts\":\"${bigDigest}`, bigDigest, 1)).toHaveLength(1);
 	});
 
-	it.skipIf(process.platform === "win32")("kills a SIGTERM-resistant timed-out Git process without an orphan", async () => {
+	it.skipIf(process.platform === "win32")("kills a SIGTERM-resistant Git descendant after its parent exits", async () => {
 		const env = fixture();
 		const commit = commitFixture(env.tmpDir, env.sourcePath);
 		fs.writeFileSync(env.fullSourcePath, "changed after evidence\n");
@@ -192,8 +192,8 @@ describe("generic-api-key source hash provenance", () => {
 		fs.writeFileSync(file, `{"verifiedSourceCommit":"${commit}","sourceSha256":{${JSON.stringify(env.sourcePath)}:"${env.digest}"}}\n`);
 		const fakeBin = path.join(env.tmpDir, "fake-bin");
 		fs.mkdirSync(fakeBin);
-		const pidFile = path.join(env.tmpDir, "git.pid");
-		fs.writeFileSync(path.join(fakeBin, "git"), `#!${process.execPath}\nimport fs from "node:fs"; fs.writeFileSync(process.env.TEST_GIT_PID_FILE, String(process.pid)); process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);\n`, { mode: 0o755 });
+		const pidFile = path.join(env.tmpDir, "git-child.pid");
+		fs.writeFileSync(path.join(fakeBin, "git"), `#!${process.execPath}\nimport { spawn } from "node:child_process"; spawn(process.execPath,["--input-type=module","--eval",'import fs from "node:fs"; fs.writeFileSync(process.env.TEST_GIT_PID_FILE,String(process.pid)); process.on("SIGTERM",()=>{}); setInterval(()=>{},1000)'],{stdio:"ignore"}); setInterval(()=>{},1000);\n`, { mode: 0o755 });
 		const savedPath = process.env.PATH;
 		process.env.PATH = `${fakeBin}${path.delimiter}${savedPath ?? ""}`;
 		process.env.TEST_GIT_PID_FILE = pidFile;
@@ -201,7 +201,8 @@ describe("generic-api-key source hash provenance", () => {
 			expect(await historicalScan(env.tmpDir, file, `token.test.ts\":\"${env.digest}`, env.digest, 1)).toHaveLength(1);
 		} finally { process.env.PATH = savedPath; delete process.env.TEST_GIT_PID_FILE; }
 		const pid = Number(fs.readFileSync(pidFile, "utf-8"));
-		expect(() => process.kill(pid, 0)).toThrow();
+		try { expect(() => process.kill(pid, 0)).toThrow(); }
+		finally { try { process.kill(pid, "SIGKILL"); } catch { /* already exited */ } }
 	}, 4_000);
 
 	it.skipIf(process.platform === "win32")("retains a finding when metadata changes during deferred Git proof", async () => {
@@ -226,6 +227,40 @@ describe("generic-api-key source hash provenance", () => {
 			fs.writeFileSync(file, `${metadata} `);
 			fs.writeFileSync(release, "release");
 			expect(await result).toHaveLength(1);
+		} finally {
+			process.env.PATH = savedPath;
+			for (const key of ["TEST_GIT_COUNT", "TEST_GIT_READY", "TEST_GIT_RELEASE", "TEST_GIT_RELEASE_DIR"]) delete process.env[key];
+		}
+	});
+
+	it.skipIf(process.platform === "win32")("revalidates an earlier exclusion after a later deferred proof", async () => {
+		const env = fixture();
+		const commit = commitFixture(env.tmpDir, env.sourcePath);
+		fs.writeFileSync(env.fullSourcePath, "changed after evidence\n");
+		const firstFile = path.join(env.tmpDir, "first-proof.json");
+		const secondFile = path.join(env.tmpDir, "second-proof.json");
+		const metadata = `{"verifiedSourceCommit":"${commit}","sourceSha256":{${JSON.stringify(env.sourcePath)}:"${env.digest}"}}\n`;
+		fs.writeFileSync(firstFile, metadata);
+		fs.writeFileSync(secondFile, metadata);
+		const fakeBin = path.join(env.tmpDir, "publication-race-bin");
+		const ready = path.join(env.tmpDir, "publication-ready");
+		const release = path.join(env.tmpDir, "publication-release");
+		const count = path.join(env.tmpDir, "publication-count");
+		const realGit = execFileSync("which", ["git"], { encoding: "utf-8" }).trim();
+		fs.mkdirSync(fakeBin);
+		fs.writeFileSync(path.join(fakeBin, "git"), `#!${process.execPath}\nimport fs from "node:fs"; import { spawnSync } from "node:child_process"; const countFile=process.env.TEST_GIT_COUNT; const n=Number(fs.existsSync(countFile)?fs.readFileSync(countFile,"utf8"):0)+1; fs.writeFileSync(countFile,String(n)); if(n===7&&!fs.existsSync(process.env.TEST_GIT_RELEASE)){fs.writeFileSync(process.env.TEST_GIT_READY,"ready"); await new Promise(resolve=>{const w=fs.watch(process.env.TEST_GIT_RELEASE_DIR,()=>{if(fs.existsSync(process.env.TEST_GIT_RELEASE)){w.close();resolve();}});});} const r=spawnSync(${JSON.stringify(realGit)},process.argv.slice(2)); if(r.stdout)process.stdout.write(r.stdout); if(r.stderr)process.stderr.write(r.stderr); process.exit(r.status??1);\n`, { mode: 0o755 });
+		const savedPath = process.env.PATH;
+		Object.assign(process.env, { PATH: `${fakeBin}${path.delimiter}${savedPath ?? ""}`, TEST_GIT_COUNT: count, TEST_GIT_READY: ready, TEST_GIT_RELEASE: release, TEST_GIT_RELEASE_DIR: env.tmpDir });
+		try {
+			const match = `token.test.ts\":\"${env.digest}`;
+			const result = parseGitleaksReportWithProvenance(JSON.stringify([
+				finding(firstFile, match, env.digest, 1),
+				finding(secondFile, match, env.digest, 1),
+			]), env.tmpDir);
+			await waitForPath(ready);
+			fs.writeFileSync(firstFile, `${metadata} `);
+			fs.writeFileSync(release, "release");
+			expect(await result).toEqual([expect.objectContaining({ file: firstFile })]);
 		} finally {
 			process.env.PATH = savedPath;
 			for (const key of ["TEST_GIT_COUNT", "TEST_GIT_READY", "TEST_GIT_RELEASE", "TEST_GIT_RELEASE_DIR"]) delete process.env[key];

@@ -229,6 +229,20 @@ function runBoundedGit(root: string, args: string[], signal: AbortSignal | undef
 		let failed = false;
 		let stopping = false;
 		let forceTimer: NodeJS.Timeout | undefined;
+		let settled = false;
+		let parentDone = false;
+		const finish = (value: Buffer | undefined) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			if (forceTimer) clearTimeout(forceTimer);
+			signal?.removeEventListener("abort", stop);
+			resolve(value);
+		};
+		const ownedGroupIsAlive = () => {
+			if (!detached || !child.pid) return false;
+			try { process.kill(-child.pid, 0); return true; } catch { return false; }
+		};
 		const signalOwned = (ownedSignal: NodeJS.Signals) => {
 			if (!child.pid) return;
 			try { if (detached) process.kill(-child.pid, ownedSignal); else child.kill(ownedSignal); } catch { /* already exited */ }
@@ -238,8 +252,17 @@ function runBoundedGit(root: string, args: string[], signal: AbortSignal | undef
 			if (stopping) return;
 			stopping = true;
 			signalOwned("SIGTERM");
-			forceTimer = setTimeout(() => signalOwned("SIGKILL"), GIT_PROOF_KILL_GRACE_MS);
-			forceTimer.unref();
+			forceTimer = setTimeout(() => {
+				signalOwned("SIGKILL");
+				const cleanupDeadline = Date.now() + GIT_PROOF_KILL_GRACE_MS * 5;
+				const finishStopped = () => {
+					if (parentDone && !ownedGroupIsAlive()) return finish(undefined);
+					if (Date.now() < cleanupDeadline) return setTimeout(finishStopped, 10);
+					signalOwned("SIGKILL");
+					finish(undefined);
+				};
+				setTimeout(finishStopped, 10);
+			}, GIT_PROOF_KILL_GRACE_MS);
 		};
 		const timer = setTimeout(stop, remaining);
 		timer.unref();
@@ -249,12 +272,10 @@ function runBoundedGit(root: string, args: string[], signal: AbortSignal | undef
 			if (bytes > maxBytes) return stop();
 			chunks.push(chunk);
 		});
-		child.on("error", stop);
+		child.on("error", () => { parentDone = true; stop(); });
 		child.on("close", code => {
-			clearTimeout(timer);
-			if (forceTimer) clearTimeout(forceTimer);
-			signal?.removeEventListener("abort", stop);
-			resolve(!failed && code === 0 ? Buffer.concat(chunks, bytes) : undefined);
+			parentDone = true;
+			if (!stopping) finish(!failed && code === 0 ? Buffer.concat(chunks, bytes) : undefined);
 		});
 	});
 }
@@ -702,6 +723,7 @@ export async function parseGitleaksReportWithProvenance(raw: string, cwd?: strin
 	if (!topLevel) return parseGitleaksReport(raw, cwd);
 	try { if (fs.realpathSync(topLevel) !== root) return parseGitleaksReport(raw, cwd); } catch { return parseGitleaksReport(raw, cwd); }
 	const retained: Record<string, unknown>[] = [];
+	const accepted = new Map<Record<string, unknown>, { file: string; metadata: BoundedFileSnapshot; requestedFile: string }>();
 	for (const entry of entries) {
 		const key = historicalFindingKey(entry);
 		if (!key || counts.get(key) !== 1 || signal?.aborted || Date.now() >= deadlineAt) { retained.push(entry); continue; }
@@ -719,9 +741,17 @@ export async function parseGitleaksReportWithProvenance(raw: string, cwd?: strin
 			if (fs.realpathSync(requestedFile) !== file) { retained.push(entry); continue; }
 			const finalMetadata = readBoundedSnapshot(requestedFile, MAX_METADATA_BYTES);
 			if (!finalMetadata || !sameSnapshot(metadata, finalMetadata)) retained.push(entry);
+			else accepted.set(entry, { file, metadata, requestedFile });
 		} catch { retained.push(entry); }
 	}
-	return parseGitleaksReport(JSON.stringify(retained), cwd);
+	for (const [entry, proof] of accepted) {
+		try {
+			const metadata = readBoundedSnapshot(proof.requestedFile, MAX_METADATA_BYTES);
+			if (fs.realpathSync(proof.requestedFile) !== proof.file || !metadata || !sameSnapshot(proof.metadata, metadata)) retained.push(entry);
+		} catch { retained.push(entry); }
+	}
+	const retainedSet = new Set(retained);
+	return parseGitleaksReport(JSON.stringify(entries.filter(entry => retainedSet.has(entry))), cwd);
 }
 
 /**
