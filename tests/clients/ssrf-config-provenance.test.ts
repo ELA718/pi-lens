@@ -85,6 +85,8 @@ describe("SSRF deployment-configuration provenance", () => {
 		["globalThis String prototype mutation", `globalThis.String.prototype.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
 		["Array prototype transform mutation", `Array.prototype.join = function () { return request.url; }; fetch(Deno.env.get("URL").split("/").join("/"));`],
 		["String prototype transform mutation", `String.prototype.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
+		["string instance prototype alias mutation", `const proto = Object.getPrototypeOf(""); proto.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
+		["computed global String alias mutation", `const S = globalThis["String"]; S.prototype.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
 		["URL prototype transform mutation", `URL.prototype.toString = function () { return request.url; }; fetch(new URL(Deno.env.get("URL")).toString());`],
 		["for-var environment shadow", `function send() { for (var Deno of request.runtimes) {} fetch(Deno.env.get("URL")); }`],
 		["for-const environment shadow", `for (const Deno of request.runtimes) { fetch(Deno.env.get("URL")); }`],

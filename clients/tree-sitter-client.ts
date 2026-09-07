@@ -3714,6 +3714,27 @@ export class TreeSitterClient {
 				return parent?.type === "member_expression" && sameNode(parent.childForFieldName?.("object"), node);
 			});
 		const nativeTransformIsStable = (method: string): boolean => {
+			const reflectiveMethods = new Set([
+				"assign", "defineProperties", "defineProperty", "getOwnPropertyDescriptor",
+				"getOwnPropertyDescriptors", "getOwnPropertyNames", "getOwnPropertySymbols",
+				"getPrototypeOf", "setPrototypeOf", "deleteProperty", "get", "ownKeys", "set",
+			]);
+			if (nodes.some((node) => {
+				if (node.type === "call_expression") {
+					const callee = node.childForFieldName?.("function");
+					const owner = callee?.type === "member_expression" ? callee.childForFieldName?.("object") : undefined;
+					const operation = callee?.type === "member_expression" ? callee.childForFieldName?.("property")?.text : undefined;
+					if (owner?.type === "identifier" && ["Object", "Reflect"].includes(owner.text) && isGlobalReference(owner) && operation && reflectiveMethods.has(operation)) return true;
+				}
+				if (node.type === "member_expression" && ["constructor", "__proto__"].includes(node.childForFieldName?.("property")?.text ?? "")) return true;
+				if (node.type === "subscript_expression" && node.childForFieldName?.("object")?.text === "globalThis") return true;
+				if (node.type === "identifier" && node.text === "globalThis" && isGlobalReference(node)) {
+					const parent = node.parent;
+					if (parent?.type !== "member_expression" || !sameNode(parent.childForFieldName?.("object"), node)) return true;
+					return ["String", "Array", "URL"].includes(parent.childForFieldName?.("property")?.text ?? "");
+				}
+				return false;
+			})) return false;
 			const owners = method === "trim" || method === "toLowerCase" || method === "toUpperCase" || method === "split"
 				? ["String"]
 				: method === "filter" || method === "at" || method === "join"
