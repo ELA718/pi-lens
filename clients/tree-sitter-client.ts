@@ -2008,7 +2008,11 @@ export class TreeSitterClient {
 
 		const references = new Map<string, TreeSitterNode[]>();
 		for (const candidate of nodes) {
-			if (!["identifier", "shorthand_property_identifier"].includes(candidate.type)) continue;
+			if (
+				!["identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern"].includes(
+					candidate.type,
+				)
+			) continue;
 			const bucket = references.get(candidate.text) ?? [];
 			bucket.push(candidate);
 			references.set(candidate.text, bucket);
@@ -2027,35 +2031,69 @@ export class TreeSitterClient {
 			}> = [];
 			for (const name of references.get(use.text) ?? []) {
 				const parent = name.parent;
+				let declarator = parent;
+				while (
+					declarator &&
+					declarator.type !== "variable_declarator" &&
+					!["lexical_declaration", "variable_declaration", "formal_parameters"].includes(declarator.type)
+				) declarator = declarator.parent;
 				if (
-					parent?.type === "variable_declarator" &&
-					isSameNode(parent.childForFieldName?.("name"), name) &&
-					parent.parent?.parent
+					declarator?.type === "variable_declarator" &&
+					contains(declarator.childForFieldName?.("name") ?? declarator, name) &&
+					declarator.parent?.parent
 				) {
-					candidates.push({ name, owner: parent, scope: parent.parent.parent, kind: "variable" });
+					let scope = declarator.parent.parent;
+					if (declarator.parent.type === "variable_declaration") {
+						let container: TreeSitterNode | null | undefined = scope;
+						while (
+							container?.parent &&
+							!["program", "function_declaration", "function_expression", "arrow_function", "method_definition"].includes(
+								container.type,
+							)
+						) container = container.parent;
+						if (container?.type !== "program") {
+							scope = container?.childForFieldName?.("body") ?? root;
+						} else {
+							scope = container;
+						}
+					}
+					candidates.push({ name, owner: declarator, scope, kind: "variable" });
 					continue;
 				}
-				const forBody = parent?.type === "for_in_statement"
-					? parent.childForFieldName?.("body")
+				let forStatement = parent;
+				while (
+					forStatement &&
+					forStatement.type !== "for_in_statement" &&
+					!["statement_block", "program"].includes(forStatement.type)
+				) forStatement = forStatement.parent;
+				const forBody = forStatement?.type === "for_in_statement"
+					? forStatement.childForFieldName?.("body")
 					: undefined;
 				if (
-					parent?.type === "for_in_statement" &&
-					isSameNode(parent.childForFieldName?.("left"), name) &&
+					forStatement?.type === "for_in_statement" &&
+					contains(forStatement.childForFieldName?.("left") ?? forStatement, name) &&
 					forBody
 				) {
 					candidates.push({
 						name,
-						owner: parent,
+						owner: forStatement,
 						scope: forBody,
 						kind: "for",
 					});
 					continue;
 				}
+				let parameter = parent;
+				while (
+					parameter &&
+					!["required_parameter", "optional_parameter"].includes(parameter.type) &&
+					parameter.type !== "formal_parameters"
+				) parameter = parameter.parent;
 				if (
-					parent?.type === "required_parameter" &&
-					isSameNode(parent.childForFieldName?.("pattern"), name)
+					parameter &&
+					["required_parameter", "optional_parameter"].includes(parameter.type) &&
+					contains(parameter.childForFieldName?.("pattern") ?? parameter, name)
 				) {
-					const fn = parent.parent?.parent;
+					const fn = parameter.parent?.parent;
 					const scope = fn?.childForFieldName?.("body");
 					if (fn && scope) candidates.push({ name, owner: fn, scope, kind: "parameter" });
 					continue;
@@ -2068,17 +2106,23 @@ export class TreeSitterClient {
 					candidates.push({ name, owner: parent, scope: parent.parent, kind: "function" });
 					continue;
 				}
-				const catchBody = parent?.type === "catch_clause"
-					? parent.childForFieldName?.("body")
+				let catchClause = parent;
+				while (
+					catchClause &&
+					catchClause.type !== "catch_clause" &&
+					!["statement_block", "program"].includes(catchClause.type)
+				) catchClause = catchClause.parent;
+				const catchBody = catchClause?.type === "catch_clause"
+					? catchClause.childForFieldName?.("body")
 					: undefined;
 				if (
-					parent?.type === "catch_clause" &&
-					isSameNode(parent.childForFieldName?.("parameter"), name) &&
+					catchClause?.type === "catch_clause" &&
+					contains(catchClause.childForFieldName?.("parameter") ?? catchClause, name) &&
 					catchBody
 				) {
 					candidates.push({
 						name,
-						owner: parent,
+						owner: catchClause,
 						scope: catchBody,
 						kind: "catch",
 					});
@@ -2169,14 +2213,7 @@ export class TreeSitterClient {
 				const literal = index.text.slice(1, -1);
 				return !literal.includes("\\") && literal !== "RegExp";
 			}
-			if (parent?.type !== "arguments" || parent.children.filter((child) => child.isNamed).length !== 1) {
-				return false;
-			}
-			const call = parent.parent;
-			const fn = call?.childForFieldName?.("function");
-			return call?.type === "call_expression" &&
-				fn?.type === "member_expression" &&
-				fn.childForFieldName?.("property")?.text === "bind";
+			return false;
 		};
 		if (
 			(references.get("RegExp") ?? []).some(
@@ -2317,6 +2354,7 @@ export class TreeSitterClient {
 		const binding = bindingFor(node);
 		if (!binding) return false;
 		if (binding.kind === "for") {
+			if (!binding.owner.children.some((child) => child.type === "of")) return false;
 			if (
 				bindingReferences(binding).some(
 					(reference) => !isAllowedReceiverReference(reference, binding),
