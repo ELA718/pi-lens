@@ -16,6 +16,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { suspendAt } from "../interleaving-kit.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
@@ -192,6 +193,79 @@ describe("#743 — per-server notify-write deadlines", () => {
 			state: { clients: Map<string, unknown> };
 		}).state.clients;
 		expect([...clients.keys()].some((k) => k.startsWith("wedged:"))).toBe(false);
+	});
+
+	it("non-fast generation reset waits for an evicted client's owned teardown", async () => {
+		const { getLSPService, resetLSPService } = await import(
+			"../../../clients/lsp/index.js"
+		);
+		const service = getLSPService();
+		const client = makeClient(true);
+		const retirement = suspendAt(client.shutdown);
+		const harness = service as unknown as {
+			recordNotifyWriteBackpressure(
+				key: string,
+				entry: { client: typeof client; info: { id: string } },
+				filePath: string,
+			): void;
+		};
+
+		try {
+			for (let attempt = 0; attempt < 3; attempt++) {
+				harness.recordNotifyWriteBackpressure(
+					"wedged:C:/repo",
+					{ client, info: { id: "wedged" } },
+					FILE,
+				);
+			}
+			await retirement.admitted;
+
+			let resetSettled = false;
+			const reset = resetLSPService().then(() => {
+				resetSettled = true;
+			});
+			await vi.advanceTimersByTimeAsync(0);
+			expect(resetSettled).toBe(false);
+
+			retirement.release();
+			await reset;
+			expect(resetSettled).toBe(true);
+		} finally {
+			retirement.release();
+			retirement.restore();
+		}
+	});
+
+	it("fast generation reset does not wait for an evicted client's owned teardown", async () => {
+		const { getLSPService, resetLSPService } = await import(
+			"../../../clients/lsp/index.js"
+		);
+		const service = getLSPService();
+		const client = makeClient(true);
+		const retirement = suspendAt(client.shutdown);
+		const harness = service as unknown as {
+			recordNotifyWriteBackpressure(
+				key: string,
+				entry: { client: typeof client; info: { id: string } },
+				filePath: string,
+			): void;
+		};
+
+		try {
+			for (let attempt = 0; attempt < 3; attempt++) {
+				harness.recordNotifyWriteBackpressure(
+					"wedged:C:/repo",
+					{ client, info: { id: "wedged" } },
+					FILE,
+				);
+			}
+			await retirement.admitted;
+			await expect(resetLSPService({ fast: true })).resolves.toBeUndefined();
+		} finally {
+			retirement.release();
+			await retirement.completed;
+			retirement.restore();
+		}
 	});
 
 	it("a successful write resets the consecutive-timeout streak so demotion needs a fresh run", async () => {
