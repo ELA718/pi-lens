@@ -72,6 +72,87 @@ const EMPTY_RESULT: Omit<GitleaksResult, "scannedAt"> = {
 };
 
 const SCAN_TIMEOUT_MS = 120_000;
+const MAX_METADATA_BYTES = 1_048_576;
+const MAX_SOURCE_BYTES = 1_048_576;
+const MAX_MATCH_BYTES = 4_096;
+
+interface JsonPropertyRange {
+	key: string;
+	valueStart: number;
+	valueEnd: number;
+}
+
+function jsonStringEnd(source: string, start: number): number {
+	for (let i = start + 1; i < source.length; i++) {
+		if (source[i] === "\\") i++;
+		else if (source[i] === '"') return i + 1;
+	}
+	return -1;
+}
+
+function jsonValueEnd(source: string, start: number): number {
+	if (source[start] === '"') return jsonStringEnd(source, start);
+	if (source[start] !== "{" && source[start] !== "[") {
+		let i = start;
+		while (i < source.length && !",}]".includes(source[i])) i++;
+		return i;
+	}
+	const stack = [source[start]];
+	for (let i = start + 1; i < source.length; i++) {
+		if (source[i] === '"') {
+			i = jsonStringEnd(source, i) - 1;
+			if (i < 0) return -1;
+		} else if (source[i] === "{" || source[i] === "[") stack.push(source[i]);
+		else if (source[i] === "}" || source[i] === "]") {
+			stack.pop();
+			if (stack.length === 0) return i + 1;
+		}
+	}
+	return -1;
+}
+
+function jsonObjectProperties(source: string, start: number, end: number): JsonPropertyRange[] | undefined {
+	if (source[start] !== "{" || source[end - 1] !== "}") return undefined;
+	const properties: JsonPropertyRange[] = [];
+	let i = start + 1;
+	while (i < end - 1) {
+		while (/\s|,/.test(source[i] ?? "")) i++;
+		if (i >= end - 1) break;
+		if (source[i] !== '"') return undefined;
+		const keyEnd = jsonStringEnd(source, i);
+		if (keyEnd < 0) return undefined;
+		let key: unknown;
+		try { key = JSON.parse(source.slice(i, keyEnd)); } catch { return undefined; }
+		if (typeof key !== "string") return undefined;
+		i = keyEnd;
+		while (/\s/.test(source[i] ?? "")) i++;
+		if (source[i++] !== ":") return undefined;
+		while (/\s/.test(source[i] ?? "")) i++;
+		const valueStart = i;
+		const valueEnd = jsonValueEnd(source, valueStart);
+		if (valueEnd < 0 || valueEnd > end) return undefined;
+		properties.push({ key, valueStart, valueEnd });
+		i = valueEnd;
+	}
+	return properties;
+}
+
+function readBoundedFile(file: string, maxBytes: number): Buffer | undefined {
+	if (!fs.lstatSync(file).isFile()) return undefined;
+	const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+	try {
+		const stat = fs.fstatSync(fd);
+		if (!stat.isFile() || stat.size > maxBytes) return undefined;
+		const content = Buffer.alloc(stat.size);
+		let offset = 0;
+		for (; offset < content.length;) {
+			const read = fs.readSync(fd, content, offset, content.length - offset, offset);
+			if (read === 0) return undefined;
+			offset += read;
+		}
+		return fs.readSync(fd, Buffer.alloc(1), 0, 1, offset) === 0 ? content : undefined;
+	} finally { fs.closeSync(fd); }
+}
 
 // --- Detection ---
 
@@ -325,6 +406,58 @@ function isNonCredentialGenericValue(entry: Record<string, unknown>): boolean {
 	return false;
 }
 
+function reportedMatchOffset(source: string, entry: Record<string, unknown>): number | undefined {
+	const match = entry.Match as string;
+	if (Buffer.byteLength(match) > MAX_MATCH_BYTES) return undefined;
+	const startLine = Number(entry.StartLine);
+	const expectedEndLine = startLine + match.split("\n").length - 1;
+	if (!Number.isInteger(startLine) || startLine < 1 || (entry.EndLine !== undefined && Number(entry.EndLine) !== expectedEndLine)) return undefined;
+	let lineStart = 0;
+	for (let line = 1; line < startLine; line++) {
+		lineStart = source.indexOf("\n", lineStart);
+		if (lineStart < 0) return undefined;
+		lineStart++;
+	}
+	const firstLineEnd = source.indexOf("\n", lineStart);
+	let rangeEnd = lineStart;
+	for (let line = startLine; line <= expectedEndLine; line++) {
+		const newline = source.indexOf("\n", rangeEnd);
+		rangeEnd = newline < 0 ? source.length : newline + 1;
+	}
+	if (!source.includes(match, lineStart)) return undefined;
+	const offset = source.indexOf(match, lineStart);
+	if ((firstLineEnd >= 0 && offset >= firstLineEnd) || offset + match.length > rangeEnd) return undefined;
+	return source.indexOf(match, offset + 1) < rangeEnd && source.indexOf(match, offset + 1) >= 0 ? undefined : offset;
+}
+
+function isVerifiedCurrentSourceHash(source: string, root: string, matchOffset: number, match: string, secret: string): boolean {
+	let parsed: unknown;
+	try { parsed = JSON.parse(source); } catch { return false; }
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+	const start = source.search(/\S/);
+	if (start < 0) return false;
+	const end = jsonValueEnd(source, start);
+	if (end < 0 || source.slice(end).trim()) return false;
+	const rootProperties = jsonObjectProperties(source, start, end);
+	const hashes = rootProperties?.filter(property => property.key === "sourceSha256") ?? [];
+	if (hashes.length !== 1 || source[hashes[0].valueStart] !== "{") return false;
+	const entries = jsonObjectProperties(source, hashes[0].valueStart, hashes[0].valueEnd);
+	if (!entries || new Set(entries.map(property => property.key)).size !== entries.length) return false;
+	if (!match.includes(secret)) return false;
+	const secretOffset = match.indexOf(secret);
+	if (match.indexOf(secret, secretOffset + 1) >= 0) return false;
+	const candidates = entries.filter(property =>
+		source.slice(property.valueStart, property.valueEnd) === JSON.stringify(secret)
+		&& property.valueStart + 1 === matchOffset + secretOffset,
+	);
+	if (candidates.length !== 1 || path.isAbsolute(candidates[0].key)) return false;
+	const sourceFile = fs.realpathSync(path.resolve(root, candidates[0].key));
+	const relative = path.relative(root, sourceFile);
+	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false;
+	const content = readBoundedFile(sourceFile, MAX_SOURCE_BYTES);
+	return content !== undefined && createHash("sha256").update(content).digest("hex") === secret;
+}
+
 /** Verify the surrounding metadata rather than ignoring hashes or whole files. */
 function isVerifiedGenericMetadata(entry: Record<string, unknown>, cwd?: string): boolean {
 	if (!cwd || entry.RuleID !== "generic-api-key" || typeof entry.File !== "string" || typeof entry.Match !== "string" || typeof entry.Secret !== "string") return false;
@@ -332,22 +465,24 @@ function isVerifiedGenericMetadata(entry: Record<string, unknown>, cwd?: string)
 		const file = fs.realpathSync(path.resolve(cwd, entry.File));
 		const relative = path.relative(fs.realpathSync(cwd), file);
 		if (relative.startsWith("..") || path.isAbsolute(relative)) return false;
-		const source = fs.readFileSync(file, "utf-8");
-		const start = Number(entry.StartLine) - 1;
+		const metadata = readBoundedFile(file, MAX_METADATA_BYTES);
+		if (!metadata) return false;
+		const source = metadata.toString("utf-8");
+		const matchOffset = reportedMatchOffset(source, entry);
+		if (matchOffset === undefined) return false;
 		const lines = source.split(/\r?\n/);
-		if (!Number.isInteger(start) || start < 0) return false;
-		const excerpt = lines.slice(start, start + entry.Match.split("\n").length + 1).join("\n");
-		const index = excerpt.indexOf(entry.Match);
-		if (index < 0) return false;
+		const start = Number(entry.StartLine) - 1;
+		const excerpt = source.slice(matchOffset, matchOffset + entry.Match.length + 2);
 		const secret = entry.Secret;
 		// The regex crossed from prose ending in "key" into the NAME of the
 		// next JSON property. This is not a credential assignment.
-		if (entry.Match.includes("\n") && /^[A-Z][A-Z0-9_]+$/.test(secret) && /^\s*:/.test(excerpt.slice(index + entry.Match.length))) return true;
+		if (entry.Match.includes("\n") && /^[A-Z][A-Z0-9_]+$/.test(secret) && /^\s*:/.test(excerpt.slice(entry.Match.length))) return true;
 		if (!/^[a-f0-9]{64}$/.test(secret)) return false;
+		if (isVerifiedCurrentSourceHash(source, fs.realpathSync(cwd), matchOffset, entry.Match, secret)) return true;
 		const artifact = entry.Match.match(/^(\d{14}_[a-z0-9_]+\.sql)['"],\s*['"]/);
 		if (artifact) {
-			const content = fs.readFileSync(path.join(cwd, "supabase", "migrations", artifact[1]));
-			return createHash("sha256").update(content).digest("hex") === secret;
+			const content = readBoundedFile(path.join(cwd, "supabase", "migrations", artifact[1]), MAX_SOURCE_BYTES);
+			return content !== undefined && createHash("sha256").update(content).digest("hex") === secret;
 		}
 		if (!file.endsWith(".sql")) return false;
 		// A simple SQL metadata inventory: derive the value's column from its
