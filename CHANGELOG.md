@@ -16,6 +16,10 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Security
 
+- The existing TypeScript SQL rule now scans `.tsx` with the TSX parser. Static
+  and parameterized SQL remain excluded; unsafe and unproven candidates remain
+  findings without duplicate reports or finding-cap loss.
+
 - SQL injection scanning now allows static and parameterized SQL while retaining
   dynamic argument-1 findings. Ast-grep NAPI now covers `.mts`, `.cts`, `.mjs`,
   and `.cjs`, and production ast-grep paths use exact-snapshot provenance. Recovered

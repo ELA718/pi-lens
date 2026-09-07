@@ -1,5 +1,10 @@
 # pi-lens — agent context
 
+The TypeScript `no-sql-in-code` NAPI rule also applies to `.tsx` files parsed
+with the real TSX grammar. Other rules retain exact language boundaries. Keep
+SQL provenance and finding-cap behavior identical across these two grammars;
+unknown, mutable, shadowed, recovered-syntax and over-budget inputs stay findings.
+
 `vendors` is a business-domain directory name, not an unconditional dependency
 boundary. Keep it out of both `EXCLUDED_DIRS` and `VENDOR_DIR_NAMES`, so source
 walks, LSP inventory and pipeline admission agree. Actual dependency directories
