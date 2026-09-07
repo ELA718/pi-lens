@@ -3820,6 +3820,22 @@ export class TreeSitterClient {
 			}
 			return names;
 		};
+		const functionIsLocallyInvoked = (fn: TreeSitterNode): boolean => {
+			const name = fn.childForFieldName?.("name");
+			let binding = name?.type === "identifier" ? bindingFor(name) : undefined;
+			if (!binding) {
+				const value = outerTransparentExpression(fn);
+				const declaration = value.parent;
+				const bindingName = declaration?.type === "variable_declarator" && sameNode(declaration.childForFieldName?.("value"), value)
+					? declaration.childForFieldName?.("name")
+					: undefined;
+				binding = bindingName?.type === "identifier" ? bindingFor(bindingName) : undefined;
+			}
+			return !!binding && referencesFor(binding).some((reference) => {
+				const callee = outerTransparentExpression(reference);
+				return callee.parent?.type === "call_expression" && sameNode(callee.parent.childForFieldName?.("function"), callee);
+			});
+		};
 		const nativeTransformIsStable = (method: string): boolean => {
 			if (!globalOwnerAccessIsStable()) return false;
 			if (nodes.some((node) => {
@@ -3851,7 +3867,10 @@ export class TreeSitterClient {
 					const name = declaration?.type === "variable_declarator" && sameNode(declaration.childForFieldName?.("value"), acquisition)
 						? declaration.childForFieldName?.("name")
 						: undefined;
-					if (sensitiveProperty || computedNativeInstance) return true;
+					const scope = nearestFunction(node);
+					const destinationScope = nearestFunction(destination);
+					const acquisitionCanRun = !scope || (!!destinationScope && sameNode(scope, destinationScope)) || functionIsLocallyInvoked(scope);
+					if (sensitiveProperty || computedNativeInstance || (unknownProperty && acquisitionCanRun)) return true;
 					if (name?.type === "identifier") {
 						const binding = bindingFor(name);
 						if (binding && acquiredBindingIsUnproven(binding) && unknownProperty) return true;

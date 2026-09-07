@@ -99,6 +99,7 @@ describe("SSRF deployment-configuration provenance", () => {
 		["computed instance prototype mutation", `const proto = ""["__proto__"]; proto.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
 		["assigned computed prototype acquisition", `const key = "__proto__"; let proto; proto = ""[key]; proto.trim = () => request.url; fetch(Deno.env.get("URL").trim());`],
 		["conditional computed prototype acquisition", `const key = "__proto__"; const proto = true ? ""[key] : ""[key]; proto.trim = () => request.url; fetch(Deno.env.get("URL").trim());`],
+		["unknown computed acquisition", `function value() { return ""; } function key() { return "__proto__"; } const proto = true ? value()[key()] : value()[key()]; proto.trim = () => request.url; fetch(Deno.env.get("URL").trim());`],
 		["returned computed prototype acquisition", `const key = "__proto__"; function acquire() { return ""[key]; } const proto = acquire(); proto.trim = () => request.url; fetch(Deno.env.get("URL").trim());`],
 		["binding-resolved computed prototype mutation", `const value = ""; const key = "__proto__"; const proto = value[key]; proto.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
 		["destructured native prototype mutation", `const { __proto__: proto } = ""; proto.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
