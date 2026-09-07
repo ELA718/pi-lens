@@ -51,21 +51,15 @@
  * project-runner scan — this module accepts the SAME signal so a `mode=full`
  * abort also bounds the fresh-fetch instead of letting it run uncancelled for
  * up to trivy's own ~180s ceiling after the rest of the scan already stopped.
- * None of the six analyzer clients accept a cancellation token today (checked
- * each `analyze()`/`scan()` signature before assuming otherwise — none does),
- * so true in-flight cancellation isn't available at the client level. Instead
- * this races the overall `Promise.all(tasks)` against the abort signal and
- * returns whatever has already settled — the same "partial is OK, a hang is
- * not" shape `clients/deadline-utils.ts`'s `withDeadline(..., onTimeout:
- * "undefined")` and `clients/lsp/index.ts`'s `runWorkspaceDiagnostics` already
- * use. Already-spawned analyzer processes are NOT killed: they keep running in
- * the background (bounded by their own `SCAN_TIMEOUT_MS`/`ANALYSIS_TIMEOUT_MS`)
- * and still write their result to cache when they finish, so nothing already
- * in flight is wasted — the NEXT caller (or a background session_start/
- * turn_end pass) benefits from it. Analyzers that hadn't settled yet when the
- * abort fired are reported in both `cold` (so they don't silently read as
- * "ran clean") and `abortedIds` (so a caller can render a more honest reason
- * than "not applicable").
+ * Each analyzer receives that signal only when this call starts its run. A
+ * same-root call that joins an incumbent promise does not replace the signal or
+ * lifetime owned by the request that started it. The overall `Promise.all`
+ * still races the abort signal so the caller gets prompt partial output while
+ * newly owned analyzer process groups stop through `safeSpawnAsync`; joined
+ * incumbents can finish and cache their result for their original owner.
+ * Analyzers that had not settled when the abort fired are reported in both
+ * `cold` (so they do not silently read as "ran clean") and `abortedIds` (so a
+ * caller can render a more honest reason than "not applicable").
  *
  * One analyzer does NOT follow the trigger-or-join shape above: `test-runner`
  * (#1004). Its "scan" is the per-edit turn_end test fire (`runtime-turn.ts`),
@@ -161,9 +155,9 @@ function pushUnique(list: string[], id: string): void {
  * single slowest one (trivy's own timeout ceiling) rather than their sum.
  *
  * `signal`, when provided and it fires before every analyzer has settled,
- * makes this return immediately with whatever partial results are available
- * (see the module header for why this races rather than cancels in-flight
- * spawns).
+ * makes this return immediately with whatever partial results are available.
+ * Newly started analyzer runs receive the signal; a joined incumbent keeps the
+ * lifetime of the request that originally started it.
  */
 export async function fetchFreshProjectDiagnostics(
 	cacheManager: CacheManager,
@@ -190,6 +184,17 @@ export async function fetchFreshProjectDiagnostics(
 			failed: [],
 			timings: {},
 			unsafeRoot: true,
+		};
+	}
+	if (signal?.aborted) {
+		return {
+			diagnostics: [],
+			runners: [],
+			cold: [...ANALYZER_IDS],
+			failed: [],
+			timings: {},
+			aborted: true,
+			abortedIds: [...ANALYZER_IDS],
 		};
 	}
 	const diagnostics: ProjectDiagnostic[] = [];
@@ -232,6 +237,7 @@ export async function fetchFreshProjectDiagnostics(
 			const result = await clients.knipClient.analyze(
 				analysisRoot,
 				getKnipIgnorePatterns(),
+				signal,
 			);
 			if (!result.success) {
 				recordFailed("knip", result);
@@ -264,6 +270,7 @@ export async function fetchFreshProjectDiagnostics(
 				undefined,
 				undefined,
 				isTsProject,
+				{ signal },
 			);
 			if (!result.success) {
 				recordFailed("jscpd", result);
@@ -286,7 +293,7 @@ export async function fetchFreshProjectDiagnostics(
 				return;
 			}
 			const startMs = Date.now();
-			const result = await clients.depChecker.scanProject(analysisRoot);
+			const result = await clients.depChecker.scanProject(analysisRoot, signal);
 			cacheManager.writeCache("madge", result, analysisRoot, {
 				scanDurationMs: Date.now() - startMs,
 			});
@@ -318,6 +325,7 @@ export async function fetchFreshProjectDiagnostics(
 			const startMs = Date.now();
 			const result = await clients.gitleaksClient.scan(analysisRoot, {
 				requireSignal: false,
+				signal,
 			});
 			if (!result.success) {
 				recordFailed("gitleaks", result);
@@ -344,7 +352,10 @@ export async function fetchFreshProjectDiagnostics(
 				return;
 			}
 			const startMs = Date.now();
-			const result = await clients.govulncheckClient.analyze(analysisRoot);
+			const result = await clients.govulncheckClient.analyze(
+				analysisRoot,
+				signal,
+			);
 			if (!result.success) {
 				recordFailed("govulncheck", result);
 				return;
@@ -379,7 +390,7 @@ export async function fetchFreshProjectDiagnostics(
 				return;
 			}
 			const startMs = Date.now();
-			const result = await clients.opengrepClient.scan(analysisRoot);
+			const result = await clients.opengrepClient.scan(analysisRoot, signal);
 			if (!result.success) {
 				recordFailed("opengrep", result);
 				return;
@@ -405,7 +416,7 @@ export async function fetchFreshProjectDiagnostics(
 				return;
 			}
 			const startMs = Date.now();
-			const result = await clients.trivyClient.scan(analysisRoot);
+			const result = await clients.trivyClient.scan(analysisRoot, signal);
 			if (!result.success) {
 				recordFailed("trivy", result);
 				return;
@@ -435,7 +446,7 @@ export async function fetchFreshProjectDiagnostics(
 				applicable.map(async (client) => {
 					const cacheKey = `dead-code-${client.id}`;
 					const startMs = Date.now();
-					const result = await client.analyze(analysisRoot);
+					const result = await client.analyze(analysisRoot, signal);
 					if (!result.success) {
 						recordFailed("dead-code", result);
 						return;

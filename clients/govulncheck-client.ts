@@ -209,7 +209,7 @@ export class GovulncheckClient extends SecurityScanClient<GovulncheckResult> {
 	 * govulncheck process. Mirrors the in-flight dedupe pattern used by
 	 * KnipClient / JscpdClient.
 	 */
-	async analyze(cwd: string): Promise<GovulncheckResult> {
+	async analyze(cwd: string, signal?: AbortSignal): Promise<GovulncheckResult> {
 		const targetDir = path.resolve(cwd);
 
 		if (!GovulncheckClient.hasGoModule(targetDir)) {
@@ -229,17 +229,20 @@ export class GovulncheckClient extends SecurityScanClient<GovulncheckResult> {
 			};
 		}
 
-		return this.dedupeScan(targetDir, () => this.runScan(targetDir));
+		return this.dedupeScan(targetDir, () => this.runScan(targetDir, signal));
 	}
 
-	private async runScan(cwd: string): Promise<GovulncheckResult> {
+	private async runScan(
+		cwd: string,
+		signal?: AbortSignal,
+	): Promise<GovulncheckResult> {
 		const scannedAt = new Date().toISOString();
 		const bin = this.binaryPath ?? "govulncheck";
 		try {
 			const result = await safeSpawnAsync(
 				bin,
 				["-mode=source", "-format=json", "./..."],
-				{ cwd, timeout: SCAN_TIMEOUT_MS },
+				{ cwd, timeout: SCAN_TIMEOUT_MS, signal },
 			);
 
 			// govulncheck exits non-zero (status 3) when vulnerabilities are

@@ -55,7 +55,7 @@ export interface DeadCodeClient {
 	/** Resolve the binary (PATH first, then auto-install). */
 	ensureAvailable(): Promise<boolean>;
 	/** Project-wide scan. Never throws; failures come back as success:false. */
-	analyze(cwd: string): Promise<DeadCodeResult>;
+	analyze(cwd: string, signal?: AbortSignal): Promise<DeadCodeResult>;
 }
 
 function emptyResult(language: string): Omit<DeadCodeResult, "summary"> {
@@ -226,7 +226,7 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 		return false;
 	}
 
-	async analyze(cwd: string): Promise<DeadCodeResult> {
+	async analyze(cwd: string, signal?: AbortSignal): Promise<DeadCodeResult> {
 		const root = this.resolveProjectRoot(cwd || process.cwd());
 		if (!root) {
 			return {
@@ -246,14 +246,17 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 		const key = path.resolve(root);
 		const existing = this.inFlight.get(key);
 		if (existing) return existing;
-		const promise = this.runAnalyze(key).finally(() =>
+		const promise = this.runAnalyze(key, signal).finally(() =>
 			this.inFlight.delete(key),
 		);
 		this.inFlight.set(key, promise);
 		return promise;
 	}
 
-	private async runAnalyze(root: string): Promise<DeadCodeResult> {
+	private async runAnalyze(
+		root: string,
+		signal?: AbortSignal,
+	): Promise<DeadCodeResult> {
 		const startMs = Date.now();
 		const invocation = this.resolved ?? { cmd: "vulture", prefix: [] };
 		const args = [
@@ -265,6 +268,7 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 		const result = await safeSpawnAsync(invocation.cmd, args, {
 			timeout: ANALYSIS_TIMEOUT_MS,
 			cwd: root,
+			signal,
 		});
 		const durationMs = Date.now() - startMs;
 

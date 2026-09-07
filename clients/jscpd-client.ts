@@ -173,7 +173,7 @@ export class JscpdClient {
 		minLines = 5,
 		minTokens = 50,
 		isTsProject = false,
-		options: { homeDir?: string } = {},
+		options: { homeDir?: string; signal?: AbortSignal } = {},
 	): Promise<JscpdResult> {
 		const targetDir = path.resolve(cwd);
 
@@ -208,6 +208,7 @@ export class JscpdClient {
 			minLines,
 			minTokens,
 			isTsProject,
+			options.signal,
 		).finally(() => {
 			this.inFlight.delete(key);
 		});
@@ -220,6 +221,7 @@ export class JscpdClient {
 		minLines: number,
 		minTokens: number,
 		isTsProject: boolean,
+		signal?: AbortSignal,
 	): Promise<JscpdResult> {
 		const outDir = mkdtempSync(`${os.tmpdir()}${path.sep}pi-lens-jscpd-`);
 
@@ -272,6 +274,7 @@ export class JscpdClient {
 				{
 					timeout: SCAN_TIMEOUT_MS,
 					cwd,
+					signal,
 				},
 			);
 
