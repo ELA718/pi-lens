@@ -1,5 +1,11 @@
 # pi-lens — agent context
 
+File-major diagnostic scans use the shared cooperative deadline to yield to
+timers and I/O between files. Synchronously resolved consumers still need a
+macrotask yield. Recheck cancellation and WASM state after yielding; cancelled
+snapshots stay truncated and report completed work instead of the inventory size.
+Preserve ordinary scan ordering and the poisoned-WASM stop contract. (refs #6)
+
 Direct file admission inherits ignored-directory verdicts from its ancestors.
 Evaluate those ancestors in root-to-leaf order before the file, so a generated
 descendant cannot evade a nested directory ignore. Preserve Git negation and

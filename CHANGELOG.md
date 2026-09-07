@@ -14,6 +14,10 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- File-major diagnostics yield during synchronous native rule work so abort
+  timers can run. Cancelled snapshots retain partial file counts and report
+  truncation. (refs #6)
+
 - Direct file scans now inherit Git-ignored parent directories, including nested
   generated Android assets, while retaining ignore-layer and tracked-file
   behavior. (refs #6)

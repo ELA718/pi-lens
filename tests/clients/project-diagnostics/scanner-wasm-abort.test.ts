@@ -7,6 +7,7 @@ const state = vi.hoisted(() => ({
 	aborted: false,
 	abortAfter: Number.POSITIVE_INFINITY,
 	parseCalls: 0,
+	busyMs: 0,
 	log: vi.fn(),
 }));
 
@@ -21,6 +22,10 @@ vi.mock("../../../clients/tree-sitter-shared.js", async (importOriginal) => {
 		runQueriesOnFile: async () => {
 			state.parseCalls++;
 			if (state.parseCalls === state.abortAfter) state.aborted = true;
+			const stopAt = performance.now() + state.busyMs;
+			while (performance.now() < stopAt) {
+				// Model a synchronous native rule consumer before its resolved promise.
+			}
 			return [];
 		},
 		withParseCacheMeasurement: async (scan: () => Promise<void>) => scan(),
@@ -133,6 +138,7 @@ beforeEach(() => {
 	state.aborted = false;
 	state.abortAfter = Number.POSITIVE_INFINITY;
 	state.parseCalls = 0;
+	state.busyMs = 0;
 	state.log.mockClear();
 	clearReviewGraphFileIr(tmp);
 });
@@ -180,6 +186,31 @@ describe("project diagnostics mid-scan WASM abort (#891)", () => {
 				}),
 			}),
 		);
+	});
+
+	it("yields to a real abort timer between synchronously resolving file consumers", async () => {
+		const files = ["a.ts", "b.ts", "c.ts"].map((name) => path.join(tmp, name));
+		const controller = new AbortController();
+		state.busyMs = 5;
+		const timer = setTimeout(() => controller.abort(), 0);
+
+		try {
+			const result = await scanProjectDiagnostics({
+				cwd: tmp,
+				tier: "cheap",
+				files,
+				signal: controller.signal,
+			});
+
+			expect(controller.signal.aborted).toBe(true);
+			expect(result.scanTruncated).toBe(true);
+			expect(result.filesScanned).toBeGreaterThan(0);
+			expect(result.filesScanned).toBeLessThan(files.length);
+			expect(result.filesScanned).toBe(state.parseCalls);
+			expect(result.runners).not.toContain("ast-grep-napi");
+		} finally {
+			clearTimeout(timer);
+		}
 	});
 
 	it("persists the complete snapshot when no WASM abort occurs", async () => {
