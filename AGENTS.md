@@ -1,5 +1,12 @@
 # pi-lens — agent context
 
+Java JDBC index checks inspect the first argument only. Same-name Java calls
+are excluded as overload delegation only when the current method is fixed-arity,
+the call has a different arity, and a unique local fixed-arity overload exists.
+Preserve same-arity and varargs recursion, foreign receivers, malformed syntax
+and bounded-traversal failures. Comments do not count as arguments; reject
+wide nodes before materializing their children. (refs #6)
+
 SQL exec-call applicability excludes a RegExp receiver only with bounded local
 syntax and reference-use proof. Every receiver reference must be its const
 declaration, direct exec/test receiver, or numeric lastIndex assignment. Escapes,

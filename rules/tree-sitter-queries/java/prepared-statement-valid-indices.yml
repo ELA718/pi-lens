@@ -34,6 +34,8 @@ metavars:
   - INDEX
   - ARGS
 
+post_filter: java_first_non_comment_argument
+
 tags:
   - reliability
   - java

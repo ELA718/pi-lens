@@ -6,6 +6,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ## [Unreleased]
 
+- Check the actual first JDBC index argument and distinguish proven Java overload delegation while retaining same-arity and varargs recursion. (refs #6)
+
 - Distinguish proven local RegExp exec calls from SQL sinks using bounded receiver provenance; retain escapes, mutation, and unknown execution. (refs #6)
 
 ### Added

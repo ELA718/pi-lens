@@ -2776,17 +2776,161 @@ export class TreeSitterClient {
 					return true;
 				}
 			}
+			case "java_first_non_comment_argument": {
+				try {
+					const args = captures.ARGS;
+					const index = captures.INDEX;
+					if (!args || !index || args.childCount > NO_NESTED_ANCHOR_VISIT_CAP) {
+						return true;
+					}
+					const parent = args as TreeSitterNode & {
+						child?: (position: number) => TreeSitterNode | null;
+					};
+					if (args.childCount > 0 && !parent.child) return true;
+					for (let position = 0; position < args.childCount; position++) {
+						const argument = parent.child?.(position);
+						if (!argument) return true;
+						if (!argument.isNamed || argument.type.endsWith("comment")) continue;
+						return (
+							argument.startIndex === index.startIndex &&
+							argument.endIndex === index.endIndex
+						);
+					}
+					return true;
+				} catch {
+					return true;
+				}
+			}
 			case "same_method_no_base_case": {
 				try {
 					const method = captures.NAME?.text ?? "";
 					if (!method || captures.RECURSE?.text !== method) return false;
 					const call = captures.CALL;
-					const declaration = call
+					const declaration = (call
 						? this.navigator.findParent(call, ["method_declaration"])
-						: undefined;
-					if (!declaration) return true;
+						: undefined) as TreeSitterNode | undefined;
+					if (!call || !declaration) return true;
+
+					const containingType = this.navigator.findParent(declaration, [
+						"class_declaration",
+						"interface_declaration",
+						"enum_declaration",
+						"record_declaration",
+					]) as TreeSitterNode | null;
+					if (!containingType) return true;
+					const pushJavaChildrenWithinBudget = (
+						node: TreeSitterNode,
+						pending: TreeSitterNode[],
+						visited: number,
+					): boolean => {
+						if (
+							node.childCount >
+							NO_NESTED_ANCHOR_VISIT_CAP - visited - pending.length - 1
+						) {
+							return false;
+						}
+						const parent = node as TreeSitterNode & {
+							child?: (index: number) => TreeSitterNode | null;
+						};
+						if (node.childCount > 0 && !parent.child) return false;
+						for (let index = 0; index < node.childCount; index++) {
+							const child = parent.child?.(index);
+							if (!child) return false;
+							pending.push(child);
+						}
+						return true;
+					};
+					const syntaxStack = [containingType];
+					for (
+						let visited = 0;
+						syntaxStack.length > 0 &&
+							visited < NO_NESTED_ANCHOR_VISIT_CAP;
+						visited++
+					) {
+						const node = syntaxStack.pop();
+						if (!node) break;
+						if (
+							node.type === "ERROR" ||
+							(node as TreeSitterNode & { isMissing?: boolean }).isMissing
+						) {
+							return true;
+						}
+						if (!pushJavaChildrenWithinBudget(node, syntaxStack, visited)) {
+							return true;
+						}
+					}
+					if (syntaxStack.length > 0) return true;
+
+					const receiver = call.childForFieldName?.("object");
+					const typeName = containingType.childForFieldName?.("name")?.text;
+					const receiverIsLocal =
+						!receiver ||
+						receiver.type === "this" ||
+						(receiver.type === "identifier" && receiver.text === typeName);
+					const argumentsNode = call.childForFieldName?.("arguments");
+					const typeBody = containingType.childForFieldName?.("body");
+					const currentParameters =
+						declaration.childForFieldName?.("parameters");
+					const currentParameterNodes = currentParameters?.children.filter(
+						(node) => node.isNamed && !node.type.endsWith("comment"),
+					);
+					const callArity = argumentsNode?.children.filter(
+						(node) => node.isNamed && !node.type.endsWith("comment"),
+					).length;
+					if (
+						receiverIsLocal &&
+						typeBody &&
+						currentParameterNodes &&
+						currentParameterNodes.every(
+							(node) => node.type === "formal_parameter",
+						) &&
+						callArity !== undefined &&
+						callArity !== currentParameterNodes.length
+					) {
+						const currentIsStatic = /\bstatic\b/.test(
+							declaration.children.find((node) => node.type === "modifiers")
+								?.text ?? "",
+						);
+						const receiverRequiresStatic =
+							currentIsStatic ||
+							(receiver?.type === "identifier" && receiver.text === typeName);
+						const overloads = typeBody.children.filter((candidate) => {
+							if (
+								(candidate.startIndex === declaration.startIndex &&
+									candidate.endIndex === declaration.endIndex) ||
+								candidate.type !== "method_declaration" ||
+								candidate.childForFieldName?.("name")?.text !== method
+							) {
+								return false;
+							}
+							const parameterNodes = candidate
+								.childForFieldName?.("parameters")
+								?.children.filter(
+									(node) => node.isNamed && !node.type.endsWith("comment"),
+								);
+							if (
+								!parameterNodes ||
+								parameterNodes.some((node) => node.type !== "formal_parameter")
+							) {
+								return false;
+							}
+							if (receiverRequiresStatic) {
+								const modifiers = candidate.children.find(
+									(node) => node.type === "modifiers",
+								)?.text;
+								if (!modifiers || !/\bstatic\b/.test(modifiers)) return false;
+							}
+							return parameterNodes.length === callArity;
+						});
+						if (overloads.length === 1) return false;
+					}
+
 					const stack = [declaration];
-					for (let visited = 0; stack.length > 0 && visited < 10_000; visited++) {
+					for (
+						let visited = 0;
+						stack.length > 0 && visited < NO_NESTED_ANCHOR_VISIT_CAP;
+						visited++
+					) {
 						const node = stack.pop();
 						if (!node) break;
 						// Any conditional or loop construct is a plausible base-case
@@ -2805,13 +2949,12 @@ export class TreeSitterClient {
 						) {
 							return false;
 						}
-						stack.push(...(node.children ?? []));
+						if (!pushJavaChildrenWithinBudget(node, stack, visited)) {
+							return true;
+						}
 					}
-					// Cap exhausted without a verdict: this rule is BLOCKING, so a
-					// >10k-node method whose guard sits beyond the budget must not
-					// become a silent blocking FP — suppress instead (#956 review;
-					// the advisory filters keep their keep-the-diagnostic default).
-					return stack.length > 0 ? false : true;
+					// Cap exhaustion cannot prove a base case, so retain the finding.
+					return true;
 				} catch {
 					return true;
 				}
