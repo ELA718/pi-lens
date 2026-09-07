@@ -87,7 +87,7 @@ describe("HTML sanitizer provenance", () => {
 			[
 				"src/pages/marketing/templates/desktop/TemplateDetailDesktop.tsx",
 				`import { sanitizeHtml } from '@/lib/utils/sanitize-html'; const view = <div className="max-w-full [&_img]:h-auto [&_img]:max-w-full" dangerouslySetInnerHTML={{__html: sanitizeHtml(template.content)}} />;`,
-				true,
+				false,
 			],
 			[
 				"src/pages/sales/estimates/desktop/SendEstimateToCustomerDialog.tsx",
