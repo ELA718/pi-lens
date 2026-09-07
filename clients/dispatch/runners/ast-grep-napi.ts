@@ -12,6 +12,7 @@ import * as path from "node:path";
 import {
 	type AstGrepNapi,
 	loadAstGrepNapi,
+	type SgNode,
 	type SgRoot,
 } from "../../deps/ast-grep-napi.js";
 import { minimatch } from "../../deps/minimatch.js";
@@ -21,6 +22,7 @@ import {
 } from "../../sgconfig.js";
 import { logLatency } from "../../latency-logger.js";
 import { hasEslintConfig } from "../../tool-policy.js";
+import { isProvenStaticSqlNapiMatch } from "../../sql-provenance.js";
 import { enabledAuxiliaryLspServerIds } from "../auxiliary-lsp.js";
 import { classifyDefect } from "../diagnostic-taxonomy.js";
 import { isAuxiliaryLspAlive } from "../../lsp/index.js";
@@ -69,7 +71,11 @@ export async function loadSg(): Promise<
 }
 
 // Supported extensions for NAPI
-const SUPPORTED_EXTS = [".ts", ".tsx", ".js", ".jsx", ".css", ".html", ".htm"];
+const SUPPORTED_EXTS = [
+	".ts", ".tsx", ".mts", ".cts",
+	".js", ".jsx", ".mjs", ".cjs",
+	".css", ".html", ".htm",
+];
 
 /** Maximum matches per rule to prevent excessive false positives */
 const MAX_MATCHES_PER_RULE = 10;
@@ -208,11 +214,15 @@ export function ruleLanguageForFile(
 	const ext = path.extname(filePath).toLowerCase();
 	switch (ext) {
 		case ".ts":
+		case ".mts":
+		case ".cts":
 			return "typescript";
 		case ".tsx":
 			return "tsx";
 		case ".js":
 		case ".jsx":
+		case ".mjs":
+		case ".cjs":
 			return "javascript";
 		default:
 			return undefined;
@@ -226,11 +236,15 @@ export function getLang(
 	const ext = path.extname(filePath).toLowerCase();
 	switch (ext) {
 		case ".ts":
+		case ".mts":
+		case ".cts":
 			return sgModule.ts;
 		case ".tsx":
 			return sgModule.tsx;
 		case ".js":
 		case ".jsx":
+		case ".mjs":
+		case ".cjs":
 			return sgModule.js;
 		case ".css":
 			return sgModule.css;
@@ -497,9 +511,13 @@ export function evaluateAstGrepRules(
 				for (const match of limitedMatches) {
 					if (diagnostics.length >= maxTotalDiagnostics) break;
 
-					const node = match as {
+					const node = match as SgNode & {
 						range(): { start: { line: number; column: number } };
 					};
+					if (
+						(rule.id === "no-sql-in-code" || rule.id === "no-sql-in-code-js") &&
+						isProvenStaticSqlNapiMatch(node)
+					) continue;
 					const range = node.range();
 					const severity = rule.severity === "error" ? "error" : "warning";
 					const semantic = severity === "error" ? "blocking" : "warning";

@@ -16,12 +16,19 @@ async function findings(code: string) {
 }
 
 describe("SQL composition provenance", () => {
-	it("accepts a fixed template composed from uniquely bound string constants", async () => {
-		expect(await findings("const TAG = 'fixture'; function cleanup() { const rows = `SELECT id FROM records WHERE tag = '${TAG}'`; db.query(`DELETE FROM records WHERE id IN (${rows})`); }")).toHaveLength(0);
+	it.each([
+		"db.query('SELECT id FROM records WHERE tag = $1', [tag]);",
+		"const TAG = 'fixture'; function cleanup() { const rows = `SELECT id FROM records WHERE tag = '${TAG}'`; db.query(`DELETE FROM records WHERE id IN (${rows})`); }",
+		"const TABLE = 'records'; db.query('SELECT * FROM ' + TABLE);",
+	])("accepts static SQL and bound values: %s", async code => {
+		expect(await findings(code)).toHaveLength(0);
 	});
 
 	it.each([
 		"const rows = request.body.sql; db.query(`DELETE FROM records WHERE id IN (${rows})`);",
+		"const sql = 'SELECT * FROM records WHERE id = ' + request.params.id; db.query(sql);",
+		"function run(sql) { db.query(sql); }",
+		"const part = 'fixed'; consume(part => db.query('SELECT ' + part));",
 		"const TAG = 'fixture'; function cleanup(TAG) { db.query(`SELECT '${TAG}'`); }",
 		"const TAG = 'fixture'; const cleanup = TAG => db.query(`SELECT '${TAG}'`);",
 		"const TAG = 'fixture'; function other() { const TAG = request.query.tag; db.query(`SELECT '${TAG}'`); }",

@@ -35,6 +35,10 @@ import {
 import { shouldPreferPullOnlyDiagnostics } from "../lsp-budget.js";
 import { withDeadline } from "../deadline-utils.js";
 import {
+	filterBoundAstGrepSqlDiagnostics,
+	hasAstGrepSqlCandidate,
+} from "../sql-provenance.js";
+import {
 	isAtOrAboveHomeDir,
 	normalizeMapKey,
 	uriToPath,
@@ -437,6 +441,34 @@ function mergeLspDiagnostics(
 	}
 	return merged;
 }
+
+async function filterClientSqlDiagnostics(
+	filePath: string,
+	diagnostics: import("./client.js").LSPDiagnostic[],
+	contentHash: string | undefined,
+	positionEncoding: import("./position-encoding.js").PositionEncoding | undefined,
+	content?: string,
+	readContent: (filePath: string) => Promise<string> = (target) => nodeFs.promises.readFile(target, "utf-8"),
+): Promise<import("./client.js").LSPDiagnostic[]> {
+	if (!hasAstGrepSqlCandidate(diagnostics) || !contentHash || !positionEncoding) return diagnostics;
+	let snapshot = content;
+	if (snapshot === undefined) {
+		try {
+			snapshot = await readContent(filePath);
+		} catch {
+			return diagnostics;
+		}
+	}
+	return filterBoundAstGrepSqlDiagnostics(
+		diagnostics,
+		filePath,
+		snapshot,
+		contentHash,
+		positionEncoding,
+	);
+}
+
+export const __filterClientSqlDiagnosticsForTest = filterClientSqlDiagnostics;
 
 export type LSPDiagnosticsMode = "none" | "document" | "full";
 export type LSPTouchClientScope = "primary" | "all" | "with-auxiliary";
@@ -2975,12 +3007,22 @@ export class LSPService {
 		// from tsserver (clean = [], dirty = real findings that a silentOnClean
 		// server had computed but never published). Otherwise merge the push
 		// diagnostics from the client cache as always.
+		const collectPublishedDiagnostics = async (): Promise<import("./client.js").LSPDiagnostic[]> => {
+			const perClient = await Promise.all(spawned.map(async entry => {
+				const diagnostics = entry.client.getDiagnostics(filePath);
+				if (entry.client.serverId !== "ast-grep") return diagnostics;
+				const contentHash = entry.client.getDiagnosticBinding?.(filePath)?.contentHash;
+				const positionEncoding = entry.client.getPositionEncoding?.();
+				return filterClientSqlDiagnostics(
+					filePath, diagnostics, contentHash, positionEncoding, content,
+				);
+			}));
+			return mergeLspDiagnostics(perClient.flat());
+		};
 		let collected = options.collectDiagnostics
 			? tsserverSyncConfirmed !== undefined
 				? mergeLspDiagnostics(tsserverSyncConfirmed)
-				: mergeLspDiagnostics(
-						spawned.flatMap((entry) => entry.client.getDiagnostics(filePath)),
-					)
+				: await collectPublishedDiagnostics()
 			: undefined;
 		// #1095 (P3-b): whether `collected` came from a tsserver sync confirm
 		// (`tsserverSyncRequest`) rather than the publish cache. A sync-confirmed
@@ -3387,6 +3429,11 @@ export class LSPService {
 					strategy.aggregateWaitMs,
 				);
 				let diagnostics = entry.client.getDiagnostics(filePath);
+				if (entry.client.serverId === "ast-grep") {
+					const contentHash = entry.client.getDiagnosticBinding?.(filePath)?.contentHash;
+					const positionEncoding = entry.client.getPositionEncoding?.();
+					diagnostics = await filterClientSqlDiagnostics(filePath, diagnostics, contentHash, positionEncoding);
+				}
 				const firstWaitMs = Date.now() - waitStart;
 				if (
 					strategy.expectSemanticSecondPush &&
@@ -3398,6 +3445,11 @@ export class LSPService {
 						DIAGNOSTICS_SEMANTIC_SETTLE_WAIT_MS,
 					);
 					diagnostics = entry.client.getDiagnostics(filePath);
+					if (entry.client.serverId === "ast-grep") {
+						const contentHash = entry.client.getDiagnosticBinding?.(filePath)?.contentHash;
+						const positionEncoding = entry.client.getPositionEncoding?.();
+						diagnostics = await filterClientSqlDiagnostics(filePath, diagnostics, contentHash, positionEncoding);
+					}
 				}
 				return {
 					serverId: entry.info.id,
@@ -5147,15 +5199,21 @@ export class LSPService {
 			);
 			const clientDiags = client.getAllDiagnostics();
 			for (const [filePath, entry] of clientDiags) {
+				const positionEncoding = client.getPositionEncoding?.();
+				const filteredDiags = client.serverId === "ast-grep"
+					? await filterClientSqlDiagnostics(
+							filePath, entry.diags, entry.binding?.contentHash, positionEncoding,
+						)
+					: entry.diags;
 				const existing = all.get(filePath);
 				if (existing) {
 					existing.diags = mergeLspDiagnostics([
 						...existing.diags,
-						...entry.diags,
+						...filteredDiags,
 					]);
 					existing.ts = Math.max(existing.ts, entry.ts);
 				} else {
-					all.set(filePath, { diags: [...entry.diags], ts: entry.ts });
+					all.set(filePath, { diags: [...filteredDiags], ts: entry.ts });
 				}
 				const list = bindingsByPath.get(filePath) ?? [];
 				list.push(entry.binding);

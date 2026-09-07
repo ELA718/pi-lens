@@ -37,6 +37,10 @@ import {
 } from "./project-trust.js";
 import { logTreeSitterDiagnostic } from "./tree-sitter-logger.js";
 import { notifyUserDegradation } from "./user-notify.js";
+import {
+	isStaticSqlExpression,
+	type SqlSyntaxAdapter,
+} from "./sql-provenance.js";
 
 const _require = createRequire(import.meta.url);
 
@@ -92,6 +96,16 @@ interface TreeSitterNode {
 	 * without field support still satisfy the interface. */
 	childForFieldName?: (field: string) => TreeSitterNode | null;
 }
+
+const TREE_SITTER_SQL_ADAPTER: SqlSyntaxAdapter<TreeSitterNode> = {
+	kind: node => node.type,
+	text: node => node.text,
+	children: node => node.children,
+	field: (node, name) => node.childForFieldName?.(name) ?? null,
+	parent: node => node.parent ?? null,
+	isNamed: node => node.isNamed,
+	key: node => `${node.type}:${node.startIndex}:${node.endIndex}`,
+};
 
 interface TreeSitterParserInstance {
 	setLanguage: (lang: TreeSitterLanguage) => void;
@@ -1967,40 +1981,8 @@ export class TreeSitterClient {
 	private isStaticSqlExpression(
 		node: TreeSitterNode | undefined,
 		root: TreeSitterNode,
-		seen = new Set<string>(),
 	): boolean {
-		if (!node || seen.size > 32) return false;
-		if (node.type === "string" || node.type === "number") return true;
-		if (node.type === "template_string") {
-			return node.children.filter(child => child.type === "template_substitution")
-				.every(child => this.isStaticSqlExpression(child.children.find(part => part.isNamed), root, new Set(seen)));
-		}
-		if (node.type !== "identifier" || seen.has(node.text)) return false;
-		const value = this.resolveFileConstValueNode(node.text, root);
-		if (!value) return false;
-		// A uniquely named const in another function is not visible here.
-		const scope = value.parent?.parent?.parent;
-		let enclosing: TreeSitterNode | null | undefined = node;
-		while (enclosing && !(enclosing.startIndex === scope?.startIndex && enclosing.endIndex === scope?.endIndex && enclosing.type === scope?.type)) enclosing = enclosing.parent;
-		if (!enclosing) return false;
-		// The shared const resolver rejects duplicate declarations/writes. Also
-		// reject parameters, imports and destructuring bindings with this name.
-		const pending = [root];
-		while (pending.length) {
-			const current = pending.pop()!;
-			if (["formal_parameters", "catch_clause", "import_clause", "object_pattern", "array_pattern"].includes(current.type) ||
-				(current.parent?.type === "arrow_function" && current.parent.childForFieldName?.("parameter")?.startIndex === current.startIndex)) {
-				const bindings = [current];
-				while (bindings.length) {
-					const binding = bindings.pop()!;
-					if (binding.type === "identifier" && binding.text === node.text) return false;
-					bindings.push(...binding.children);
-				}
-			}
-			pending.push(...current.children);
-		}
-		seen.add(node.text);
-		return this.isStaticSqlExpression(value, root, seen);
+		return isStaticSqlExpression(node ?? null, root, TREE_SITTER_SQL_ADAPTER);
 	}
 
 	/**
@@ -3373,9 +3355,15 @@ export class TreeSitterClient {
 				} catch { return true; }
 			}
 			case "sql_dynamic_composition":
-				return !rootNode || !this.isStaticSqlExpression(
-					captures.INTERPOLATION?.children.find(child => child.isNamed), rootNode,
-				);
+				if (!rootNode) return true;
+				{
+					const sqlArg = captures.SQL_ARG ?? captures.INTERPOLATION?.children.find(child => child.isNamed);
+					if (!sqlArg || ![
+						"identifier", "binary_expression", "template_string",
+						"call_expression", "member_expression", "subscript_expression",
+					].includes(sqlArg.type)) return false;
+					return !this.isStaticSqlExpression(sqlArg, rootNode);
+				}
 			case "ts_command_injection_sink":
 				return (
 					captures.MOD?.text === "child_process" &&

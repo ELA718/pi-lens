@@ -1,5 +1,5 @@
 # SQL Injection Detection
-# Detects unsafe interpolation in SQL-like template literals
+# Detects dynamic values in SQL execution arguments
 id: sql-injection
 name: SQL Injection Risk
 severity: error
@@ -11,8 +11,8 @@ language: typescript
 message: "SQL injection risk — use parameterized queries, never interpolate into SQL"
 
 description: |
-  Building SQL queries with template literal interpolation is vulnerable to SQL
-  injection. An attacker can craft input that escapes the query and runs arbitrary SQL.
+  Building SQL queries from dynamic values is vulnerable to SQL injection.
+  Static SQL and placeholders with separately bound values are safe.
   
   ❌ NEVER:
   db.query(`SELECT * FROM users WHERE id = ${userId}`);
@@ -30,13 +30,12 @@ query: |
       (identifier) @SQL_FUNC
       (member_expression property: (property_identifier) @SQL_FUNC)
     ]
-    arguments: (arguments
-      (template_string (template_substitution) @INTERPOLATION))
+    arguments: (arguments . (_) @SQL_ARG)
     (#match? @SQL_FUNC "^(query|execute|exec|run)$"))
 
 metavars:
   - SQL_FUNC
-  - INTERPOLATION
+  - SQL_ARG
 
 post_filter: sql_dynamic_composition
 

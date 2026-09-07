@@ -181,7 +181,7 @@ See [`docs/custom-rules.md`](custom-rules.md) to add your own. Rule sources: `ru
 | `no-open-redirect-js` | error | pi-lens | Potential open redirect vulnerability — validate redirect URLs |
 | `no-prototype-builtins-js` | error | pi-lens | Use Object.hasOwn() or Object.prototype.hasOwnProperty.call() instead of calling methods directly on the object |
 | `no-single-promise-in-promise-methods-js` | warning | pi-lens | Promise.all/race with a single promise is unnecessary — await it directly |
-| `no-sql-in-code-js` | error | pi-lens | Raw SQL string in code — use query builder or ORM |
+| `no-sql-in-code-js` | error | pi-lens | SQL injection risk — parameterize dynamic query values |
 | `no-throw-string-js` | error | pi-lens | Throw Error objects, not strings |
 | `no-typeof-undefined-js` | hint | pi-lens | Use === undefined instead of typeof x === 'undefined' |
 | `no-unimplemented-stub-js` | warning | pi-lens | Unimplemented stub — function was scaffolded but never completed |
@@ -462,7 +462,7 @@ See [`docs/custom-rules.md`](custom-rules.md) to add your own. Rule sources: `ru
 | `no-return-await` | warning | pi-lens | Unnecessary 'await' in return statement — use direct return instead |
 | `no-single-promise-in-promise-methods` | warning | pi-lens | Promise.all/race with a single promise is unnecessary — await it directly |
 | `no-sort-without-comparator` | warning | pi-lens | .sort()/.toSorted() without a compare function sorts by string order — numbers sort wrong (e.g. [10,9,1] becomes [1,10,9]) |
-| `no-sql-in-code` | error | pi-lens | Raw SQL string in code — use query builder or ORM |
+| `no-sql-in-code` | error | pi-lens | SQL injection risk — parameterize dynamic query values |
 | `no-throw-string` | error | pi-lens | Throw Error objects, not strings |
 | `no-typeof-undefined` | hint | pi-lens | Use === undefined instead of typeof x === 'undefined' |
 | `no-unimplemented-stub` | warning | pi-lens | Unimplemented stub — function was scaffolded but never completed |

@@ -300,6 +300,8 @@ export interface LSPClientInfo {
 	 * the binding as "unknown", i.e. pre-#1095 behavior).
 	 */
 	getDiagnosticBinding(filePath: string): StoredDiagnosticBinding | undefined;
+	/** Position encoding used by this server's diagnostic ranges. */
+	getPositionEncoding?(): PositionEncoding;
 	/** Monotonic counter bumped when fresh diagnostics are stored for this client. */
 	readonly diagnosticsVersion: number;
 	waitForDiagnostics(
@@ -2804,6 +2806,10 @@ export async function createLSPClient(options: {
 
 		getDiagnosticBinding(filePath) {
 			return state.diagnosticBindings.get(normalizeMapKey(filePath));
+		},
+
+		getPositionEncoding() {
+			return state.positionEncoding;
 		},
 
 		getAllDiagnostics() {

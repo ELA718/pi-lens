@@ -1610,8 +1610,11 @@ an import alone or execute load tests to establish runtime ownership.
 Generic-secret narrowing applies only to exact protocol identifier bindings,
 recognizable incomplete/synthetic JWTs, and verified metadata. Provider-specific
 credential rules and opaque values remain active, including in tests. SQL
-composition must resolve to visible, unique immutable constants; dynamic,
-shadowed and unresolved bindings stay findings. SSRF inspects the destination
+scanners allow static statements and separately bound values. Ast-grep emits
+conservative argument-1 candidates, then the shared bounded provenance filter
+removes only constants proven against the exact NAPI or ast-grep LSP content
+snapshot. Unknown bindings, stale or ambiguous ranges, parse errors, shadowing,
+mutation, cycles, and exhausted budgets stay findings. SSRF inspects the destination
 argument, not request options. Private Supabase transport hooks require a sole
 SDK registration and a configured destination; exported or independently called
 hooks remain unproven. HTML exemptions require an imported DOMPurify sanitizer
