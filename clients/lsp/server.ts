@@ -2155,7 +2155,10 @@ export const JavaServer = createInteractiveServer({
 	name: "JDT Language Server",
 	extensions: KIND_EXTENSIONS["java"],
 	root: RootWithFallback(
-		createRootDetector(["pom.xml", "build.gradle", ".classpath"]),
+		PriorityRoot([
+			["settings.gradle", "settings.gradle.kts"],
+			["pom.xml", "build.gradle", "build.gradle.kts", ".classpath"],
+		]),
 	),
 	language: "java",
 	command: () => process.env.JDTLS_PATH || "jdtls",

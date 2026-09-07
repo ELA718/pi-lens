@@ -59,6 +59,7 @@ describe("CLIENT_CAPABILITIES (#278 regression)", () => {
 			"codeAction",
 			"rename",
 			"publishDiagnostics",
+			"diagnostic",
 		]) {
 			expect(td[key], `textDocument.${key} present`).toBeTypeOf("object");
 		}
@@ -72,6 +73,10 @@ describe("CLIENT_CAPABILITIES (#278 regression)", () => {
 			(CLIENT_CAPABILITIES.textDocument.publishDiagnostics as { versionSupport?: boolean })
 				.versionSupport,
 		).toBe(true);
+		expect(CLIENT_CAPABILITIES.textDocument.diagnostic).toEqual({
+			dynamicRegistration: false,
+			relatedDocumentSupport: true,
+		});
 	});
 });
 
@@ -417,6 +422,7 @@ function createMockState(overrides?: Partial<LSPClientState>): LSPClientState {
 		documentPullDiagnostics: new Map(),
 		documentPullDiagnosticTimestamps: new Map(),
 		pullFailureHistory: [],
+		diagnosticComputationErrors: new Map(),
 		pendingDiagnostics: new Map(),
 		diagnosticPublicationCounts: new Map(),
 		documentOpenedAt: new Map(),
@@ -505,8 +511,17 @@ describe("resolveConfigurationSection (#983)", () => {
 		expect(resolveConfigurationSection(initialization, "scan.nope")).toBe(null);
 	});
 
-	it("returns null for an unknown section when initialization is undefined", () => {
-		expect(resolveConfigurationSection(undefined, "anything")).toBe(null);
+	it("returns native empty defaults for missing CSS-family sections", () => {
+		for (const section of ["css", "scss", "less"]) {
+			expect(resolveConfigurationSection(undefined, section)).toEqual({});
+			expect(resolveConfigurationSection({}, section)).toEqual({});
+			expect(resolveConfigurationSection({ unrelated: true }, section)).toEqual({});
+		}
+		expect(
+			resolveConfigurationSection({ css: { validate: false } }, "css"),
+		).toEqual({ validate: false });
+		expect(resolveConfigurationSection({}, "unknown")).toBe(null);
+		expect(resolveConfigurationSection(undefined, "unknown")).toBe(null);
 	});
 });
 
@@ -1322,6 +1337,63 @@ describe("clientWaitForDiagnostics — pull mode (#240)", () => {
 		const start = Date.now();
 		await clientWaitForDiagnostics(state, TEST_FILE, 1000);
 		expect(Date.now() - start).toBeLessThan(80);
+	});
+
+	it("invalidates a cached clean pull when the next computation fails", async () => {
+		const state = pullState();
+		state.openDocuments.add(TEST_KEY);
+		let logHandler: ((params: { type: number; message: string }) => void) | undefined;
+		(
+			state.connection.onNotification as unknown as ReturnType<typeof vi.fn>
+		).mockImplementation(
+			(method: string, handler: (params: { type: number; message: string }) => void) => {
+				if (method === "window/logMessage") logHandler = handler;
+			},
+		);
+		setupIncomingHandlers(state, {});
+		expect(logHandler).toBeDefined();
+		state.connection.sendRequest = vi
+			.fn()
+			.mockResolvedValueOnce({ kind: "full", items: [] })
+			.mockImplementationOnce(async () => {
+				logHandler?.({
+					type: 1,
+					message: `Error while computing diagnostics for ${pathToFileURL(TEST_FILE).href}: validation failed`,
+				});
+				return { kind: "full", items: [] };
+			});
+
+		await clientWaitForDiagnostics(state, TEST_FILE, 50, { pullOnly: true });
+		expect(state.documentPullDiagnostics.get(TEST_KEY)).toEqual([]);
+		expect(state.diagnosticBindings.has(TEST_KEY)).toBe(true);
+
+		await clientWaitForDiagnostics(state, TEST_FILE, 50, { pullOnly: true });
+
+		expect(state.documentPullDiagnostics.has(TEST_KEY)).toBe(false);
+		expect(state.diagnosticBindings.has(TEST_KEY)).toBe(false);
+		expect(state.pullFailureHistory.at(-1)?.message).toContain(
+			"Error while computing diagnostics",
+		);
+	});
+
+	it("ignores computation errors for documents that are not active", () => {
+		const state = pullState();
+		let logHandler: ((params: { type: number; message: string }) => void) | undefined;
+		(
+			state.connection.onNotification as unknown as ReturnType<typeof vi.fn>
+		).mockImplementation(
+			(method: string, handler: (params: { type: number; message: string }) => void) => {
+				if (method === "window/logMessage") logHandler = handler;
+			},
+		);
+		setupIncomingHandlers(state, {});
+
+		logHandler?.({
+			type: 1,
+			message: `Error while computing diagnostics for ${pathToFileURL("/tmp/unrelated.css").href}: validation failed`,
+		});
+
+		expect(state.diagnosticComputationErrors.size).toBe(0);
 	});
 
 	it("resolves immediately when the pull returns diagnostics (found)", async () => {

@@ -1,5 +1,13 @@
 # pi-lens — agent context
 
+Advertise diagnostic pull support and use a primary server's advertised pull
+contract while preserving auxiliary push waits. A missing or failed primary
+pull stays incomplete; a CSS computation error also invalidates old clean
+bindings. Missing css/scss/less configuration sections use native empty objects;
+other unknown sections remain null. Java Gradle roots prefer settings.gradle
+or settings.gradle.kts over module build files. Existing silent-clean liveness
+confirmation binds only the sent snapshot and still checks current disk bytes. (refs #6)
+
 Open-redirect applicability may exclude only a lexically proven immutable local
 `URL.createObjectURL` value passed directly to `window.open`. Share the bounded
 provenance check between native rules and LSP delivery; the latter additionally

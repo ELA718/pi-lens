@@ -14,6 +14,11 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- Primary pull-capable language servers now receive advertised diagnostic pulls.
+  CSS uses valid default configuration and retains incomplete status when
+  validation fails. Java prefers the Gradle settings root, and existing
+  silent-clean confirmation records the verified snapshot binding. (refs #6)
+
 - Open-redirect scanning recognizes proven immutable local Blob URLs in native
   and content-bound LSP results. Unknown, mutable and shadowed values remain
   findings, and excluded matches do not consume the finding cap. (refs #6)

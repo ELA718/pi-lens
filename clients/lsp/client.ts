@@ -532,6 +532,10 @@ export const CLIENT_CAPABILITIES = {
 			relatedInformation: true,
 			versionSupport: true,
 		},
+		diagnostic: {
+			dynamicRegistration: false,
+			relatedDocumentSupport: true,
+		},
 	},
 } as const;
 const NAV_REQUEST_TIMEOUT_MS = positiveIntFromEnv(
@@ -667,6 +671,10 @@ export interface LSPClientState {
 	readonly documentPullDiagnosticTimestamps: Map<string, number>;
 	/** Most recent operational pull failures, capped to avoid unbounded telemetry. */
 	readonly pullFailureHistory: LSPPullFailure[];
+	readonly diagnosticComputationErrors: Map<
+		string,
+		{ count: number; message: string }
+	>;
 	readonly pendingDiagnostics: Map<string, ReturnType<typeof setTimeout>>;
 	/** Receive sequence and didOpen epoch used only for bounded TypeScript
 	 * diagnostic-publication telemetry. Plain Maps keyed by the already
@@ -1064,6 +1072,7 @@ export function clearDiagnosticsForPath(
 	state.pushDiagnosticTimestamps?.delete(normalizedPath);
 	state.documentPullDiagnostics?.delete(normalizedPath);
 	state.documentPullDiagnosticTimestamps?.delete(normalizedPath);
+	state.diagnosticComputationErrors?.delete(normalizedPath);
 	state.diagnosticDocVersions?.delete(normalizedPath);
 	// #1095: a cleared path must never serve a stale content binding alongside a
 	// later publish — drop it with the diagnostics it described. (The last-sent
@@ -1196,16 +1205,18 @@ export function resolveConfigurationSection(
 	initialization: Record<string, unknown> | undefined,
 	section: string | undefined,
 ): unknown {
-	if (!initialization) return section ? null : {};
-	if (!section) return initialization;
-	let cur: unknown = initialization;
+	const settings = initialization ?? {};
+	if (!section) return settings;
+	let cur: unknown = settings;
 	for (const part of section.split(".")) {
 		if (
 			typeof cur !== "object" ||
 			cur === null ||
 			!Object.prototype.hasOwnProperty.call(cur, part)
 		) {
-			return null;
+			return section === "css" || section === "scss" || section === "less"
+				? {}
+				: null;
 		}
 		cur = (cur as Record<string, unknown>)[part];
 	}
@@ -1476,6 +1487,30 @@ export function setupIncomingHandlers(
 			);
 		},
 	);
+	state.connection.onNotification(
+		"window/logMessage",
+		(params: { type?: number; message?: string }) => {
+			if (params.type !== 1 || typeof params.message !== "string") return;
+			const match = /^Error while computing diagnostics for (\S+):(?:\s|$)/.exec(
+				params.message,
+			);
+			if (!match) return;
+			try {
+				const normalizedPath = normalizeMapKey(uriToPath(match[1]));
+				if (
+					!state.openDocuments.has(normalizedPath) &&
+					!state.pendingOpens.has(normalizedPath)
+				) return;
+				const previous = state.diagnosticComputationErrors.get(normalizedPath);
+				state.diagnosticComputationErrors.set(normalizedPath, {
+					count: (previous?.count ?? 0) + 1,
+					message: params.message,
+				});
+			} catch {
+				// An unparseable URI cannot be correlated to a document pull.
+			}
+		},
+	);
 	state.connection.onRequest("window/workDoneProgress/create", async () => {});
 }
 
@@ -1568,6 +1603,8 @@ async function clientRequestPullDiagnostics(
 	// recomputing — see the `kind === "unchanged"` branch below for how that's
 	// honored (inherit, never treat an omitted `items` as clean).
 	const previousResultId = state.pullResultIds.get(normalizedPath);
+	const computationErrorBaseline =
+		state.diagnosticComputationErrors.get(normalizedPath)?.count ?? 0;
 	try {
 		// withTimeout is the backstop against a hung pull-mode server: without it
 		// this await never settles unless the stream is destroyed. Bounded by the
@@ -1589,6 +1626,17 @@ async function clientRequestPullDiagnostics(
 			}),
 			Math.max(1, Math.min(PULL_REQUEST_TIMEOUT_MS, budgetMs)),
 		);
+
+		const computationError = state.diagnosticComputationErrors.get(normalizedPath);
+		if (computationError && computationError.count > computationErrorBaseline) {
+			clearDiagnosticsForPath(state, normalizedPath);
+			recordPullFailure(
+				state,
+				"textDocument/diagnostic",
+				new Error(computationError.message),
+			);
+			return { status: "unavailable" };
+		}
 
 		if (!report) {
 			recordPullFailure(state, "textDocument/diagnostic", new Error("empty response"));
@@ -2598,6 +2646,7 @@ export async function createLSPClient(options: {
 		documentPullDiagnostics: new Map(),
 		documentPullDiagnosticTimestamps: new Map(),
 		pullFailureHistory: [],
+		diagnosticComputationErrors: new Map(),
 		pendingDiagnostics: new Map(),
 		diagnosticPublicationCounts: new Map(),
 		documentOpenedAt: new Map(),
