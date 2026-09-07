@@ -28,13 +28,16 @@ query: |
   (call_expression
     function: [
       (identifier) @SQL_FUNC
-      (member_expression property: (property_identifier) @SQL_FUNC)
+      (member_expression
+        object: (_) @SQL_RECEIVER
+        property: (property_identifier) @SQL_FUNC)
     ]
     arguments: (arguments . (_) @SQL_ARG)
     (#match? @SQL_FUNC "^(query|execute|exec|run)$"))
 
 metavars:
   - SQL_FUNC
+  - SQL_RECEIVER
   - SQL_ARG
 
 post_filter: sql_dynamic_composition

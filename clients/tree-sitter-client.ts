@@ -88,6 +88,7 @@ interface TreeSitterNode {
 	children: TreeSitterNode[];
 	parent?: TreeSitterNode | null;
 	isNamed: boolean;
+	isMissing?: boolean;
 	childCount: number;
 	startPosition: { row: number; column: number };
 	startIndex: number;
@@ -1978,6 +1979,148 @@ export class TreeSitterClient {
 		} finally { (tree as TreeSitterTree & { delete?: () => void }).delete?.(); }
 	}
 
+	private isProvenRegExpReceiver(
+		node: TreeSitterNode | undefined,
+		root: TreeSitterNode,
+		depth = 0,
+		boundedNodes?: readonly TreeSitterNode[],
+	): boolean {
+		if (!node || depth > 8) return false;
+		let nodes = boundedNodes;
+		if (!nodes) {
+			const collected: TreeSitterNode[] = [];
+			const pending = [root];
+			while (pending.length > 0) {
+				const current = pending.pop();
+				if (!current) continue;
+				collected.push(current);
+				const remaining = NO_NESTED_ANCHOR_VISIT_CAP - collected.length - pending.length;
+				if (current.childCount > remaining) return false;
+				const children = current.children;
+				if (children.length > remaining) return false;
+				for (const child of children) pending.push(child);
+			}
+			if (collected.some((candidate) => candidate.type === "ERROR" || candidate.isMissing)) {
+				return false;
+			}
+			nodes = collected;
+		}
+
+		const references = new Map<string, TreeSitterNode[]>();
+		for (const candidate of nodes) {
+			if (!["identifier", "shorthand_property_identifier"].includes(candidate.type)) continue;
+			const bucket = references.get(candidate.text) ?? [];
+			bucket.push(candidate);
+			references.set(candidate.text, bucket);
+		}
+
+		const isSameNode = (left: TreeSitterNode | null | undefined, right: TreeSitterNode) =>
+			left?.startIndex === right.startIndex && left.endIndex === right.endIndex;
+		const isNativeRegExpConstructorReference = (candidate: TreeSitterNode) => {
+			if (candidate.type !== "identifier" || candidate.text !== "RegExp") return false;
+			const parent = candidate.parent;
+			if (parent?.type === "new_expression") {
+				return isSameNode(parent.childForFieldName?.("constructor"), candidate);
+			}
+			return parent?.type === "call_expression" &&
+				isSameNode(parent.childForFieldName?.("function"), candidate);
+		};
+		const unsafeRegExpEnvironment = [
+			...(references.get("RegExp") ?? []),
+			...(references.get("globalThis") ?? []),
+		].some((candidate) => {
+			if (candidate.text === "RegExp") return !isNativeRegExpConstructorReference(candidate);
+			const parent = candidate.parent;
+			if (!parent || !isSameNode(parent.childForFieldName?.("object"), candidate)) return true;
+			if (parent.type === "member_expression") {
+				return parent.childForFieldName?.("property")?.text === "RegExp";
+			}
+			if (parent.type !== "subscript_expression") return true;
+			const index = parent.childForFieldName?.("index");
+			if (index?.type !== "string") return true;
+			const literal = index.text.slice(1, -1);
+			return literal.includes("\\") || literal === "RegExp";
+		});
+		if (unsafeRegExpEnvironment) return false;
+
+		if (node.type === "regex") return true;
+		if (node.type === "parenthesized_expression") {
+			return this.isProvenRegExpReceiver(
+				node.children.find((child) => child.isNamed),
+				root,
+				depth + 1,
+				nodes,
+			);
+		}
+		if (node.type === "new_expression" || node.type === "call_expression") {
+			const constructor = node.childForFieldName?.(
+				node.type === "new_expression" ? "constructor" : "function",
+			);
+			if (constructor?.type !== "identifier" || constructor.text !== "RegExp") return false;
+			return true;
+		}
+		if (node.type !== "identifier") return false;
+		const declarators = nodes.filter(
+			(candidate) =>
+				candidate.type === "variable_declarator" &&
+				candidate.childForFieldName?.("name")?.type === "identifier" &&
+				candidate.childForFieldName?.("name")?.text === node.text,
+		);
+		if (declarators.length !== 1) return false;
+		const declarator = declarators[0];
+		const declaration = declarator.parent;
+		const scope = declaration?.parent;
+		const initializer = declarator.childForFieldName?.("value");
+		if (
+			declaration?.type !== "lexical_declaration" ||
+			!declaration.children.some((child) => child.type === "const") ||
+			!scope ||
+			!initializer ||
+			declarator.startIndex >= node.startIndex ||
+			scope.startIndex > node.startIndex ||
+			scope.endIndex < node.endIndex
+		) {
+			return false;
+		}
+
+		const declaratorName = declarator.childForFieldName?.("name");
+		const isAllowedReceiverReference = (candidate: TreeSitterNode) => {
+			if (isSameNode(declaratorName, candidate)) return true;
+			let expression = candidate;
+			let wrappers = 0;
+			while (
+				expression.parent?.type === "parenthesized_expression" &&
+				expression.parent.children.some(
+					(child) => child.isNamed && isSameNode(child, expression),
+				)
+			) {
+				if (++wrappers > 8) return false;
+				expression = expression.parent;
+			}
+			const member = expression.parent;
+			if (
+				member?.type !== "member_expression" ||
+				!isSameNode(member.childForFieldName?.("object"), expression)
+			) {
+				return false;
+			}
+			const property = member.childForFieldName?.("property")?.text;
+			if (property === "exec" || property === "test") {
+				return member.parent?.type === "call_expression" &&
+					isSameNode(member.parent.childForFieldName?.("function"), member);
+			}
+			if (property !== "lastIndex" || member.parent?.type !== "assignment_expression") {
+				return false;
+			}
+			return isSameNode(member.parent.childForFieldName?.("left"), member) &&
+				member.parent.childForFieldName?.("right")?.type === "number";
+		};
+		if ((references.get(node.text) ?? []).some((candidate) => !isAllowedReceiverReference(candidate))) {
+			return false;
+		}
+		return this.isProvenRegExpReceiver(initializer, root, depth + 1, nodes);
+	}
+
 	private isStaticSqlExpression(
 		node: TreeSitterNode | undefined,
 		root: TreeSitterNode,
@@ -3360,6 +3503,10 @@ export class TreeSitterClient {
 					const sqlArg = captures.SQL_ARG ?? captures.INTERPOLATION?.children.find(child => child.isNamed);
 					if (!sqlArg) return true;
 					if (["arrow_function", "function_expression"].includes(sqlArg.type)) return false;
+					if (
+						captures.SQL_FUNC?.text === "exec" &&
+						this.isProvenRegExpReceiver(captures.SQL_RECEIVER, rootNode)
+					) return false;
 					return !this.isStaticSqlExpression(sqlArg, rootNode);
 				}
 			case "ts_command_injection_sink":

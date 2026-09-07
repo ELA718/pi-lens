@@ -1,5 +1,12 @@
 # pi-lens — agent context
 
+SQL exec-call applicability excludes a RegExp receiver only with bounded local
+syntax and reference-use proof. Every receiver reference must be its const
+declaration, direct exec/test receiver, or numeric lastIndex assignment. Escapes,
+mutation, shadowing, malformed syntax and exhausted traversal budgets retain
+findings. Type annotations or factory return types do not prove a runtime
+receiver. Preserve unknown SQL execution and actual dynamic SQL findings. (refs #6)
+
 Generic secret findings may be excluded as source hashes only when the exact
 reported span is a unique entry in a top-level sourceSha256 map and its digest
 matches bounded current file bytes inside the repository. Historical, duplicate,

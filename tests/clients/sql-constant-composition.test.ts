@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { TreeSitterQueryLoader } from "../../clients/tree-sitter-query-loader.js";
+import { ruleFilesForLanguage, TreeSitterQueryLoader } from "../../clients/tree-sitter-query-loader.js";
 import { getSharedTreeSitterClient } from "../../clients/tree-sitter-shared.js";
 import { assertGrammarAvailable, makeRealRunnerEnv } from "../support/real-runner-ctx.js";
 
@@ -8,11 +8,11 @@ const loader = new TreeSitterQueryLoader();
 beforeAll(async () => { await assertGrammarAvailable("typescript"); await loader.loadQueries(process.cwd()); });
 afterAll(() => env.cleanup());
 
-async function findings(code: string) {
-	const { filePath } = env.addFile("cleanup.ts", code);
+async function findings(code: string, language = "typescript") {
+	const { filePath } = env.addFile(language === "tsx" ? "cleanup.tsx" : "cleanup.ts", code);
 	const query = loader.getQueryById("sql-injection");
 	if (!query) throw new Error("SQL rule missing");
-	return getSharedTreeSitterClient()!.runQueryOnFile(query, filePath, "typescript");
+	return getSharedTreeSitterClient()!.runQueryOnFile(query, filePath, language);
 }
 
 describe("SQL composition provenance", () => {
@@ -23,6 +23,18 @@ describe("SQL composition provenance", () => {
 		"db.query(('SELECT 1'));",
 		"scenario.run((message) => console.log(message));",
 	])("accepts static SQL and bound values: %s", async code => {
+		expect(await findings(code)).toHaveLength(0);
+	});
+
+	it.each([
+		"/^fixed$/.exec(input);",
+		"new RegExp(pattern).exec(input);",
+		"RegExp(pattern).exec(input);",
+		"const matcher = /^fixed$/; matcher.exec(input);",
+		"const matcher = /^fixed$/g; const match = matcher.exec(input);",
+		"const matcher = /^fixed$/g; let match; while ((match = matcher.exec(input)) !== null) {}",
+		"const matcher = /^fixed$/g; matcher.lastIndex = 0; matcher.exec(input);",
+	])("accepts only source-proven RegExp execution: %s", async code => {
 		expect(await findings(code)).toHaveLength(0);
 	});
 
@@ -46,6 +58,68 @@ describe("SQL composition provenance", () => {
 		"const rows = `SELECT '${request.query.tag}'`; db.query(`DELETE FROM records WHERE id IN (${rows})`);",
 	])("retains dynamic, shadowed, cyclic or inaccessible values: %s", async code => {
 		expect((await findings(code)).length).toBeGreaterThan(0);
+	});
+
+	it.each([
+		"unknown.exec(input);",
+		"let matcher = /^fixed$/; matcher.exec(input);",
+		"const matcher = /^fixed$/; matcher = unknown; matcher.exec(input);",
+		"const matcher = /^fixed$/; matcher.exec = sql.exec; matcher.exec(input);",
+		"const matcher = /^fixed$/; const alias = matcher; alias.exec = sql.exec; matcher.exec(input);",
+		"const matcher = /^fixed$/; function check(matcher) { matcher.exec(input); }",
+		"const matcher = /^fixed$/; try {} catch (matcher) { matcher.exec(input); }",
+		"const matcher = /^fixed$/; for (const matcher of unknown) matcher.exec(input);",
+		"const matcher = /^fixed$/; { matcher.exec(input); let matcher; }",
+		"matcher.exec(input); const matcher = /^fixed$/;",
+		"const BASE = /^fixed$/; const matcher = BASE; matcher.exec(input);",
+		"function scan(input: string, matchers: RegExp[]) { for (const matcher of matchers) matcher.exec(input); }",
+		"const makeMatcher = (): RegExp => sql; const matcher = makeMatcher(); matcher.exec(input);",
+		"const RegExp = SQL; new RegExp(pattern).exec(input);",
+		"globalThis.RegExp = SQL; new RegExp(pattern).exec(input);",
+		"Object.defineProperty(RegExp.prototype, 'exec', { value: SQL }); new RegExp(pattern).exec(input);",
+		"Object.defineProperty(globalThis, 'RegExp', { value: SQL }); new RegExp(pattern).exec(input);",
+		"RegExp.prototype.exec = SQL; new RegExp(pattern).exec(input);",
+		"const matcher = /^fixed$/; matcher.lastIndex = dynamic; matcher.exec(input);",
+		"import RegExp from 'custom'; new RegExp(pattern).exec(input);",
+		"type RegExp = SqlExecutor; (value as RegExp).exec(input);",
+		"const matcher = /^fixed$/; let alias; alias = matcher; alias.exec = sql.exec; matcher.exec(input);",
+		"const matcher = /^fixed$/; Object.defineProperty(matcher, 'exec', { value: sql.exec }); matcher.exec(input);",
+		"RegExp.prototype.exec = db.exec; /x/.exec(userInput);",
+		"const matcher = /x/; RegExp.prototype.exec = db.exec; matcher.exec(userInput);",
+		"const matcher = /x/; const box = { matcher }; box.matcher.exec = db.exec; matcher.exec(userInput);",
+		"const matcher = /x/; const list = [matcher]; list[0].exec = db.exec; matcher.exec(userInput);",
+		"const matcher = /x/; const alias = (matcher); alias.exec = db.exec; matcher.exec(userInput);",
+		"const proto = RegExp.prototype; proto.exec = db.exec; /x/.exec(input);",
+		"Object.assign(RegExp.prototype, { exec: db.exec }); /x/.exec(input);",
+		"const globals = globalThis; globals.RegExp.prototype.exec = db.exec; /x/.exec(input);",
+		"globalThis['RegExp'].prototype.exec = db.exec; /x/.exec(input);",
+		"const matcher = /x/; function getMatcher() { return matcher; } getMatcher().exec = db.exec; matcher.exec(input);",
+		"const matcher = /x/; new Mutator(matcher); matcher.exec(input);",
+		"const matcher = /x/; (matcher).exec = db.exec; matcher.exec(input);",
+		"globalThis['\\x52egExp'].prototype.exec = db.exec; /x/.exec(input);",
+		"db.exec(request.body.sql);",
+	])("retains unproven, mutable, shadowed, hoisted, or SQL exec calls: %s", async code => {
+		expect((await findings(code)).length).toBeGreaterThan(0);
+	});
+
+	it("fails closed on missing syntax nodes", async () => {
+		expect((await findings("const matcher = /x/; matcher.exec(input); function broken() {")).length).toBeGreaterThan(0);
+	});
+
+	it("fails closed when RegExp proof exceeds its node budget", async () => {
+		const code = `${"const filler = 0;".repeat(10_001)} const matcher = /x/; matcher.exec(input);`;
+		expect((await findings(code)).length).toBeGreaterThan(0);
+	});
+
+	it("fails closed before queueing a root wider than its node budget", async () => {
+		const code = `const wide = [${Array.from({ length: 10_001 }, () => "0").join(",")}]; /x/.exec(input);`;
+		expect((await findings(code)).length).toBeGreaterThan(0);
+	});
+
+	it("applies the SQL rule to TypeScript and TSX, not JavaScript", async () => {
+		expect((await findings("db.query(request.body.sql)", "typescript")).length).toBeGreaterThan(0);
+		expect((await findings("const view = <div />; db.query(request.body.sql)", "tsx")).length).toBeGreaterThan(0);
+		expect(ruleFilesForLanguage("javascript").some(path => path.endsWith("/typescript/sql-injection.yml"))).toBe(false);
 	});
 
 	it("retains a static candidate when the parser recovered an error", async () => {

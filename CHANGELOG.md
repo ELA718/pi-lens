@@ -6,6 +6,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ## [Unreleased]
 
+- Distinguish proven local RegExp exec calls from SQL sinks using bounded receiver provenance; retain escapes, mutation, and unknown execution. (refs #6)
+
 ### Added
 
 ### Changed
