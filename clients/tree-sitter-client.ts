@@ -3756,14 +3756,22 @@ export class TreeSitterClient {
 			seen.add(binding.owner);
 			return immutableValue(binding.owner.childForFieldName?.("value"), seen, mode);
 		};
+		const outerTransparentExpression = (value: TreeSitterNode): TreeSitterNode => {
+			let current = value;
+			while (["parenthesized_expression", "non_null_expression", "as_expression", "satisfies_expression", "type_assertion"].includes(current.parent?.type ?? "")) current = current.parent!;
+			return current;
+		};
+		const staticStringValue = (value: TreeSitterNode | null | undefined): string | undefined => {
+			if (value?.type !== "string" || value.text.includes("\\")) return undefined;
+			return value.children.filter((child) => child.type === "string_fragment").map((child) => child.text).join("");
+		};
 		const acquiredBindingIsUnproven = (binding: Binding, seen = new Set<TreeSitterNode>()): boolean => {
 			if (seen.has(binding.owner) || seen.size > 32) return true;
 			seen.add(binding.owner);
 			if (bindingWrites(binding).length > 0) return true;
 			return referencesFor(binding).some((reference) => {
 				if (sameNode(reference, binding.name)) return false;
-				let value: TreeSitterNode = reference;
-				while (["parenthesized_expression", "non_null_expression", "as_expression", "satisfies_expression", "type_assertion"].includes(value.parent?.type ?? "")) value = value.parent!;
+				const value = outerTransparentExpression(reference);
 				const parent = value.parent;
 				if (parent?.type === "variable_declarator" && isTransparentAlias(parent.childForFieldName?.("value"), reference)) {
 					const name = parent.childForFieldName?.("name");
@@ -3792,12 +3800,13 @@ export class TreeSitterClient {
 				if (node.type === "subscript_expression") {
 					if (node.childForFieldName?.("object")?.text === "globalThis") return true;
 					const index = immutableValue(node.childForFieldName?.("index"));
-					const property = index?.type === "string" ? index.children.find((child) => child.type === "string_fragment")?.text : undefined;
-					const unknownProperty = !index || !["string", "number"].includes(index.type);
+					const property = staticStringValue(index);
+					const unknownProperty = !index || (index.type === "string" ? property === undefined : index.type !== "number");
 					const object = immutableValue(node.childForFieldName?.("object"), new Set(), "allow-property-writes");
 					const computedNativeInstance = unknownProperty && !!object && ["string", "template_string", "array"].includes(object.type);
-					const declaration = node.parent;
-					const name = declaration?.type === "variable_declarator" && sameNode(declaration.childForFieldName?.("value"), node)
+					const acquisition = outerTransparentExpression(node);
+					const declaration = acquisition.parent;
+					const name = declaration?.type === "variable_declarator" && sameNode(declaration.childForFieldName?.("value"), acquisition)
 						? declaration.childForFieldName?.("name")
 						: undefined;
 					if (computedNativeInstance) return true;
