@@ -64,6 +64,21 @@ describe("lsp server policy", () => {
 		expect(missing).toEqual([]);
 	});
 
+	it("uses the enclosing Gradle settings project instead of a nested module", async () => {
+		const { JavaServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-java-root-"));
+		dirs.push(tmp);
+		const project = path.join(tmp, "android");
+		const module = path.join(project, "app");
+		const file = path.join(module, "src", "main", "java", "App.java");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(path.join(project, "settings.gradle"), "include ':app'\n");
+		fs.writeFileSync(path.join(module, "build.gradle"), "plugins {}\n");
+		fs.writeFileSync(file, "class App {}\n");
+
+		await expect(JavaServer.root(file)).resolves.toBe(project);
+	});
+
 	it("prioritizes go.work root over go.mod", async () => {
 		const { PriorityRoot } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-go-root-"));

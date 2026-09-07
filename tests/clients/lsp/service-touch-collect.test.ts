@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { normalizeMapKey } from "../../../clients/path-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
@@ -128,6 +129,94 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 				process.env.PI_LENS_LSP_BUDGET_CEILING = previousCeiling;
 			}
 		}
+	});
+
+	it("pulls from an advertised primary while preserving an auxiliary push wait", async () => {
+		const malformed = makeDiagnostic("} expected");
+		const primary = {
+			serverId: "css",
+			isAlive: () => true,
+			shutdown: async () => {},
+			getWorkspaceDiagnosticsSupport: () => ({
+				advertised: true,
+				mode: "pull" as const,
+				diagnosticProviderKind: "object" as const,
+			}),
+			getOperationSupport: () => ({}),
+			getAdvertisedCommands: () => [],
+			getRawCapabilityKeys: () => ["diagnosticProvider"],
+			notify: { open: vi.fn().mockResolvedValue(undefined) },
+			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
+			getDiagnostics: vi.fn(() => [malformed]),
+			getAllDiagnostics: vi.fn(
+				() => new Map([[normalizeMapKey(FILE), { diags: [malformed], ts: Date.now() }]]),
+			),
+		};
+		const auxiliary = {
+			...primary,
+			serverId: "typos",
+			getWorkspaceDiagnosticsSupport: () => ({
+				advertised: false,
+				mode: "push-only" as const,
+				diagnosticProviderKind: "none" as const,
+			}),
+			getRawCapabilityKeys: () => [],
+			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
+			getDiagnostics: vi.fn(() => []),
+		};
+		createLSPClient.mockImplementation(async (options: { serverId: string }) =>
+			options.serverId === "css" ? primary : auxiliary,
+		);
+		getServersForFileWithConfig.mockReturnValue([
+			{ ...makeServer("css"), role: undefined },
+			{ ...makeServer("typos"), role: "auxiliary" },
+		]);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const result = await new LSPService().touchFile(FILE, "body { color: red;\n", {
+			clientScope: "all",
+			diagnostics: "document",
+			collectDiagnostics: true,
+			maxClientWaitMs: 25,
+		});
+
+		expect(primary.waitForDiagnostics).toHaveBeenCalledWith(FILE, 25, {
+			pullOnly: true,
+		});
+		expect(auxiliary.waitForDiagnostics).toHaveBeenCalledWith(FILE, 25);
+		expect(result?.diags).toEqual([malformed]);
+	});
+
+	it("does not confirm clean when an advertised primary pull has no answer", async () => {
+		const client = {
+			serverId: "css",
+			isAlive: () => true,
+			shutdown: async () => {},
+			getWorkspaceDiagnosticsSupport: () => ({
+				advertised: true,
+				mode: "pull" as const,
+				diagnosticProviderKind: "object" as const,
+			}),
+			getOperationSupport: () => ({}),
+			getAdvertisedCommands: () => [],
+			getRawCapabilityKeys: () => ["diagnosticProvider"],
+			notify: { open: vi.fn().mockResolvedValue(undefined) },
+			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
+			getDiagnostics: vi.fn(() => []),
+			getAllDiagnostics: vi.fn(() => new Map()),
+		};
+		createLSPClient.mockResolvedValue(client);
+		getServersForFileWithConfig.mockReturnValue([makeServer("css")]);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const result = await new LSPService().touchFile(FILE, "body {}\n", {
+			diagnostics: "document",
+			collectDiagnostics: true,
+			maxClientWaitMs: 25,
+		});
+
+		expect(result?.inconclusive).toBe(true);
+		expect(result?.confirmation).toBeUndefined();
 	});
 
 	it("returns merged diagnostics from touched clients", async () => {

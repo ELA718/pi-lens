@@ -21,6 +21,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
+import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
@@ -175,6 +176,10 @@ describe("touchFile silent-clean push-only confirm (#799)", () => {
 		expect(result?.confirmation).toBe("confirmed");
 
 		// The env override (set in beforeEach) is what the wait actually pays
+		expect(result?.binding).toEqual({
+			contentHash: hashDiagnosticContent("# hi\n"),
+			boundToCurrentDisk: true,
+		});
 		// here — marksman's real 1500ms strategy budget is covered separately by
 		// sweep-warmup.test.ts:128.
 		expect(waitCalls.length).toBe(1);
@@ -186,6 +191,32 @@ describe("touchFile silent-clean push-only confirm (#799)", () => {
 		const warmup = await service.ensureWarmForSweep(filePath);
 		expect(warmup.performedWarmup).toBe(false);
 		expect(warmup.failedServerIds).toEqual([]);
+	});
+
+	it("rejects the sent-content binding when disk changes during silent-clean confirmation", async () => {
+		const filePath = path.join(tmp, "changed.md");
+		const content = "# sent\n";
+		fs.writeFileSync(filePath, content);
+		const marksman = makeServer("marksman", ".md", tmp);
+		getServersForFileWithConfig.mockReturnValue([marksman]);
+		const { client } = makeSilentPushOnlyClient("marksman", tmp);
+		client.notify.open = vi.fn(async () => {
+			fs.writeFileSync(filePath, "# changed\n");
+		});
+		createLSPClient.mockResolvedValue(client);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const result = await new LSPService().touchFile(filePath, content, {
+			diagnostics: "document",
+			collectDiagnostics: true,
+			clientScope: "primary",
+		});
+
+		expect(result?.confirmation).toBe("confirmed");
+		expect(result?.binding).toEqual({
+			contentHash: hashDiagnosticContent(content),
+			boundToCurrentDisk: false,
+		});
 	});
 
 	it("#1277: a WEDGED marksman (accepts the notify write, then never answers anything) stays INCONCLUSIVE, not confirmed clean", async () => {
@@ -308,6 +339,10 @@ describe("touchFile capability-aware AGGREGATE wait (#814)", () => {
 		expect((result as { inconclusive?: boolean }).inconclusive).toBeUndefined();
 		expect(result?.confirmation).toBe("confirmed");
 		expect(result?.diags).toEqual([finding]);
+		expect(result?.binding).toEqual({
+			contentHash: hashDiagnosticContent("# hi\n"),
+			boundToCurrentDisk: true,
+		});
 	});
 
 	it("#1277: scope-all — the still-outstanding silent server is WEDGED (fails the liveness ping), so the touch stays INCONCLUSIVE even though the publishing sibling answered", async () => {
@@ -400,6 +435,7 @@ describe("touchFile capability-aware AGGREGATE wait (#814)", () => {
 
 			expect((result as { inconclusive?: boolean }).inconclusive).toBe(true);
 			expect(result?.confirmation).toBeUndefined();
+			expect(result?.binding?.contentHash).toBeUndefined();
 		} finally {
 			if (prev === undefined) delete process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS;
 			else process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS = prev;

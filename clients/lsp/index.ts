@@ -2452,6 +2452,7 @@ export class LSPService {
 		const notifyWriteTimedOut = notifyWriteTimedOutServerIds.length > 0;
 
 		let diagnosticsTimedOut = false;
+		const silentCleanConfirmedServerIds = new Set<string>();
 		// R8 (#714): server ids of aux-role servers whose push wait was cut off by
 		// the aux grace window. Undefined when no aux was cut off (primary-only
 		// paths never set this). Logged in lsp_touch_file metadata.
@@ -2692,23 +2693,50 @@ export class LSPService {
 			// Per-server wait promises (each already bounded by its own
 			// perServerTimeout — unchanged from before R8).
 			let pressureSnapshots: LSPCapabilitySnapshot[] = [];
-			if (shouldPreferPullOnlyDiagnostics()) {
+			const preferPullOnlyUnderPressure = shouldPreferPullOnlyDiagnostics();
+			if (preferPullOnlyUnderPressure) {
 				try {
 					pressureSnapshots = await this.getCapabilitySnapshots(filePath);
 				} catch {
 					// Fail-open: missing capability state keeps today's push fallback.
 				}
 			}
+			const pullOnlyServerIds = new Set<string>();
+			const authoritativePrimaryPullServerIds = new Set<string>();
+			for (const entry of spawned) {
+				let snapshot = pressureSnapshots.find(
+					(candidate) => candidate.serverId === entry.client.serverId,
+				);
+				if (!snapshot && entry.info.role !== "auxiliary") {
+					try {
+						snapshot = {
+							serverId: entry.client.serverId,
+							root: entry.client.root,
+							operationSupport: entry.client.getOperationSupport(),
+							workspaceDiagnosticsSupport:
+								entry.client.getWorkspaceDiagnosticsSupport(),
+							advertisedCommands: entry.client.getAdvertisedCommands(),
+							rawCapabilityKeys: entry.client.getRawCapabilityKeys?.() ?? [],
+							launchVariant: entry.client.getLaunchVariant?.(),
+						};
+					} catch {
+						// Fail closed: uncertain primary capabilities keep the push wait.
+					}
+				}
+				if (
+					classifyServerWaitTier(entry.client.serverId, snapshot) ===
+					"pull-capable"
+				) {
+					pullOnlyServerIds.add(entry.info.id);
+					if (entry.info.role !== "auxiliary") {
+						authoritativePrimaryPullServerIds.add(entry.info.id);
+					}
+				}
+			}
 			const perServerWaits = spawned.map((entry) => {
 				const serverTimeout = timeoutFor(entry.client.serverId);
 				const baseline = diagnosticBaselines.get(entry.client);
-				const pullOnly =
-					classifyServerWaitTier(
-						entry.client.serverId,
-						pressureSnapshots.find(
-							(snapshot) => snapshot.serverId === entry.client.serverId,
-						),
-					) === "pull-capable";
+				const pullOnly = pullOnlyServerIds.has(entry.info.id);
 				// #743: per-server — a server we DID push to still gets the
 				// version-baseline wait even when a sibling was debounced away.
 				const wait =
@@ -2879,7 +2907,14 @@ export class LSPService {
 						savedVsBudgetMs: Math.max(0, timeoutMs - waitedMs),
 					},
 				});
-			} else if (waitedMs + 20 >= timeoutMs) {
+			} else if (
+				waitedMs + 20 >= timeoutMs ||
+				spawned.some(
+					(entry) =>
+						authoritativePrimaryPullServerIds.has(entry.info.id) &&
+						entry.client.getAllDiagnostics?.().has(normalizedPath) !== true,
+				)
+			) {
 				// Within ~20 ms of the configured budget we treat it as a timeout;
 				// the LSP didn't beat the cap. Diagnostics that arrive late still
 				// land in the client's cache and surface on the next edit.
@@ -2979,6 +3014,9 @@ export class LSPService {
 							);
 							if (liveness.every(Boolean)) {
 								diagnosticsTimedOut = false;
+								for (const entry of outstanding) {
+									silentCleanConfirmedServerIds.add(entry.info.id);
+								}
 								logLatency({
 									type: "phase",
 									phase: "lsp_silent_clean_confirm",
@@ -3148,6 +3186,7 @@ export class LSPService {
 					).catch(() => false);
 					if (alive) {
 						diagnosticsTimedOut = false;
+						silentCleanConfirmedServerIds.add(spawned[0].info.id);
 						if (collected !== undefined) collected = mergeLspDiagnostics([]);
 						logLatency({
 							type: "phase",
@@ -3258,7 +3297,9 @@ export class LSPService {
 						// partially-mocked client) yields "unknown" rather than throwing —
 						// unknown preserves pre-#1095 behavior for that contributor.
 						spawned.map((entry) =>
-							entry.client.getDiagnosticBinding?.(filePath),
+							silentCleanConfirmedServerIds.has(entry.info.id)
+								? { contentHash: this.hashContent(content) }
+								: entry.client.getDiagnosticBinding?.(filePath),
 						),
 					);
 			result.binding = binding;
