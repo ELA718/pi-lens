@@ -391,18 +391,19 @@ export async function fetchFreshProjectDiagnostics(
 			}
 			const startMs = Date.now();
 			const result = await clients.opengrepClient.scan(analysisRoot, signal);
-			if (!result.success) {
+			const elapsedMs = Date.now() - startMs;
+			record(
+				"opengrep",
+				opengrepResultToProjectDiagnostics(analysisRoot, result),
+				elapsedMs,
+			);
+			if (!result.success || result.reportIntegrity !== "complete") {
 				recordFailed("opengrep", result);
 				return;
 			}
 			cacheManager.writeCache("opengrep", result, analysisRoot, {
-				scanDurationMs: Date.now() - startMs,
+				scanDurationMs: elapsedMs,
 			});
-			record(
-				"opengrep",
-				opengrepResultToProjectDiagnostics(analysisRoot, result),
-				Date.now() - startMs,
-			);
 		}),
 
 		// trivy — dependency CVE detection. Explicit opt-in per #131.

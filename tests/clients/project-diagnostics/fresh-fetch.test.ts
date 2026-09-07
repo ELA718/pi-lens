@@ -125,6 +125,7 @@ function makeClients(
 			ensureAvailable: vi.fn().mockResolvedValue(true),
 			scan: vi.fn().mockResolvedValue({
 				success: true,
+				reportIntegrity: "complete",
 				findings: [],
 				scannedAt: "now",
 			}),
@@ -462,6 +463,7 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 		const clients = makeClients();
 		(clients.opengrepClient.scan as ReturnType<typeof vi.fn>).mockResolvedValue({
 			success: true,
+			reportIntegrity: "complete",
 			scannedAt: "now",
 			findings: [
 				{
@@ -505,6 +507,63 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 			rule: "opengrep:python.lang.security.audit.subprocess-shell-true",
 			message: "shell=True is dangerous (CWE-78: OS Command Injection)",
 		});
+	});
+
+	it("keeps usable opengrep diagnostics while reporting partial coverage as incomplete", async () => {
+		const cacheManager = makeCacheManager();
+		const clients = makeClients();
+		(clients.opengrepClient.scan as ReturnType<typeof vi.fn>).mockResolvedValue({
+			success: true,
+			reportIntegrity: "partial",
+			scannedAt: "now",
+			summary: "opengrep report is partial; 1 report error(s)",
+			findings: [
+				{
+					checkId: "generic.warning-rule",
+					path: "src/a.ts",
+					startLine: 1,
+					startCol: 1,
+					endLine: 1,
+					endCol: 2,
+					message: "usable finding before interruption",
+					severity: "WARNING",
+				},
+			],
+			reportErrors: [
+				{
+					type: "PartialParsing",
+					level: "warn",
+					message: "Syntax error",
+					path: "src/b.ts",
+					line: 9,
+				},
+			],
+		});
+
+		const result = await fetchFreshProjectDiagnostics(cacheManager, tmp, clients);
+
+		expect(result.failed).toEqual([
+			{
+				id: "opengrep",
+				summary: "opengrep report is partial; 1 report error(s)",
+			},
+		]);
+		expect(result.diagnostics).toEqual([
+			expect.objectContaining({
+				runner: "opengrep",
+				rule: "opengrep:generic.warning-rule",
+			}),
+			expect.objectContaining({
+				runner: "opengrep",
+				rule: "opengrep:report-error:PartialParsing",
+			}),
+		]);
+		expect(cacheManager.writeCache).not.toHaveBeenCalledWith(
+			"opengrep",
+			expect.anything(),
+			expect.anything(),
+			expect.anything(),
+		);
 	});
 
 	it("reports opengrep cold (not clean) when the tool isn't available (#585)", async () => {
