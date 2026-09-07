@@ -2017,19 +2017,6 @@ export class TreeSitterClient {
 			right: TreeSitterNode,
 		) =>
 			left?.startIndex === right.startIndex && left.endIndex === right.endIndex;
-		const functionTypes = new Set([
-			"function_declaration",
-			"function_expression",
-			"generator_function",
-			"generator_function_declaration",
-			"arrow_function",
-			"method_definition",
-		]);
-		const enclosingFunction = (node: TreeSitterNode) => {
-			let current = node.parent;
-			while (current && !functionTypes.has(current.type)) current = current.parent;
-			return current;
-		};
 		const hasCompetingBinding = (
 			reference: TreeSitterNode,
 			name: string,
@@ -2045,15 +2032,17 @@ export class TreeSitterClient {
 				this.isShadowedByEnclosingParam(reference, name)
 			)
 				return true;
-			const referenceFunction = enclosingFunction(reference);
-			const sameFunction = (node: TreeSitterNode) => {
-				const owner = enclosingFunction(node);
-				return owner
-					? referenceFunction != null && sameNode(owner, referenceFunction)
-					: referenceFunction == null;
-			};
 			return nodes.some((node) => {
-				if (!sameFunction(node)) return false;
+				if (
+					node.type === "formal_parameters" &&
+					this.paramsBindName(node, name)
+				)
+					return true;
+				if (
+					node.type === "arrow_function" &&
+					node.childForFieldName?.("parameter")?.text === name
+				)
+					return true;
 				if (node.type === "variable_declarator") {
 					return (
 						(allowedDeclarator == null || !sameNode(node, allowedDeclarator)) &&
@@ -2084,12 +2073,7 @@ export class TreeSitterClient {
 					return node.childForFieldName?.("name")?.text === name;
 				if (node.type === "catch_clause") {
 					const parameter = node.childForFieldName?.("parameter");
-					return (
-						parameter != null &&
-						reference.startIndex >= node.startIndex &&
-						reference.endIndex <= node.endIndex &&
-						this.bindingNames(parameter).has(name)
-					);
+					return parameter != null && this.bindingNames(parameter).has(name);
 				}
 				return false;
 			});
