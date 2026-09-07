@@ -792,6 +792,18 @@ function isClientAlive(state: LSPClientState): boolean {
 	);
 }
 
+class DisposableStreamMessageReader extends StreamMessageReader {
+	override dispose(): void {
+		// vscode-jsonrpc 9.0.0 leaves its referenced 10-second partial-frame
+		// timer armed in the base dispose(). Clear it through the reader's own
+		// cleanup seam before the connection performs its canonical disposal.
+		(
+			this as unknown as { clearPartialMessageTimer: () => void }
+		).clearPartialMessageTimer();
+		super.dispose();
+	}
+}
+
 function disposeClientConnection(state: LSPClientState): void {
 	if (state.connectionDisposed) return;
 	state.connectionDisposed = true;
@@ -2682,7 +2694,7 @@ export async function createLSPClient(options: {
 	);
 
 	const connection = createMessageConnection(
-		new StreamMessageReader(lspProcess.stdout),
+		new DisposableStreamMessageReader(lspProcess.stdout),
 		new StreamMessageWriter(lspProcess.stdin),
 	);
 
