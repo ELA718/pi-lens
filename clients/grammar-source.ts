@@ -28,9 +28,12 @@ export const GRAMMAR_CDN_BASE = `https://unpkg.com/tree-sitter-wasms@${TREE_SITT
  *
  * tree-sitter-lua: the aggregator's lua wasm corrupts to ERROR trees once a second
  * grammar loads into web-tree-sitter's shared WASM Module (#255) — the maintained
- * 0.4.1 build parses cleanly in a multi-grammar process. tree-sitter-yaml: the
- * aggregator's yaml wasm is ABI-incompatible with web-tree-sitter 0.25 and fails to
- * load at all (#427); the maintained 0.7.1 build loads + parses. Mirrored by
+ * 0.4.1 build parses cleanly in a multi-grammar process. tree-sitter-tsx: the
+ * aggregator build rejects literal ampersands in valid quoted JSX attributes; the
+ * official 0.23.2 grammar parses them without weakening malformed-input recovery.
+ * tree-sitter-yaml: the aggregator's yaml wasm is ABI-incompatible with
+ * web-tree-sitter 0.25 and fails to load at all (#427); the maintained 0.7.1 build
+ * loads + parses. Mirrored by
  * `SOURCE_OVERRIDES` in scripts/download-grammars.
  */
 export interface GrammarSourceOverride {
@@ -42,6 +45,11 @@ export interface GrammarSourceOverride {
 }
 
 export const GRAMMAR_SOURCE_OVERRIDES: Record<string, GrammarSourceOverride> = {
+	"tree-sitter-tsx.wasm": {
+		package: "tree-sitter-typescript",
+		version: "0.23.2",
+		url: "https://unpkg.com/tree-sitter-typescript@0.23.2/tree-sitter-tsx.wasm",
+	},
 	"tree-sitter-lua.wasm": {
 		package: "@tree-sitter-grammars/tree-sitter-lua",
 		version: "0.4.1",
