@@ -31,7 +31,58 @@ async function diagnosticFor(content: string, language: "ts" | "tsx" = "ts"): Pr
 	};
 }
 
+const privateCallbackSql = [
+	"export {};",
+	"async function asActor(fn: (sql: (text: string, values?: unknown[]) => Promise<unknown>) => Promise<unknown>) {",
+	"\treturn fn((text, values) => client.query(text, values));",
+	"}",
+	"asActor(async (sql) => {",
+	"\tawait sql('SELECT 1');",
+	"\tawait sql('SELECT * FROM users WHERE id = $1', [id]);",
+	"});",
+].join("\n");
+
 describe("SQL scanner applicability through production project dispatch", () => {
+	it.each(["ts", "tsx"] as const)("suppresses bounded private callback SQL in real %s dispatch", async extension => {
+		const file = path.join(env.tmpDir, `private-callback.${extension}`);
+		fs.writeFileSync(file, extension === "tsx" ? `${privateCallbackSql}\nconst view = <div />;` : privateCallbackSql);
+		const result = await scanProjectDiagnostics({ cwd: env.tmpDir, tier: "cheap", files: [file], maxFiles: 1 });
+		expect(result.diagnostics.filter(diagnostic => ["no-sql-in-code", "sql-injection"].includes(diagnostic.rule ?? ""))).toEqual([]);
+	});
+
+	it.each([
+		["helper shorthand escape", `${privateCallbackSql}\nglobalThis.leaked = { asActor };\nglobalThis.leaked.asActor(sql => sql(request.body.sql));`],
+		["forwarded SQL shorthand escape", privateCallbackSql.replace(
+			"await sql('SELECT 1');",
+			"globalThis.leaked = { sql };\n\tawait sql('SELECT 1');",
+		) + "\nglobalThis.leaked.sql(request.body.sql);"],
+		["global script helper", `${privateCallbackSql.replace("export {};\n", "")}\nglobalThis['asActor'](sql => sql(request.body.sql));`],
+	])("retains both production SQL findings for parent-review adversary: %s", async (_name, content) => {
+		const file = path.join(env.tmpDir, `private-callback-adversary-${_name}.ts`);
+		fs.writeFileSync(file, content);
+		const result = await scanProjectDiagnostics({ cwd: env.tmpDir, tier: "cheap", files: [file], maxFiles: 1 });
+		const rules = result.diagnostics.map(diagnostic => diagnostic.rule);
+		expect(rules).toContain("no-sql-in-code");
+		expect(rules).toContain("sql-injection");
+	});
+
+	it.each([
+		["direct var for-of", "export {}; const QUERY = 'SELECT 1'; for (var QUERY of unsafeValues) {} client.query(QUERY);"],
+		["direct let for-in", "export {}; const QUERY = 'SELECT 1'; for (let QUERY in unsafeValues) client.query(QUERY);"],
+		["direct destructured for-of", "export {}; const QUERY = 'SELECT 1'; for (const { query: QUERY } of unsafeValues) client.query(QUERY);"],
+		["direct shorthand destructured for-of", "export {}; const QUERY = 'SELECT 1'; for (const { QUERY } of unsafeValues) client.query(QUERY);"],
+		["callback var for-of", privateCallbackSql.replace("await sql('SELECT 1');", "for (var QUERY of unsafeValues) {}\n\tawait sql(QUERY);")],
+		["callback const for-in", privateCallbackSql.replace("await sql('SELECT 1');", "for (const QUERY in unsafeValues) await sql(QUERY);")],
+		["callback destructured for-of", privateCallbackSql.replace("await sql('SELECT 1');", "for (let [QUERY] of unsafeValues) await sql(QUERY);")],
+	])("retains both production SQL findings for loop binding: %s", async (_name, content) => {
+		const file = path.join(env.tmpDir, `loop-binding-${_name}.ts`);
+		fs.writeFileSync(file, content);
+		const result = await scanProjectDiagnostics({ cwd: env.tmpDir, tier: "cheap", files: [file], maxFiles: 1 });
+		const rules = result.diagnostics.map(diagnostic => diagnostic.rule);
+		expect(rules).toContain("no-sql-in-code");
+		expect(rules).toContain("sql-injection");
+	});
+
 	it("scans .mts without treating static or parameterized SQL as injection", async () => {
 		const staticFile = path.join(env.tmpDir, "static.mts");
 		const dynamicFile = path.join(env.tmpDir, "dynamic.mts");
