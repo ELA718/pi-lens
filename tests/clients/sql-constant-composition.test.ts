@@ -93,6 +93,10 @@ describe("SQL composition provenance", () => {
 		"Object.assign(RegExp.prototype, { exec: db.exec }); /x/.exec(input);",
 		"const globals = globalThis; globals.RegExp.prototype.exec = db.exec; /x/.exec(input);",
 		"globalThis['RegExp'].prototype.exec = db.exec; /x/.exec(input);",
+		"const matcher = /x/; function getMatcher() { return matcher; } getMatcher().exec = db.exec; matcher.exec(input);",
+		"const matcher = /x/; new Mutator(matcher); matcher.exec(input);",
+		"const matcher = /x/; (matcher).exec = db.exec; matcher.exec(input);",
+		"globalThis['\\x52egExp'].prototype.exec = db.exec; /x/.exec(input);",
 		"db.exec(request.body.sql);",
 	])("retains unproven, mutable, shadowed, hoisted, or SQL exec calls: %s", async code => {
 		expect((await findings(code)).length).toBeGreaterThan(0);
