@@ -3296,6 +3296,202 @@ export class TreeSitterClient {
 		return object.text;
 	}
 
+	/**
+	 * Proves a direct fetch of a native URL whose exact configured origin is
+	 * checked by an immediately dominating terminating guard. Redirects must be
+	 * rejected so transport cannot leave that origin after validation.
+	 */
+	private isProvenExactOriginGuardedFetch(
+		destination: TreeSitterNode,
+		root: TreeSitterNode,
+	): boolean {
+		const named = (node: TreeSitterNode | null | undefined) =>
+			(node?.children ?? []).filter((child) => child.isNamed && child.type !== "comment");
+		const unwrap = (node: TreeSitterNode | null | undefined) => {
+			let current = node;
+			while (current?.type === "parenthesized_expression") current = named(current)[0];
+			return current;
+		};
+		const member = (node: TreeSitterNode | null | undefined, object: string, property: string) =>
+			node?.type === "member_expression" &&
+			node.childForFieldName?.("object")?.type === "identifier" &&
+			node.childForFieldName?.("object")?.text === object &&
+			node.childForFieldName?.("property")?.text === property;
+		const argumentsOf = (node: TreeSitterNode) =>
+			named(node.childForFieldName?.("arguments"));
+		const hasCompetingBinding = (
+			name: string,
+			allowedValue: TreeSitterNode,
+		): boolean => {
+			const stack = [root];
+			while (stack.length > 0) {
+				const node = stack.pop();
+				if (!node) continue;
+				if (node.type === "variable_declarator") {
+					const pattern = node.childForFieldName?.("name");
+					if (
+						this.bindingNames(pattern ?? undefined).has(name) &&
+						node.childForFieldName?.("value")?.startIndex !== allowedValue.startIndex
+					) return true;
+				}
+				if (
+					node.type === "lexical_declaration" &&
+					node.parent?.type === "for_in_statement" &&
+					this.bindingNames(node).has(name)
+				) return true;
+				if (
+					node.type === "for_in_statement" &&
+					(node.children ?? []).some((child) => ["const", "let", "var"].includes(child.text)) &&
+					this.bindingNames(node.childForFieldName?.("left") ?? undefined).has(name)
+				) return true;
+				if (
+					node.type === "catch_clause" &&
+					this.bindingNames(node.childForFieldName?.("parameter") ?? undefined).has(name)
+				) return true;
+				stack.push(...(node.children ?? []));
+			}
+			return false;
+		};
+
+		if (destination.type !== "call_expression") return false;
+		const serializer = destination.childForFieldName?.("function");
+		if (!serializer || serializer.type !== "member_expression") return false;
+		if (serializer.childForFieldName?.("property")?.text !== "toString") return false;
+		const urlRef = serializer.childForFieldName?.("object");
+		if (urlRef?.type !== "identifier" || argumentsOf(destination).length !== 0) return false;
+		const urlName = urlRef.text;
+
+		const sinkArgs = destination.parent;
+		const sink = sinkArgs?.parent;
+		if (
+			sinkArgs?.type !== "arguments" ||
+			sink?.type !== "call_expression" ||
+			sink.childForFieldName?.("function")?.type !== "identifier" ||
+			sink.childForFieldName?.("function")?.text !== "fetch"
+		) return false;
+		const fetchArgs = named(sinkArgs);
+		if (fetchArgs.length !== 2 || fetchArgs[0].startIndex !== destination.startIndex) return false;
+		const options = fetchArgs[1];
+		const optionProperties = named(options);
+		if (options.type !== "object" || optionProperties.some((child) => child.type !== "pair")) return false;
+		const propertyName = (pair: TreeSitterNode): string | null => {
+			const key = pair.childForFieldName?.("key");
+			if (key?.type === "property_identifier") return key.text;
+			if (key?.type === "string" && /^(["']).*\1$/.test(key.text)) {
+				const value = key.text.slice(1, -1);
+				return value.includes("\\") ? null : value;
+			}
+			return null;
+		};
+		const staticProperties = optionProperties.map((pair) => [propertyName(pair), pair] as const);
+		if (staticProperties.some(([name]) => name === null)) return false;
+		const redirectValues = staticProperties
+			.filter(([name]) => name === "redirect")
+			.map(([, pair]) => pair.childForFieldName?.("value"));
+		if (
+			redirectValues.length !== 1 ||
+			redirectValues[0]?.type !== "string" ||
+			!/^["']error["']$/.test(redirectValues[0].text)
+		) return false;
+
+		const urlInit = this.resolveFileConstValueNode(urlName, root);
+		if (!urlInit || urlInit.type !== "new_expression") return false;
+		const urlCtor = urlInit.childForFieldName?.("constructor");
+		const urlArgs = argumentsOf(urlInit);
+		if (urlCtor?.type !== "identifier" || urlCtor.text !== "URL" || urlArgs.length !== 2) return false;
+
+		let sinkStatement: TreeSitterNode | null | undefined = sink;
+		while (sinkStatement?.parent && sinkStatement.parent.type !== "statement_block") {
+			sinkStatement = sinkStatement.parent;
+		}
+		if (sinkStatement?.parent?.type !== "statement_block") return false;
+		const statements = named(sinkStatement.parent);
+		const sinkIndex = statements.findIndex((node) => node.startIndex === sinkStatement?.startIndex);
+		const guard = sinkIndex > 0 ? statements[sinkIndex - 1] : undefined;
+		if (guard?.type !== "if_statement" || guard.childForFieldName?.("alternative")) return false;
+		const condition = unwrap(guard.childForFieldName?.("condition"));
+		if (condition?.type !== "binary_expression") return false;
+		const left = unwrap(condition.childForFieldName?.("left"));
+		const right = unwrap(condition.childForFieldName?.("right"));
+		if (
+			!member(left, urlName, "origin") ||
+			right?.type !== "identifier" ||
+			!(condition.children ?? []).some((child) => !child.isNamed && child.text === "!==")
+		) return false;
+		const consequence = guard.childForFieldName?.("consequence");
+		if (!consequence || !this.statementTerminates(consequence)) return false;
+
+		const expectedOrigin = this.resolveFileConstValueNode(right.text, root);
+		if (
+			expectedOrigin?.type !== "member_expression" ||
+			expectedOrigin.childForFieldName?.("property")?.text !== "origin"
+		) return false;
+		if (
+			this.isShadowedByEnclosingParam(right, right.text) ||
+			hasCompetingBinding(right.text, expectedOrigin)
+		) return false;
+		const originUrl = expectedOrigin.childForFieldName?.("object");
+		if (originUrl?.type !== "new_expression") return false;
+		const originCtor = originUrl.childForFieldName?.("constructor");
+		const originArgs = argumentsOf(originUrl);
+		if (
+			originCtor?.type !== "identifier" ||
+			originCtor.text !== "URL" ||
+			originArgs.length !== 1 ||
+			originArgs[0].text !== urlArgs[1].text
+		) return false;
+		const base = urlArgs[1];
+		if (!this.isFixedUrlLiteralExpr(base)) {
+			if (base.type !== "identifier" || this.isShadowedByEnclosingParam(base, base.text)) return false;
+			const baseValue = this.resolveFileConstValueNode(base.text, root);
+			if (
+				!baseValue ||
+				!this.isFixedUrlLiteralExpr(baseValue) ||
+				hasCompetingBinding(base.text, baseValue)
+			) return false;
+		}
+
+		const allowedUrlUses = new Set([urlCtor.startIndex, originCtor.startIndex]);
+		const allowedInstanceUses = new Set([
+			urlRef.startIndex,
+			left?.childForFieldName?.("object")?.startIndex,
+		]);
+		const stack = [root];
+		while (stack.length > 0) {
+			const node = stack.pop();
+			if (!node) continue;
+			if (node.text === "URL" && !allowedUrlUses.has(node.startIndex)) return false;
+			if (new Set(["global", "globalThis", "self", "window"]).has(node.text)) return false;
+			if (
+				node.type === "identifier" &&
+				node.text === urlName &&
+				!allowedInstanceUses.has(node.startIndex)
+			) {
+				const parent = node.parent;
+				const isDeclaration =
+					parent?.type === "variable_declarator" &&
+					parent.childForFieldName?.("name")?.startIndex === node.startIndex &&
+					parent.childForFieldName?.("value")?.startIndex === urlInit.startIndex;
+				const searchParams =
+					parent?.type === "member_expression" &&
+					parent.childForFieldName?.("object")?.startIndex === node.startIndex &&
+					parent.childForFieldName?.("property")?.text === "searchParams";
+				const method = searchParams ? parent?.parent : undefined;
+				const safeQueryMutation =
+					method?.type === "member_expression" &&
+					method.childForFieldName?.("object")?.startIndex === parent?.startIndex &&
+					new Set(["append", "delete", "set", "sort"]).has(
+						method.childForFieldName?.("property")?.text ?? "",
+					) &&
+					method.parent?.type === "call_expression" &&
+					method.parent.childForFieldName?.("function")?.startIndex === method.startIndex;
+				if (!isDeclaration && !safeQueryMutation) return false;
+			}
+			stack.push(...(node.children ?? []));
+		}
+		return true;
+	}
+
 	private isSafeSqlAlchemyExpressionCall(node: TreeSitterNode): boolean {
 		if (node.type !== "call") return false;
 		const callee = node.children?.[0]?.text ?? "";
@@ -4468,6 +4664,9 @@ export class TreeSitterClient {
 					/^(exec|execSync)$/.test(captures.FN?.text ?? "")
 				);
 			case "ts_ssrf_sink": {
+				if (rootNode && captures.URL) {
+					try { if (this.isProvenExactOriginGuardedFetch(captures.URL, rootNode)) return false; } catch { /* Unknown guards retain the finding. */ }
+				}
 				if (rootNode && filePath && captures.URL) {
 					try { if (this.isPrivateSdkFetchHook(captures.URL, rootNode, filePath)) return false; } catch { /* Unknown hooks retain the finding. */ }
 				}
