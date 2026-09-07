@@ -103,6 +103,33 @@ describe("Java rule applicability", () => {
 		).resolves.toBe(1);
 	});
 
+	it("retains same-arity recursion when another overload exists", async () => {
+		await expect(
+			count(
+				"infinite-recursion",
+				"class T { int f(int value) { return f(value); } int f(String value) { return 0; } }",
+			),
+		).resolves.toBe(1);
+	});
+
+	it("retains recursion from a current varargs method", async () => {
+		await expect(
+			count(
+				"infinite-recursion",
+				"class T { int f(int... values) { return f(1, 2); } int f(int first, int second) { return 0; } }",
+			),
+		).resolves.toBe(1);
+	});
+
+	it("excludes comments when counting call arguments", async () => {
+		await expect(
+			count(
+				"infinite-recursion",
+				"class T { int f(int value) { return f(value, /* default */ 0); } int f(int value, int mode) { return 0; } }",
+			),
+		).resolves.toBe(0);
+	});
+
 	it("retains conservative findings for varargs, ambiguous overloads, and recovery", async () => {
 		await expect(
 			count(
@@ -132,5 +159,57 @@ describe("Java rule applicability", () => {
 				`class T { int f() { return f(); ${statements} } }`,
 			),
 		).resolves.toBe(1);
+	});
+
+	it("rejects a wide Java node before materializing its children", () => {
+		const client = getSharedTreeSitterClient();
+		if (!client) throw new Error("shared TreeSitterClient unavailable");
+		let childrenRead = false;
+		const containingType = {
+			type: "class_declaration",
+			text: "class T {}",
+			parent: null,
+			childCount: 10_001,
+			get children() {
+				childrenRead = true;
+				return [];
+			},
+		};
+		const classBody = {
+			type: "class_body",
+			text: "{}",
+			parent: containingType,
+			childCount: 0,
+			children: [],
+		};
+		const declaration = {
+			type: "method_declaration",
+			text: "int f() { return f(); }",
+			parent: classBody,
+			childCount: 0,
+			children: [],
+		};
+		const call = {
+			type: "method_invocation",
+			text: "f()",
+			parent: declaration,
+			childCount: 0,
+			children: [],
+		};
+		const keep = (
+			client as unknown as {
+				applyPostFilter(
+					name: string,
+					params: unknown,
+					captures: Record<string, unknown>,
+				): boolean;
+			}
+		).applyPostFilter("same_method_no_base_case", undefined, {
+			NAME: { text: "f" },
+			RECURSE: { text: "f" },
+			CALL: call,
+		});
+		expect(keep).toBe(true);
+		expect(childrenRead).toBe(false);
 	});
 });

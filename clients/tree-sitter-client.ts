@@ -2650,6 +2650,28 @@ export class TreeSitterClient {
 						"record_declaration",
 					]) as TreeSitterNode | null;
 					if (!containingType) return true;
+					const pushJavaChildrenWithinBudget = (
+						node: TreeSitterNode,
+						pending: TreeSitterNode[],
+						visited: number,
+					): boolean => {
+						if (
+							node.childCount >
+							NO_NESTED_ANCHOR_VISIT_CAP - visited - pending.length - 1
+						) {
+							return false;
+						}
+						const parent = node as TreeSitterNode & {
+							child?: (index: number) => TreeSitterNode | null;
+						};
+						if (node.childCount > 0 && !parent.child) return false;
+						for (let index = 0; index < node.childCount; index++) {
+							const child = parent.child?.(index);
+							if (!child) return false;
+							pending.push(child);
+						}
+						return true;
+					};
 					const syntaxStack = [containingType];
 					for (
 						let visited = 0;
@@ -2665,7 +2687,9 @@ export class TreeSitterClient {
 						) {
 							return true;
 						}
-						syntaxStack.push(...(node.children ?? []));
+						if (!pushJavaChildrenWithinBudget(node, syntaxStack, visited)) {
+							return true;
+						}
 					}
 					if (syntaxStack.length > 0) return true;
 
@@ -2677,10 +2701,24 @@ export class TreeSitterClient {
 						(receiver.type === "identifier" && receiver.text === typeName);
 					const argumentsNode = call.childForFieldName?.("arguments");
 					const typeBody = containingType.childForFieldName?.("body");
-					if (receiverIsLocal && argumentsNode && typeBody) {
-						const callArity = argumentsNode.children.filter(
-							(node) => node.isNamed,
-						).length;
+					const currentParameters =
+						declaration.childForFieldName?.("parameters");
+					const currentParameterNodes = currentParameters?.children.filter(
+						(node) => node.isNamed && !node.type.endsWith("comment"),
+					);
+					const callArity = argumentsNode?.children.filter(
+						(node) => node.isNamed && !node.type.endsWith("comment"),
+					).length;
+					if (
+						receiverIsLocal &&
+						typeBody &&
+						currentParameterNodes &&
+						currentParameterNodes.every(
+							(node) => node.type === "formal_parameter",
+						) &&
+						callArity !== undefined &&
+						callArity !== currentParameterNodes.length
+					) {
 						const currentIsStatic = /\bstatic\b/.test(
 							declaration.children.find((node) => node.type === "modifiers")
 								?.text ?? "",
@@ -2697,12 +2735,14 @@ export class TreeSitterClient {
 							) {
 								return false;
 							}
-							const parameters = candidate.childForFieldName?.("parameters");
+							const parameterNodes = candidate
+								.childForFieldName?.("parameters")
+								?.children.filter(
+									(node) => node.isNamed && !node.type.endsWith("comment"),
+								);
 							if (
-								!parameters ||
-								parameters.children.some(
-									(node) => node.isNamed && node.type !== "formal_parameter",
-								)
+								!parameterNodes ||
+								parameterNodes.some((node) => node.type !== "formal_parameter")
 							) {
 								return false;
 							}
@@ -2712,11 +2752,7 @@ export class TreeSitterClient {
 								)?.text;
 								if (!modifiers || !/\bstatic\b/.test(modifiers)) return false;
 							}
-							return (
-								parameters.children.filter(
-									(node) => node.type === "formal_parameter",
-								).length === callArity
-							);
+							return parameterNodes.length === callArity;
 						});
 						if (overloads.length === 1) return false;
 					}
@@ -2745,7 +2781,9 @@ export class TreeSitterClient {
 						) {
 							return false;
 						}
-						stack.push(...(node.children ?? []));
+						if (!pushJavaChildrenWithinBudget(node, stack, visited)) {
+							return true;
+						}
 					}
 					// Cap exhaustion cannot prove a base case, so retain the finding.
 					return true;
