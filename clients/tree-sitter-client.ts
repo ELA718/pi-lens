@@ -3524,6 +3524,265 @@ export class TreeSitterClient {
 		return true;
 	}
 
+	/**
+	 * Proves that an SSRF destination is built only from literals and static
+	 * deployment configuration. This is request-taint provenance only: it does
+	 * not certify the configured host, scheme, or transport policy.
+	 */
+	private isDeploymentConfigOnlyUrl(
+		destination: TreeSitterNode,
+		root: TreeSitterNode,
+	): boolean {
+		const FUNCTION_TYPES = new Set([
+			"function_declaration",
+			"function_expression",
+			"generator_function",
+			"generator_function_declaration",
+			"arrow_function",
+			"method_definition",
+		]);
+		const nodes: TreeSitterNode[] = [];
+		const pending = [root];
+		while (pending.length > 0) {
+			const node = pending.pop();
+			if (!node || nodes.length >= NO_NESTED_ANCHOR_VISIT_CAP) return false;
+			if (
+				node.type === "ERROR" ||
+				(node as TreeSitterNode & { isMissing?: boolean }).isMissing
+			) return false;
+			nodes.push(node);
+			if (node.childCount > NO_NESTED_ANCHOR_VISIT_CAP - nodes.length - pending.length) return false;
+			pending.push(...(node.children ?? []));
+		}
+		if (root.endIndex > 512_000) return false;
+
+		const nearestFunction = (node: TreeSitterNode): TreeSitterNode | null => {
+			let current = node.parent;
+			while (current && current !== root) {
+				if (FUNCTION_TYPES.has(current.type)) return current;
+				current = current.parent;
+			}
+			return null;
+		};
+		const sameNode = (
+			left: TreeSitterNode | null | undefined,
+			right: TreeSitterNode | null | undefined,
+		): boolean =>
+			!!left &&
+			!!right &&
+			left.startIndex === right.startIndex &&
+			left.endIndex === right.endIndex;
+		const globalIsUnbound = (name: string): boolean =>
+			!nodes.some((node) => {
+				if (node.type === "variable_declarator") {
+					return node.childForFieldName?.("name")?.text === name;
+				}
+				if (node.type === "import_specifier" || node.type === "import_clause" || node.type === "namespace_import") {
+					return (node.children ?? []).some((child) => child.type === "identifier" && child.text === name);
+				}
+				if (FUNCTION_TYPES.has(node.type)) {
+					const bare = node.childForFieldName?.("parameter");
+					return bare?.text === name || this.paramsBindName(node.childForFieldName?.("parameters") ?? node, name);
+				}
+				return false;
+			});
+		const environmentIsStable = (): boolean =>
+			!nodes.some((node) => {
+				if (node.type === "assignment_expression" || node.type === "augmented_assignment_expression") {
+					return /^(?:Deno\.env|process\.env|Bun\.env)(?:\.|\[)/.test(node.childForFieldName?.("left")?.text ?? "");
+				}
+				if (node.type === "call_expression") {
+					return /^(?:Deno\.env|process\.env|Bun\.env)\.(?:set|delete)$/.test(node.childForFieldName?.("function")?.text ?? "");
+				}
+				return false;
+			});
+
+		type TraceContext = {
+			fn: TreeSitterNode | null;
+			params: ReadonlyMap<string, TreeSitterNode>;
+		};
+		const bindingValue = (
+			name: string,
+			use: TreeSitterNode,
+			ctx: TraceContext,
+		): TreeSitterNode | null => {
+			if (sameNode(ctx.fn, nearestFunction(use)) && ctx.params.has(name)) {
+				return ctx.params.get(name) ?? null;
+			}
+			const scopes: TreeSitterNode[] = [];
+			let scope = nearestFunction(use);
+			if (scope) scopes.push(scope);
+			scopes.push(root);
+			for (const currentScope of scopes) {
+				const declarations: TreeSitterNode[] = [];
+				const assignments: TreeSitterNode[] = [];
+				const references: TreeSitterNode[] = [];
+				const stack = [currentScope];
+				while (stack.length > 0) {
+					const node = stack.pop();
+					if (!node) continue;
+					if (node !== currentScope && FUNCTION_TYPES.has(node.type)) continue;
+					if (node.type === "variable_declarator" && node.childForFieldName?.("name")?.text === name) {
+						declarations.push(node);
+					} else if ((node.type === "identifier" || node.type === "shorthand_property_identifier") && node.text === name) {
+						references.push(node);
+					} else if (node.type === "assignment_expression" || node.type === "augmented_assignment_expression") {
+						const left = node.childForFieldName?.("left");
+						if (left?.text === name || left?.text.startsWith(`${name}.`) || left?.text.startsWith(`${name}[`)) assignments.push(node);
+					}
+					stack.push(...(node.children ?? []));
+				}
+				if (declarations.length === 0) continue;
+				if (declarations.length !== 1 || declarations[0].startIndex >= use.startIndex) return null;
+				const declaration = declarations[0];
+				const lexical = declaration.parent;
+				if (lexical?.parent?.type === "export_statement") return null;
+				const relevantReferences = currentScope === root
+					? nodes.filter((node) => (node.type === "identifier" || node.type === "shorthand_property_identifier") && node.text === name)
+					: references;
+				const declarationName = declaration.childForFieldName?.("name");
+				for (const reference of relevantReferences) {
+					if (reference.startIndex >= use.startIndex || sameNode(reference, use) || sameNode(reference, declarationName)) continue;
+					let parent = reference.parent;
+					while (parent && parent !== currentScope) {
+						if (parent.type === "arguments" || parent.type === "return_statement" || parent.type === "export_statement") return null;
+						if (FUNCTION_TYPES.has(parent.type) && parent !== nearestFunction(reference)) break;
+						parent = parent.parent;
+					}
+				}
+				const isConst = lexical?.type === "lexical_declaration" && lexical.children.some((child) => child.type === "const");
+				const initializer = declaration.childForFieldName?.("value");
+				if (isConst && initializer && assignments.length === 0) return initializer;
+				if (!initializer && assignments.length === 1) {
+					const assignment = assignments[0];
+					if (assignment.type === "assignment_expression" && assignment.startIndex < use.startIndex) {
+						return assignment.childForFieldName?.("right") ?? null;
+					}
+				}
+				return null;
+			}
+			return null;
+		};
+
+		const privateFunction = (name: string): TreeSitterNode | null => {
+			const declarations = nodes.filter(
+				(node) => node.type === "function_declaration" && node.childForFieldName?.("name")?.text === name,
+			);
+			if (declarations.length !== 1) return null;
+			const declaration = declarations[0];
+			if (declaration.parent?.type !== "program") return null;
+			const nameNode = declaration.childForFieldName?.("name");
+			for (const node of nodes) {
+				if (node.type !== "identifier" || node.text !== name || sameNode(node, nameNode)) continue;
+				const parent = node.parent;
+				if (parent?.type !== "call_expression" || !sameNode(parent.childForFieldName?.("function"), node)) return null;
+			}
+			return declaration;
+		};
+
+		const active = new Set<string>();
+		const trace = (
+			node: TreeSitterNode | null | undefined,
+			property: string | undefined,
+			ctx: TraceContext,
+			depth: number,
+		): boolean => {
+			if (!node || depth > 32) return false;
+			const paramKey = [...ctx.params.entries()].map(([name, value]) => `${name}:${value.startIndex}`).join(",");
+			const key = `${node.startIndex}:${node.endIndex}:${property ?? ""}:${ctx.fn?.startIndex ?? -1}:${paramKey}`;
+			if (active.has(key)) return false;
+			active.add(key);
+			try {
+				if (["string", "number", "true", "false", "null"].includes(node.type)) return property === undefined;
+				if (["parenthesized_expression", "non_null_expression", "as_expression", "await_expression", "template_substitution", "unary_expression"].includes(node.type)) {
+					return trace(node.children.find((child) => child.isNamed), property, ctx, depth + 1);
+				}
+				if (node.type === "template_string") {
+					if (property !== undefined) return false;
+					return node.children.filter((child) => child.type === "template_substitution").every((child) => trace(child, undefined, ctx, depth + 1));
+				}
+				if (node.type === "binary_expression" || node.type === "ternary_expression") {
+					if (property !== undefined) return false;
+					return node.children.filter((child) => child.isNamed).every((child) => trace(child, undefined, ctx, depth + 1));
+				}
+				if (node.type === "identifier" || node.type === "shorthand_property_identifier") {
+					if (node.text === "Boolean" && property === undefined && globalIsUnbound("Boolean")) return true;
+					return trace(bindingValue(node.text, node, ctx), property, ctx, depth + 1);
+				}
+				if (node.type === "object") {
+					if (!property) return false;
+					const matches = node.children.filter((child) => {
+						if (child.type === "pair") return child.childForFieldName?.("key")?.text === property;
+						return child.type === "shorthand_property_identifier" && child.text === property;
+					});
+					if (matches.length !== 1) return false;
+					const match = matches[0];
+					return trace(match.type === "pair" ? match.childForFieldName?.("value") : match, undefined, ctx, depth + 1);
+				}
+				if (node.type === "member_expression") {
+					const object = node.childForFieldName?.("object");
+					const member = node.childForFieldName?.("property")?.text;
+					if (!object || !member || property !== undefined) return property ? false : trace(object, member, ctx, depth + 1);
+					if (/^(?:process|Bun)\.env$/.test(object.text)) {
+						const owner = object.childForFieldName?.("object")?.text;
+						return !!owner && globalIsUnbound(owner) && environmentIsStable();
+					}
+					if (object.text === "import.meta.env") return environmentIsStable();
+					return trace(object, member, ctx, depth + 1);
+				}
+				if (node.type === "new_expression") {
+					if (node.childForFieldName?.("constructor")?.text !== "URL" || !globalIsUnbound("URL")) return false;
+					const args = node.childForFieldName?.("arguments")?.children.filter((child) => child.isNamed) ?? [];
+					return args.length > 0 && args.every((arg) => trace(arg, undefined, ctx, depth + 1));
+				}
+				if (node.type === "call_expression") {
+					const callee = node.childForFieldName?.("function");
+					const args = node.childForFieldName?.("arguments")?.children.filter((child) => child.isNamed) ?? [];
+					if (callee?.type === "member_expression") {
+						const receiver = callee.childForFieldName?.("object");
+						const method = callee.childForFieldName?.("property")?.text;
+						if (method === "get" && receiver?.type === "member_expression" && receiver.childForFieldName?.("property")?.text === "env") {
+							const owner = receiver.childForFieldName?.("object")?.text;
+							return property === undefined && args.length === 1 && args[0].type === "string" && !!owner && ["Deno", "process", "Bun"].includes(owner) && globalIsUnbound(owner) && environmentIsStable();
+						}
+						if (!receiver || !method || !new Set(["trim", "toLowerCase", "toUpperCase", "split", "filter", "at", "slice", "join", "toString"]).has(method)) return false;
+						return trace(receiver, property, ctx, depth + 1) && args.every((arg) => trace(arg, undefined, ctx, depth + 1));
+					}
+					if (callee?.type !== "identifier") return false;
+					const declaration = privateFunction(callee.text);
+					if (!declaration) return false;
+					const parameterNodes = declaration.childForFieldName?.("parameters")?.children.filter((child) => child.isNamed) ?? [];
+					if (parameterNodes.length !== args.length) return false;
+					const params = new Map<string, TreeSitterNode>();
+					for (let index = 0; index < parameterNodes.length; index++) {
+						const parameter = parameterNodes[index];
+						const pattern = parameter.childForFieldName?.("pattern") ?? parameter;
+						if (pattern.type !== "identifier") return false;
+						params.set(pattern.text, args[index]);
+					}
+					const body = declaration.childForFieldName?.("body");
+					if (!body) return false;
+					const returns: TreeSitterNode[] = [];
+					const stack = [body];
+					while (stack.length > 0) {
+						const current = stack.pop();
+						if (!current) continue;
+						if (current !== body && FUNCTION_TYPES.has(current.type)) continue;
+						if (current.type === "return_statement") returns.push(current);
+						else stack.push(...(current.children ?? []));
+					}
+					const nextContext = { fn: declaration, params };
+					return returns.length > 0 && returns.every((ret) => trace(ret.children.find((child) => child.isNamed), property, nextContext, depth + 1));
+				}
+				return false;
+			} finally {
+				active.delete(key);
+			}
+		};
+
+		return trace(destination, undefined, { fn: nearestFunction(destination), params: new Map() }, 0);
+	}
+
 	private isSafeSqlAlchemyExpressionCall(node: TreeSitterNode): boolean {
 		if (node.type !== "call") return false;
 		const callee = node.children?.[0]?.text ?? "";
@@ -4698,6 +4957,7 @@ export class TreeSitterClient {
 			case "ts_ssrf_sink": {
 				if (rootNode && captures.URL) {
 					try { if (this.isProvenExactOriginGuardedFetch(captures.URL, rootNode)) return false; } catch { /* Unknown guards retain the finding. */ }
+					try { if (this.isDeploymentConfigOnlyUrl(captures.URL, rootNode)) return false; } catch { /* Unknown provenance retains the finding. */ }
 				}
 				if (rootNode && filePath && captures.URL) {
 					try { if (this.isPrivateSdkFetchHook(captures.URL, rootNode, filePath)) return false; } catch { /* Unknown hooks retain the finding. */ }
