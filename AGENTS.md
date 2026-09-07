@@ -1,5 +1,12 @@
 # pi-lens — agent context
 
+Open-redirect applicability may exclude only a lexically proven immutable local
+`URL.createObjectURL` value passed directly to `window.open`. Share the bounded
+provenance check between native rules and LSP delivery; the latter additionally
+requires the exact captured content hash and negotiated diagnostic range.
+Unknown bindings, mutation, shadowing, recovered syntax and exhausted budgets
+retain findings. Excluded matches must not consume the rule's finding cap. (refs #6)
+
 Full diagnostic cancellation belongs to the request that starts an analyzer.
 Pass its signal through each new run; joining an incumbent run must not change
 that run's lifetime. Already-aborted requests start no analyzers. POSIX

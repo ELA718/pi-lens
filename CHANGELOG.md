@@ -14,6 +14,10 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- Open-redirect scanning recognizes proven immutable local Blob URLs in native
+  and content-bound LSP results. Unknown, mutable and shadowed values remain
+  findings, and excluded matches do not consume the finding cap. (refs #6)
+
 - Full diagnostic cancellation now reaches analyzer processes started by that
   request. POSIX cleanup stops wrapper descendants, including children that
   ignore TERM after their wrapper exits. Joined runs retain their original
