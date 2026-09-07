@@ -1,5 +1,11 @@
 # pi-lens — agent context
 
+Direct file admission inherits ignored-directory verdicts from its ancestors.
+Evaluate those ancestors in root-to-leaf order before the file, so a generated
+descendant cannot evade a nested directory ignore. Preserve Git negation and
+anchoring, tracked-file overrides, and separate direct-directory matching from
+ancestor inheritance. Compare edge cases to git check-ignore. (refs #6)
+
 Versionless diagnostic pushes bind only to an unchanged first-open generation
 on that client. Record the exact sent hash; a duplicate send of identical bytes
 may advance its version. A real edit, pre-open publication, or close/reopen

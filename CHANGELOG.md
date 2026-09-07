@@ -14,6 +14,10 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- Direct file scans now inherit Git-ignored parent directories, including nested
+  generated Android assets, while retaining ignore-layer and tracked-file
+  behavior. (refs #6)
+
 - Versionless language servers can bind first-open diagnostics to their exact
   sent content. Real edits, pre-open publications and close/reopen stay unbound
   instead of accepting stale diagnostics merely because disk bytes match. (refs #6)

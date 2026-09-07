@@ -275,13 +275,17 @@ function matchesGitignorePattern(
 	pattern: GitignorePattern,
 	relativePath: string,
 	isDirectory: boolean,
+	inheritanceCheck = false,
 ): boolean {
 	const candidate = stripLeadingSlashes(normalizeIgnorePath(relativePath));
 	if (!candidate) return false;
-	const candidates = isDirectory ? [candidate, `${candidate}/`] : [candidate];
+	const candidates =
+		isDirectory && !inheritanceCheck
+			? [candidate, `${candidate}/`]
+			: [candidate];
 	const options = { dot: true, nocase: process.platform === "win32" };
 	return expandGitignorePattern(pattern).some((expanded) => {
-		if (isDirectory && expanded.endsWith("/**")) {
+		if (isDirectory && !inheritanceCheck && expanded.endsWith("/**")) {
 			const prefix = expanded.slice(0, -3);
 			if (candidate === prefix || candidate.startsWith(`${prefix}/`))
 				return true;
@@ -358,6 +362,7 @@ function buildProjectIgnoreMatcher(
 		) {
 			return cached.patterns;
 		}
+		if (cached) patternMemo.clear();
 		const nestedConfig = loadPiLensConfigInDir(dir);
 		const nextPatterns = [
 			...readGitignorePatterns(dir),
@@ -422,6 +427,45 @@ function buildProjectIgnoreMatcher(
 		return snapshot.has(normalizeEphemeralMapKey(resolved));
 	}
 
+	function directPatternVerdict(
+		resolved: string,
+		isDirectory: boolean,
+		inheritanceCheck = false,
+	): { ignored: boolean; layer: GitignorePatternLayer | undefined } {
+		let memoPrefix = "F:";
+		if (inheritanceCheck) memoPrefix = "A:";
+		else if (isDirectory) memoPrefix = "D:";
+		const memoKey = memoPrefix + resolved;
+		const patternSets = ancestorDirsBetween(
+			resolvedRoot,
+			path.dirname(resolved),
+		).map((dir) => ({ dir, patterns: patternsForDir(dir) }));
+		const cached = patternMemo.get(memoKey);
+		if (cached) return cached;
+		let ignored = false;
+		let layer: GitignorePatternLayer | undefined;
+		for (const { dir, patterns: dirPatterns } of patternSets) {
+			if (dirPatterns.length === 0) continue;
+			const normalized = normalizeIgnorePath(path.relative(dir, resolved));
+			for (const pattern of dirPatterns) {
+				if (
+					!matchesGitignorePattern(
+						pattern,
+						normalized,
+						isDirectory,
+						inheritanceCheck,
+					)
+				)
+					continue;
+				ignored = !pattern.negated;
+				layer = pattern.layer;
+			}
+		}
+		const verdict = { ignored, layer };
+		patternMemo.set(memoKey, verdict);
+		return verdict;
+	}
+
 	return {
 		rootDir: resolvedRoot,
 		patterns,
@@ -430,41 +474,26 @@ function buildProjectIgnoreMatcher(
 		},
 		isIgnored(filePath: string, isDirectory = false): boolean {
 			const resolved = path.resolve(filePath);
-			// Two namespaces (D: for directory queries, F: for file queries)
-			// because gitignore semantics differ for trailing-slash patterns.
-			const memoKey = (isDirectory ? "D:" : "F:") + resolved;
-			let verdict = patternMemo.get(memoKey);
-			if (verdict === undefined) {
-				const rootRelative = path.relative(resolvedRoot, resolved);
-				if (
-					!rootRelative ||
-					rootRelative.startsWith("..") ||
-					path.isAbsolute(rootRelative)
-				) {
-					verdict = { ignored: false, layer: undefined };
-				} else {
-					let ignored = false;
-					let layer: GitignorePatternLayer | undefined;
-					const patternDirs = ancestorDirsBetween(
-						resolvedRoot,
-						path.dirname(resolved),
-					);
-					for (const dir of patternDirs) {
-						const dirPatterns = patternsForDir(dir);
-						if (dirPatterns.length === 0) continue;
-						const relative = path.relative(dir, resolved);
-						const normalized = normalizeIgnorePath(relative);
-						for (const pattern of dirPatterns) {
-							if (!matchesGitignorePattern(pattern, normalized, isDirectory))
-								continue;
-							ignored = !pattern.negated;
-							layer = pattern.layer;
-						}
-					}
-					verdict = { ignored, layer };
-				}
-				patternMemo.set(memoKey, verdict);
+			const rootRelative = path.relative(resolvedRoot, resolved);
+			if (
+				!rootRelative ||
+				rootRelative.startsWith("..") ||
+				path.isAbsolute(rootRelative)
+			)
+				return false;
+			let verdict = { ignored: false, layer: undefined } as {
+				ignored: boolean;
+				layer: GitignorePatternLayer | undefined;
+			};
+			for (const ancestor of ancestorDirsBetween(
+				resolvedRoot,
+				path.dirname(resolved),
+			).slice(1)) {
+				verdict = directPatternVerdict(ancestor, true, true);
+				if (verdict.ignored) break;
 			}
+			if (!verdict.ignored)
+				verdict = directPatternVerdict(resolved, isDirectory);
 
 			if (!verdict.ignored) return false;
 			// #703 layer semantics: a winning positive match from `global` or
