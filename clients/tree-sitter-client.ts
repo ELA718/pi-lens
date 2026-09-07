@@ -1995,67 +1995,22 @@ export class TreeSitterClient {
 		};
 		const collectNodes = (
 			treeRoot: TreeSitterNode,
-			proofNode: TreeSitterNode,
 		): TreeSitterNode[] | undefined => {
 			const nodes: TreeSitterNode[] = [];
 			const pending = [treeRoot];
 			while (pending.length > 0) {
 				const node = pending.pop();
-				if (
-					!node ||
-					nodes.length + pending.length + node.children.length >= maxNodes
-				)
-					return undefined;
+				if (!node) return undefined;
+				const remaining = maxNodes - nodes.length - pending.length - 1;
+				if (node.childCount > remaining) return undefined;
+				const children = node.children;
+				if (children.length > remaining) return undefined;
 				nodes.push(node);
-				pending.push(...node.children);
+				pending.push(...children);
 			}
-			const safeJsxAttributeRecovery = (recovery: TreeSitterNode): boolean => {
-				let ancestor = recovery.parent;
-				while (ancestor && ancestor !== treeRoot) {
-					if (ancestor.type === "jsx_attribute") {
-						return (
-							ancestor.children.find(
-								(child) => child.type === "property_identifier",
-							)?.text !== "dangerouslySetInnerHTML"
-						);
-					}
-					ancestor = ancestor.parent;
-				}
-				return false;
-			};
-			const unsafeRecovery = nodes.some((node) => {
-				if (node.type !== "ERROR" && !node.isMissing) return false;
-				if (
-					node.startIndex < proofNode.endIndex &&
-					node.endIndex > proofNode.startIndex
-				)
-					return true;
-				if (safeJsxAttributeRecovery(node)) return false;
-				if (node.text === '"') {
-					let element = node.parent;
-					while (
-						element &&
-						!["jsx_element", "jsx_self_closing_element"].includes(element.type)
-					)
-						element = element.parent;
-					if (element) {
-						const { startIndex, endIndex } = element;
-						if (
-							nodes.some(
-								(other) =>
-									other !== node &&
-									other.type === "ERROR" &&
-									other.startIndex >= startIndex &&
-									other.endIndex <= endIndex &&
-									safeJsxAttributeRecovery(other),
-							)
-						)
-							return false;
-					}
-				}
-				return true;
-			});
-			return unsafeRecovery ? undefined : nodes;
+			return nodes.some((node) => node.type === "ERROR" || node.isMissing)
+				? undefined
+				: nodes;
 		};
 		const sameNode = (
 			left: TreeSitterNode | null | undefined,
@@ -2070,7 +2025,7 @@ export class TreeSitterClient {
 		): boolean => {
 			if (!candidate || depth > 8 || !bindTreeFile(sourceFile, treeRoot))
 				return false;
-			const nodes = collectNodes(treeRoot, candidate);
+			const nodes = collectNodes(treeRoot);
 			if (!nodes) return false;
 			if (candidate.type === "string")
 				return (

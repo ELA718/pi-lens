@@ -55,7 +55,7 @@ describe("HTML sanitizer provenance", () => {
 			).length,
 		).toBeGreaterThan(0);
 	});
-	it("excludes the five reviewed TB sinks only after their complete paths are proven", async () => {
+	it("excludes only reviewed TB sinks whose complete files parse without recovery", async () => {
 		env.addFile(
 			"tsconfig.json",
 			JSON.stringify({
@@ -86,27 +86,34 @@ describe("HTML sanitizer provenance", () => {
 		const cases = [
 			[
 				"src/pages/marketing/templates/desktop/TemplateDetailDesktop.tsx",
-				"import { sanitizeHtml } from '@/lib/utils/sanitize-html'; const view = <div dangerouslySetInnerHTML={{__html: sanitizeHtml(template.content)}} />;",
+				`import { sanitizeHtml } from '@/lib/utils/sanitize-html'; const view = <div className="max-w-full [&_img]:h-auto [&_img]:max-w-full" dangerouslySetInnerHTML={{__html: sanitizeHtml(template.content)}} />;`,
+				true,
 			],
 			[
 				"src/pages/sales/estimates/desktop/SendEstimateToCustomerDialog.tsx",
 				"import { useMemo as memo } from 'react'; import { sanitizeHtml } from '@/lib/utils/sanitize-html'; const previewHtml = input; const sanitizedPreviewHtml = memo(() => sanitizeHtml(previewHtml), [previewHtml]); const view = <div dangerouslySetInnerHTML={{__html: sanitizedPreviewHtml}} />;",
+				false,
 			],
 			[
 				"src/pages/settings/email-templates/desktop/EditEmailTemplateDesktop.tsx",
 				"import { useMemo } from 'react'; import { sanitizeEmailPreviewHtml } from '@/lib/utils/sanitize-html'; const previewHtml = useMemo(() => sanitizeEmailPreviewHtml(substitute(body)), [body]); const view = <div dangerouslySetInnerHTML={{__html: previewHtml}} />;",
+				false,
 			],
 			[
 				"src/pages/settings/email-templates/desktop/EmailTemplateDetailDesktop.tsx",
 				"import { useMemo } from 'react'; import { buildEmailTemplateSamplePreview } from './email-template-preview'; const previewHtml = useMemo(() => ready ? buildEmailTemplateSamplePreview(body) : '', [ready, body]); const view = <div dangerouslySetInnerHTML={{__html: previewHtml || '—'}} />;",
+				false,
 			],
 			[
 				"src/pages/settings/email-templates/mobile/EmailTemplateDetailMobile.tsx",
 				"import { sanitizeHtml } from '@/lib/utils/sanitize-html'; const view = <div dangerouslySetInnerHTML={{__html: body ? sanitizeHtml(body) : '—'}} />;",
+				false,
 			],
 		] as const;
-		for (const [file, code] of cases)
-			expect(await findingsAt(file, code), file).toHaveLength(0);
+		for (const [file, code, expectedFinding] of cases)
+			expect((await findingsAt(file, code)).length > 0, file).toBe(
+				expectedFinding,
+			);
 	});
 	it.each([
 		"const DOMPurify = {sanitize: value => value}; const view = <div dangerouslySetInnerHTML={{__html: DOMPurify.sanitize(input)}} />;",
@@ -176,5 +183,29 @@ describe("HTML sanitizer provenance", () => {
 				)
 			).length,
 		).toBeGreaterThan(0);
+	});
+
+	it("checks childCount before materializing a hostile wide node", () => {
+		const { filePath } = env.addFile("wide.tsx", "x");
+		let childrenRead = false;
+		const root = {
+			startIndex: 0,
+			endIndex: 1,
+			text: "x",
+			childCount: 50_000,
+			get children(): never {
+				childrenRead = true;
+				throw new Error("children must not be materialized");
+			},
+		};
+		const client = getSharedTreeSitterClient() as unknown as {
+			isProvenHtmlSanitizer(
+				value: unknown,
+				root: unknown,
+				file: string,
+			): boolean;
+		};
+		expect(client.isProvenHtmlSanitizer(root, root, filePath)).toBe(false);
+		expect(childrenRead).toBe(false);
 	});
 });
