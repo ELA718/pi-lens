@@ -7,7 +7,7 @@
  * - Platform-specific handling
  */
 
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { constants, existsSync, mkdirSync, readFileSync } from "node:fs";
 import {
 	access,
 	readFile,
@@ -359,6 +359,55 @@ function markDirectLspCommandUnavailable(command: string): void {
 	directLspCommandSkipLoggedUntil.delete(command);
 }
 
+function isMissingPathError(error: unknown): boolean {
+	const code = (error as NodeJS.ErrnoException)?.code;
+	return code === "ENOENT" || code === "ENOTDIR";
+}
+
+async function isLaunchCandidateAvailable(
+	command: string,
+	cwd: string,
+	env?: NodeJS.ProcessEnv,
+): Promise<boolean> {
+	if (isSimpleCommand(command)) {
+		const effectivePath =
+			env?.PATH ??
+			env?.Path ??
+			env?.path ??
+			process.env.PATH ??
+			process.env.Path ??
+			process.env.path ??
+			"";
+		const hasExplicitExtension =
+			process.platform === "win32" && path.extname(command) !== "";
+		const extensions =
+			process.platform === "win32"
+				? hasExplicitExtension
+					? [""]
+					: (env?.PATHEXT ?? process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";")
+				: [""];
+		for (const entry of effectivePath.split(path.delimiter)) {
+			const binDir = path.resolve(cwd, entry || ".");
+			for (const extension of extensions) {
+				try {
+					await access(path.join(binDir, `${command}${extension}`));
+					return true;
+				} catch (error) {
+					if (!isMissingPathError(error)) return true;
+				}
+			}
+		}
+		return false;
+	}
+	const resolved = isFullyQualified(command) ? command : path.resolve(cwd, command);
+	try {
+		await access(resolved);
+		return true;
+	} catch (error) {
+		return !isMissingPathError(error);
+	}
+}
+
 const PI_LENS_BIN_DIR = path.join(getGlobalPiLensDir(), "bin");
 
 // ---------------------------------------------------------------------------
@@ -429,8 +478,31 @@ export async function resolveAndLaunch(
 		err: unknown;
 	}> = [];
 
-	// Step 1 & 2 — try all explicit candidates (includes bare command = PATH lookup)
+	// Step 1 & 2 — try available explicit candidates (includes bare command = PATH lookup).
+	// If cwd is invalid, let launchLSP retain its typed cwd failure.
+	let canPreflightCandidates = true;
+	try {
+		await access(spec.cwd, constants.X_OK);
+	} catch {
+		canPreflightCandidates = false;
+	}
 	for (const [index, command] of spec.candidates.entries()) {
+		if (
+			canPreflightCandidates &&
+			!(await isLaunchCandidateAvailable(command, spec.cwd, spec.env))
+		) {
+			logLatency({
+				type: "phase",
+				phase: "lsp_launch_candidate_unavailable",
+				filePath: spec.cwd,
+				durationMs: 0,
+				metadata: { tool: toolLabel, command, index },
+			});
+			logSessionStart(
+				`lsp launch candidate unavailable tool=${toolLabel} idx=${index} command=${command} cwd=${spec.cwd}`,
+			);
+			continue;
+		}
 		logLatency({
 			type: "phase",
 			phase: "lsp_launch_candidate_attempt",
@@ -922,6 +994,23 @@ function createInteractiveServer(spec: InteractiveServerSpec): LSPServerInfo {
 				isSimpleCommand(command) &&
 				isDirectLspCommandTemporarilyUnavailable(command)
 			) {
+				return undefined;
+			}
+			let canPreflightCommand = true;
+			try {
+				await access(root, constants.X_OK);
+			} catch {
+				// Let launchLSP retain its typed cwd failure.
+				canPreflightCommand = false;
+			}
+			if (
+				canPreflightCommand &&
+				!(await isLaunchCandidateAvailable(command, root))
+			) {
+				logSessionStart(
+					`lsp direct command ${command}: unavailable before launch cwd=${root}`,
+				);
+				markDirectLspCommandUnavailable(command);
 				return undefined;
 			}
 			// #241: the server binary is run by a language runtime (jdtls → java).

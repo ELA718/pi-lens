@@ -49,6 +49,8 @@ afterEach(() => {
 	}
 	delete process.env.PI_LENS_DISABLE_LSP_INSTALL;
 	ensureTool.mockReset();
+	getToolEnvironment.mockReset();
+	getToolEnvironment.mockResolvedValue({});
 	launchLSP.mockReset();
 	observedReadFileSync.mockClear();
 	logSessionStart.mockClear();
@@ -348,7 +350,7 @@ describe("lsp server policy", () => {
 		await expect(FSharpServer.root(file)).resolves.toBeUndefined();
 	});
 
-	it("tries pi-lens managed csharp candidates before legacy global dotnet tools", async () => {
+	it("skips missing managed csharp candidates before legacy global dotnet tools", async () => {
 		const { CSharpServer } = await import("../../../clients/lsp/server.js");
 		const { getGlobalPiLensDir } = await import(
 			"../../../clients/file-utils.js"
@@ -362,14 +364,13 @@ describe("lsp server policy", () => {
 
 		const spawned = await CSharpServer.spawn(tmp, { allowInstall: false });
 		expect(spawned).toBeUndefined();
-		expect(launchLSP).toHaveBeenCalled();
 		const commands = launchLSP.mock.calls.map((call) => String(call[0] ?? ""));
 		// Asserts against the actual machine-global root (respects #525's
 		// PI_LENS_HOME test override) rather than hardcoding ".pi-lens".
 		const managedBinDir = path.join(getGlobalPiLensDir(), "bin", "csharp-ls");
 		expect(
 			commands.some((command) => command.includes(managedBinDir)),
-		).toBe(true);
+		).toBe(false);
 	});
 
 	it("falls back to file directory for standalone cpp/zig/elixir/gleam files", async () => {
@@ -724,6 +725,22 @@ describe("lsp server policy", () => {
 		expect(spawned).toBeUndefined();
 	});
 
+	it("does not launch an unavailable interactive server command", async () => {
+		const { JavaServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-jdtls-missing-"));
+		dirs.push(tmp);
+		const savedPath = process.env.PATH;
+		try {
+			process.env.PATH = "";
+			const spawned = await JavaServer.spawn(tmp);
+			expect(spawned).toBeUndefined();
+			expect(launchLSP).not.toHaveBeenCalled();
+		} finally {
+			if (savedPath === undefined) delete process.env.PATH;
+			else process.env.PATH = savedPath;
+		}
+	});
+
 	it("skips PowerShell bash-language-server shim candidates on Windows", async () => {
 		const { BashServer } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(
@@ -735,7 +752,6 @@ describe("lsp server policy", () => {
 
 		const spawned = await BashServer.spawn(tmp, { allowInstall: false });
 		expect(spawned).toBeUndefined();
-		expect(launchLSP).toHaveBeenCalled();
 		const commands = launchLSP.mock.calls.map((call) => String(call[0] ?? ""));
 		expect(commands.some((command) => command.endsWith(".ps1"))).toBe(false);
 	});
@@ -864,6 +880,8 @@ describe("lsp server policy", () => {
 		dirs.push(tmp);
 
 		ensureTool.mockResolvedValue(path.join(tmp, "tools", "pyright.cmd"));
+		fs.mkdirSync(path.join(tmp, "tools"), { recursive: true });
+		fs.writeFileSync(path.join(tmp, "tools", "pyright-langserver"), "");
 		launchLSP.mockImplementation(async (command: string) => {
 			if (command.includes(path.join("tools", "pyright-langserver"))) {
 				return {
@@ -900,6 +918,8 @@ describe("lsp server policy", () => {
 		const { PythonServer } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ty-lsp-"));
 		dirs.push(tmp);
+		fs.writeFileSync(path.join(tmp, "ty"), "");
+		getToolEnvironment.mockResolvedValue({ PATH: tmp });
 
 		launchLSP.mockImplementation(async (command: string, args: string[]) => {
 			if (command === "ty" && args?.[0] === "server") {
@@ -937,9 +957,17 @@ describe("lsp server policy", () => {
 			path.join(os.tmpdir(), "pi-lens-pyright-over-ty-"),
 		);
 		dirs.push(tmp);
+		const localPyright = path.join(
+			tmp,
+			"node_modules",
+			".bin",
+			"pyright-langserver",
+		);
+		fs.mkdirSync(path.dirname(localPyright), { recursive: true });
+		fs.writeFileSync(localPyright, "");
 
 		launchLSP.mockImplementation(async (command: string) => {
-			if (command === "pyright-langserver") {
+			if (command.endsWith("pyright-langserver")) {
 				return {
 					process: { killed: false } as never,
 					stdin: {} as never,
@@ -1008,6 +1036,9 @@ describe("lsp server policy", () => {
 		const { KotlinServer } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-kotlin-cli-"));
 		dirs.push(tmp);
+		fs.writeFileSync(path.join(tmp, "kotlin-lsp"), "");
+		const savedPath = process.env.PATH;
+		process.env.PATH = `${tmp}${path.delimiter}${savedPath ?? ""}`;
 
 		launchLSP.mockImplementation(async (command: string) => {
 			if (command === "kotlin-lsp") {
@@ -1022,9 +1053,14 @@ describe("lsp server policy", () => {
 			throw toolNotFound(`unexpected command: ${command}`);
 		});
 
-		const spawned = await KotlinServer.spawn(tmp, { allowInstall: true });
-		expect(spawned).toBeDefined();
-		expect(launchLSP.mock.calls[0]?.[0]).toBe("kotlin-lsp");
+		try {
+			const spawned = await KotlinServer.spawn(tmp, { allowInstall: true });
+			expect(spawned).toBeDefined();
+			expect(launchLSP.mock.calls[0]?.[0]).toBe("kotlin-lsp");
+		} finally {
+			if (savedPath === undefined) delete process.env.PATH;
+			else process.env.PATH = savedPath;
+		}
 	});
 
 	it("launches zls from managed install when direct command is unavailable", async () => {
@@ -1239,11 +1275,14 @@ describe("lsp server policy", () => {
 				: path.join(tmp, ".venv", "bin", "python");
 		fs.mkdirSync(path.dirname(pythonPath), { recursive: true });
 		fs.writeFileSync(pythonPath, "#!/usr/bin/env python\n");
+		fs.writeFileSync(path.join(tmp, "jedi-language-server"), "");
 
 		const origVENV = process.env.VIRTUAL_ENV;
 		const origCONDA = process.env.CONDA_PREFIX;
+		const origPath = process.env.PATH;
 		delete process.env.VIRTUAL_ENV;
 		delete process.env.CONDA_PREFIX;
+		process.env.PATH = `${tmp}${path.delimiter}${origPath ?? ""}`;
 
 		launchLSP.mockResolvedValue({
 			process: { killed: false } as never,
@@ -1262,6 +1301,8 @@ describe("lsp server policy", () => {
 		} finally {
 			if (origVENV !== undefined) process.env.VIRTUAL_ENV = origVENV;
 			if (origCONDA !== undefined) process.env.CONDA_PREFIX = origCONDA;
+			if (origPath === undefined) delete process.env.PATH;
+			else process.env.PATH = origPath;
 		}
 	});
 
