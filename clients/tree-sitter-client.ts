@@ -3000,13 +3000,25 @@ export class TreeSitterClient {
 			if (reference.type !== "identifier" || reference.text !== receiver.text) continue;
 			if (declaredName && sameNode(reference, declaredName)) continue;
 			const member = reference.parent;
+			const method = member?.childForFieldName?.("property")?.text ?? "";
+			const call = member?.parent;
 			if (
 				member?.type !== "member_expression" ||
 				!sameNode(member.childForFieldName?.("object"), reference) ||
-				!allowedMethods.has(member.childForFieldName?.("property")?.text ?? "") ||
-				member.parent?.type !== "call_expression" ||
-				!sameNode(member.parent.childForFieldName?.("function"), member)
+				!allowedMethods.has(method) ||
+				call?.type !== "call_expression" ||
+				!sameNode(call.childForFieldName?.("function"), member)
 			) return false;
+			if (["set", "add"].includes(method) && call.parent?.type !== "expression_statement") return false;
+			if (["entries", "keys", "values"].includes(method)) {
+				const consumer = call.parent;
+				if (consumer?.type === "spread_element") continue;
+				if (
+					consumer?.type === "for_in_statement" &&
+					sameNode(consumer.childForFieldName?.("right"), call)
+				) continue;
+				return false;
+			}
 		}
 		return true;
 	}

@@ -121,6 +121,30 @@ describe("SSRF native Map and Set receiver provenance", () => {
 			`const cache = new Map(); cache.get = request.get; cache.get(buildKey());`,
 		],
 		[
+			"Map.set result escape",
+			`const cache = new Map(); consume(cache.set("key", "value")); cache.get(buildKey(request));`,
+		],
+		[
+			"Map.set chained receiver override",
+			`const cache = new Map(); cache.set("key", "value").get = request.get; cache.get(buildKey(request));`,
+		],
+		[
+			"Set.add result escape",
+			`const cache = new Set(); consume(cache.add("key")); cache.delete(buildKey(request));`,
+		],
+		[
+			"Set.add chained receiver override",
+			`const cache = new Set(); cache.add("key").delete = request.delete; cache.delete(buildKey(request));`,
+		],
+		[
+			"iterator result escape",
+			`const cache = new Map(); const entries = cache.entries(); consume(entries); cache.get(buildKey(request));`,
+		],
+		[
+			"iterator prototype access",
+			`const cache = new Map(); Object.getPrototypeOf(cache.entries()).next = request.next; cache.get(buildKey(request));`,
+		],
+		[
 			"escaped receiver",
 			`const cache = new Map(); mutate(cache); cache.get(buildKey());`,
 		],
