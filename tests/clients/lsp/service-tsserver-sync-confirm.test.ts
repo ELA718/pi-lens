@@ -26,6 +26,9 @@
  *   d. dirty-file sync winner — findings surfaced, not discarded
  */
 
+import * as os from "node:os";
+import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // --- Module-level mocks set up BEFORE any imports of the tested module ---
@@ -63,7 +66,15 @@ vi.mock("../../../clients/cascade-logger.js", () => ({
 // Helpers
 // ---------------------------------------------------------------------------
 
-const FILE = "C:/repo/main.ts";
+const FILE = path.join(os.tmpdir(), "repo", "main.ts");
+const SNAPSHOT = {
+	clientInstanceId: "client-1",
+	filePath: FILE,
+	uri: pathToFileURL(FILE).href,
+	documentGeneration: 3,
+	version: 7,
+	contentHash: "current-content-sha256",
+};
 
 function makeFakeProcess() {
 	return {
@@ -104,6 +115,7 @@ function makeSyncResponse(
 	>,
 ) {
 	// The CLIENT's executeCommand is called as executeCommand(command, args)
+	let requestSeq = 20;
 	// (the service layer strips the filePath before forwarding to the client).
 	return vi
 		.fn()
@@ -116,6 +128,10 @@ function makeSyncResponse(
 			return {
 				executed: true,
 				result: {
+					seq: 0,
+					type: "response",
+					command: sub,
+					request_seq: requestSeq++,
 					success: true,
 					body: bodies[sub] ?? [],
 				},
@@ -138,6 +154,7 @@ function makeClient(overrides: Record<string, unknown> = {}) {
 		}),
 		getOperationSupport: () => ({}),
 		getAdvertisedCommands: () => ["typescript.tsserverRequest"],
+		getDocumentSnapshot: () => SNAPSHOT,
 		getLaunchVariant: () => undefined, // classic (not native-ts7)
 		getRawCapabilityKeys: () => [],
 		diagnosticsVersion: 0,
@@ -168,6 +185,46 @@ describe("#707 per-edit tsserver sync clean-confirm in touchFile", () => {
 	afterEach(() => {
 		delete process.env.PI_LENS_TSSERVER_SYNC_GRACE_MS;
 		vi.restoreAllMocks();
+	});
+
+	it("keeps the original version when sweep pre-open repeats identical content", async () => {
+		const { handleNotifyOpen } = await vi.importActual<
+			typeof import("../../../clients/lsp/client.js")
+		>("../../../clients/lsp/client.js");
+		const sendNotification = vi.fn();
+		const content = "const x = 1;\n";
+		const state = {
+			isConnected: true,
+			isDestroyed: false,
+			lspProcess: { process: { killed: false } },
+			serverId: "typescript",
+			launchVariant: "classic",
+			connection: { sendNotification },
+			openDocuments: new Set([FILE]),
+			pendingOpens: new Set(),
+			openDocumentUris: new Map([[FILE, SNAPSHOT.uri]]),
+			documentVersions: new Map([[FILE, 7]]),
+			documentContentHashes: new Map([
+				[
+					FILE,
+					{
+						version: 7,
+						hash: await import("node:crypto").then(({ createHash }) =>
+							createHash("sha256").update(content).digest("hex"),
+						),
+					},
+				],
+			]),
+		} as never;
+
+		await handleNotifyOpen(state, FILE, content, "typescript");
+
+		expect(sendNotification).not.toHaveBeenCalled();
+		expect(
+			(state as { documentVersions: Map<string, number> }).documentVersions.get(
+				FILE,
+			),
+		).toBe(7);
 	});
 
 	it("clean TS file: sync returns empty body → confirmed clean, inconclusive=false", async () => {
@@ -223,16 +280,220 @@ describe("#707 per-edit tsserver sync clean-confirm in touchFile", () => {
 
 		expect(result).toBeDefined();
 		expect(result!.diags.length).toBe(1);
-		expect(result!.diags[0]?.message).toContain("not assignable to type 'string'");
+		expect(result!.diags[0]?.message).toContain(
+			"not assignable to type 'string'",
+		);
 		expect(result?.inconclusive).toBeFalsy();
 		// #1179 shape-5: on the REAL producer result, `binding` is an enumerable OWN
 		// wrapper field (a sync-confirmed touch composes {boundToCurrentDisk}), so it
 		// survives a copy of the result — it would be dropped if it were still the
 		// pre-#1179 non-enumerable array side-channel with a spread intervening (#1096).
-		expect(
-			Object.prototype.propertyIsEnumerable.call(result, "binding"),
-		).toBe(true);
+		expect(Object.prototype.propertyIsEnumerable.call(result, "binding")).toBe(
+			true,
+		);
 		expect({ ...result! }.binding?.boundToCurrentDisk).toBeDefined();
+		expect(result?.binding).toMatchObject({
+			version: SNAPSHOT.version,
+			contentHash: SNAPSHOT.contentHash,
+		});
+	});
+
+	it("rejects an ABA document change across the two native sync responses", async () => {
+		const changed = { ...SNAPSHOT, version: 9 };
+		const snapshots = [
+			SNAPSHOT,
+			{ ...SNAPSHOT, version: 8, contentHash: "temporary-content" },
+			changed,
+		];
+		const client = makeClient({
+			executeCommand: makeSyncResponse({}),
+			getDocumentSnapshot: vi.fn(() => snapshots.shift() ?? changed),
+		});
+		createLSPClient.mockResolvedValue(client);
+		getServersForFileWithConfig.mockReturnValue([makeServer("typescript")]);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const result = await new LSPService().touchFile(FILE, "const x = 1;\n", {
+			clientScope: "primary",
+			diagnostics: "document",
+			collectDiagnostics: true,
+			maxDiagnosticsWaitMs: 1,
+		});
+
+		expect(result?.inconclusive).toBe(true);
+		expect(result?.binding?.contentHash).toBeUndefined();
+	});
+
+	it.each([
+		["malformed", [{ message: "missing category" }]],
+		[
+			"mixed valid and malformed",
+			[
+				{ message: "real error", category: "error", code: 2322 },
+				{ category: "error" },
+			],
+		],
+	])(
+		"does not convert a %s nonempty body into confirmed clean",
+		async (_name, body) => {
+			const client = makeClient({
+				executeCommand: makeSyncResponse({ semanticDiagnosticsSync: body }),
+			});
+			createLSPClient.mockResolvedValue(client);
+			getServersForFileWithConfig.mockReturnValue([makeServer("typescript")]);
+
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const result = await new LSPService().touchFile(FILE, "const x = 1;\n", {
+				clientScope: "primary",
+				diagnostics: "document",
+				collectDiagnostics: true,
+				maxDiagnosticsWaitMs: 1,
+			});
+
+			expect(result?.inconclusive).toBe(true);
+		},
+	);
+
+	it.each([
+		["close/reopen", { ...SNAPSHOT, documentGeneration: 4 }],
+		["client replacement", { ...SNAPSHOT, clientInstanceId: "client-2" }],
+	])("rejects %s across native sync responses", async (_name, replacement) => {
+		let snapshotCall = 0;
+		let requestSeq = 40;
+		const { attemptTsserverSyncConfirmation } = await import(
+			"../../../clients/lsp/tsserver-sync.js"
+		);
+		const result = await attemptTsserverSyncConfirmation(FILE, {
+			getAdvertisedCommands: async () => ["typescript.tsserverRequest"],
+			getDocumentSnapshot: async () =>
+				snapshotCall++ === 0 ? SNAPSHOT : replacement,
+			executeCommand: async (_file, _outer, args) => {
+				const command = (args as [string])[0];
+				return {
+					executed: true,
+					result: {
+						seq: 0,
+						type: "response",
+						command,
+						request_seq: requestSeq++,
+						success: true,
+						body: [],
+					},
+				};
+			},
+		});
+
+		expect(result).toBeUndefined();
+	});
+
+	it.each([
+		[
+			"wrong response command",
+			{ command: "syntacticDiagnosticsSync", requestSeqs: [20, 21] },
+		],
+		[
+			"non-increasing request sequence",
+			{ command: undefined, requestSeqs: [20, 20] },
+		],
+	])("rejects %s", async (_name, corruption) => {
+		let call = 0;
+		const executeCommand = vi.fn(async (_outer: string, args: unknown[]) => {
+			const requested = (args as [string])[0];
+			return {
+				executed: true,
+				result: {
+					seq: 0,
+					type: "response",
+					command: corruption.command ?? requested,
+					request_seq: corruption.requestSeqs[call++],
+					success: true,
+					body: [],
+				},
+			};
+		});
+		const client = makeClient({ executeCommand });
+		createLSPClient.mockResolvedValue(client);
+		getServersForFileWithConfig.mockReturnValue([makeServer("typescript")]);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const result = await new LSPService().touchFile(FILE, "const x = 1;\n", {
+			clientScope: "primary",
+			diagnostics: "document",
+			collectDiagnostics: true,
+			maxDiagnosticsWaitMs: 1,
+		});
+
+		expect(result?.inconclusive).toBe(true);
+	});
+
+	it("rejects a sync response when the selected document URI does not match", async () => {
+		const client = makeClient({
+			executeCommand: makeSyncResponse({}),
+			getDocumentSnapshot: () => ({
+				...SNAPSHOT,
+				uri: pathToFileURL(path.join(os.tmpdir(), "repo", "other.ts")).href,
+			}),
+		});
+		createLSPClient.mockResolvedValue(client);
+		getServersForFileWithConfig.mockReturnValue([makeServer("typescript")]);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const result = await new LSPService().touchFile(FILE, "const x = 1;\n", {
+			clientScope: "primary",
+			diagnostics: "document",
+			collectDiagnostics: true,
+			maxDiagnosticsWaitMs: 1,
+		});
+
+		expect(result?.inconclusive).toBe(true);
+	});
+
+	it("keeps all-scope auxiliary timeout unconfirmed while primary scope can confirm", async () => {
+		const primary = makeClient({
+			executeCommand: makeSyncResponse({}),
+			waitForDiagnostics: vi.fn(
+				(_file: string, ms: number) =>
+					new Promise((resolve) => setTimeout(resolve, ms)),
+			),
+		});
+		const auxiliary = makeClient({
+			serverId: "ast-grep",
+			getAdvertisedCommands: () => [],
+			waitForDiagnostics: vi.fn(
+				(_file: string, ms: number) =>
+					new Promise((resolve) => setTimeout(resolve, ms)),
+			),
+		});
+		createLSPClient.mockImplementation(
+			async ({ serverId }: { serverId: string }) =>
+				serverId === "typescript" ? primary : auxiliary,
+		);
+		getServersForFileWithConfig.mockReturnValue([
+			makeServer("typescript"),
+			makeServer("ast-grep", [".ts"], "auxiliary"),
+		]);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const all = await service.touchFile(FILE, "const x = 1;\n", {
+			clientScope: "all",
+			diagnostics: "document",
+			collectDiagnostics: true,
+			maxDiagnosticsWaitMs: 1,
+		});
+		const primaryOnly = await service.touchFile(FILE, "const x = 1;\n", {
+			clientScope: "primary",
+			diagnostics: "document",
+			collectDiagnostics: true,
+			maxDiagnosticsWaitMs: 1,
+		});
+
+		expect(all?.inconclusive).toBe(true);
+		expect(primaryOnly?.confirmation).toBe("confirmed");
+		expect(primaryOnly?.binding).toMatchObject({
+			version: SNAPSHOT.version,
+			contentHash: SNAPSHOT.contentHash,
+		});
 	});
 
 	it("non-typescript server (gopls): sync is never attempted", async () => {
@@ -273,7 +534,10 @@ describe("#707 per-edit tsserver sync clean-confirm in touchFile", () => {
 		const diag = {
 			severity: 1 as const,
 			message: "error from push",
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 5 },
+			},
 		};
 		const client = makeClient({
 			executeCommand,

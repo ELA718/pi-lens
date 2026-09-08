@@ -57,6 +57,7 @@ import { WatchedFilesQueue } from "./watch-queue.js";
 // diagnose the clean-file affirmative-signal question (#240): which servers
 // publish an empty-with-version set on a clean scan vs go silent.
 const PUB_DEBUG = Boolean(process.env.PILENS_PUB_DEBUG);
+let nextClientInstanceId = 0;
 
 /**
  * #472/#449: extract a per-spawn-unique "marker" from an LSP server's resolved
@@ -236,6 +237,15 @@ export interface LSPCallHierarchyOutgoingCall {
 	fromRanges: LSPLocation["range"][];
 }
 
+export interface LSPDocumentSnapshot {
+	clientInstanceId: string;
+	filePath: string;
+	uri: string;
+	documentGeneration: number;
+	version: number;
+	contentHash: string;
+}
+
 export interface LSPClientInfo {
 	serverId: string;
 	root: string;
@@ -300,6 +310,8 @@ export interface LSPClientInfo {
 	 * the binding as "unknown", i.e. pre-#1095 behavior).
 	 */
 	getDiagnosticBinding(filePath: string): StoredDiagnosticBinding | undefined;
+	/** Exact sent document state used to correlate synchronous server replies. */
+	getDocumentSnapshot?(filePath: string): LSPDocumentSnapshot | undefined;
 	/** Position encoding used by this server's diagnostic ranges. */
 	getPositionEncoding?(): PositionEncoding;
 	/** Monotonic counter bumped when fresh diagnostics are stored for this client. */
@@ -685,6 +697,10 @@ export interface LSPClientState {
 	readonly documentOpenedAt: Map<string, number>;
 	readonly diagnosticEmitter: EventEmitter;
 	diagnosticsVersion: number;
+	/** Optional only so lightweight test states predating this proof remain valid. */
+	readonly clientInstanceId?: string;
+	documentGenerationCounter?: number;
+	readonly documentGenerations?: Map<string, number>;
 	readonly documentVersions: Map<string, number>;
 	/** The LSP document version (`publishDiagnostics.version`) the cached
 	 *  diagnostics for a path were computed against. Only set when the server
@@ -2052,6 +2068,17 @@ export async function handleNotifyOpen(
 		state.openDocuments.has(normalizedPath) ||
 		state.pendingOpens.has(normalizedPath)
 	) {
+		const sent = state.documentContentHashes.get(normalizedPath);
+		if (
+			state.openDocuments.has(normalizedPath) &&
+			sent?.hash === hashDiagnosticContent(content) &&
+			!getStrategy(state.serverId, state.launchVariant).reopenOnResync
+		) {
+			// A sweep pre-open repeats these exact bytes. A no-op didChange would
+			// advance the client version while classic TypeScript's clean push stays
+			// versionless, breaking the first-open version/hash correlation.
+			return;
+		}
 		const version = (state.documentVersions.get(normalizedPath) ?? 0) + 1;
 		state.documentVersions.set(normalizedPath, version);
 		// preserveDiagnostics: skip cache clear for format-only resyncs so
@@ -2086,6 +2113,12 @@ export async function handleNotifyOpen(
 			// late echo strictly older → dropped by isSupersededPush → never bound.
 			state.documentVersions.set(normalizedPath, version);
 			state.documentOpenedAt.set(normalizedPath, Date.now());
+			state.documentGenerationCounter =
+				(state.documentGenerationCounter ?? 0) + 1;
+			state.documentGenerations?.set(
+				normalizedPath,
+				state.documentGenerationCounter,
+			);
 			state.diagnosticPublicationCounts.set(normalizedPath, 0);
 			if (!isClientAlive(state)) return;
 			await safeSendNotification(state.connection, "textDocument/didOpen", {
@@ -2106,6 +2139,11 @@ export async function handleNotifyOpen(
 
 	state.pendingOpens.add(normalizedPath);
 	state.documentVersions.set(normalizedPath, 0);
+	state.documentGenerationCounter = (state.documentGenerationCounter ?? 0) + 1;
+	state.documentGenerations?.set(
+		normalizedPath,
+		state.documentGenerationCounter,
+	);
 	state.documentOpenedAt.set(normalizedPath, Date.now());
 	state.diagnosticPublicationCounts.set(normalizedPath, 0);
 	clearDiagnosticsForPath(state, normalizedPath); // always clear for initial open
@@ -2726,6 +2764,9 @@ export async function createLSPClient(options: {
 		documentOpenedAt: new Map(),
 		diagnosticEmitter,
 		diagnosticsVersion: 0,
+		clientInstanceId: `${process.pid}:${serverId}:${++nextClientInstanceId}`,
+		documentGenerationCounter: 0,
+		documentGenerations: new Map(),
 		documentVersions: new Map(),
 		diagnosticDocVersions: new Map(),
 		documentContentHashes: new Map(),
@@ -2930,6 +2971,27 @@ export async function createLSPClient(options: {
 
 		getDiagnosticBinding(filePath) {
 			return state.diagnosticBindings.get(normalizeMapKey(filePath));
+		},
+
+		getDocumentSnapshot(filePath) {
+			const normalizedPath = normalizeMapKey(filePath);
+			const sent = state.documentContentHashes.get(normalizedPath);
+			if (
+				!sent ||
+				(!state.openDocuments.has(normalizedPath) &&
+					!state.pendingOpens.has(normalizedPath))
+			) return undefined;
+			return {
+				clientInstanceId: state.clientInstanceId ?? "",
+				filePath: normalizedPath,
+				uri:
+					state.openDocumentUris?.get(normalizedPath) ??
+					pathToFileURL(filePath).href,
+				documentGeneration:
+					state.documentGenerations?.get(normalizedPath) ?? 0,
+				version: sent.version,
+				contentHash: sent.hash,
+			};
 		},
 
 		getPositionEncoding() {

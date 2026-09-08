@@ -7,8 +7,9 @@
  * These are a genuine synchronous request/response tsserver protocol extension
  * exposed via `workspace/executeCommand` with command
  * `typescript.tsserverRequest`. Unlike the push-only LSP surface, calling them
- * gives a definitive answer: empty array = confirmed clean, non-empty = real
- * diagnostics the server had computed but never published on the push surface.
+ * gives a definitive answer only while both responses stay correlated to one
+ * client/document generation and sent version/hash. Empty bodies then mean
+ * confirmed clean; non-empty bodies are real diagnostics.
  *
  * Empirically verified live (2026-07, typescript-language-server 5.9.3, this
  * repo's own tsconfig.json as the fixture project):
@@ -33,7 +34,8 @@
  * fall back to existing unconfirmed/timed-out behavior".
  */
 
-import type { LSPDiagnostic } from "./client.js";
+import type { LSPDiagnostic, LSPDocumentSnapshot } from "./client.js";
+import { normalizeMapKey, uriToPath } from "../path-utils.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -51,11 +53,33 @@ export interface TsserverSyncRawDiagnostic {
  * the full LSPService class and keeps the extracted module test-friendly. */
 export interface TsserverSyncCapableService {
 	getAdvertisedCommands?: (filePath?: string) => Promise<string[]>;
+	getDocumentSnapshot?: (
+		filePath: string,
+	) => Promise<LSPDocumentSnapshot | undefined>;
 	executeCommand?: (
 		filePath: string | undefined,
 		command: string,
 		args?: unknown[],
 	) => Promise<{ executed: boolean; result?: unknown; reason?: string }>;
+}
+
+export interface TsserverSyncCommandReceipt {
+	command: "semanticDiagnosticsSync" | "syntacticDiagnosticsSync";
+	requestSeq: number;
+	diagnostics: TsserverSyncRawDiagnostic[];
+}
+
+export interface TsserverSyncConfirmation {
+	diagnostics: LSPDiagnostic[];
+	binding: { version: number; contentHash: string };
+	attribution: {
+		clientInstanceId: string;
+		filePath: string;
+		uri: string;
+		documentGeneration: number;
+		semanticRequestSeq: number;
+		syntacticRequestSeq: number;
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -120,17 +144,17 @@ export function tsserverSyncDiagnosticToLsp(
 }
 
 /**
- * Run a single tsserver sync diagnostic command via the LSP service's
- * `executeCommand`. Returns the raw diagnostic array from the response body,
- * or `undefined` if: the service has no `executeCommand`, the command wasn't
- * executed, the response envelope isn't `{success:true, body:[...]}`, or
- * any error is thrown.
+ * The awaited executeCommand promise is the primary attribution: JSON-RPC
+ * correlates the outer response to this call, and typescript-language-server
+ * correlates its inner tsserver response by request sequence. Command and
+ * sequence checks below validate that transport result; they do not replace it.
+ * A malformed body stays unavailable instead of being filtered into false clean.
  */
 export async function runTsserverSyncCommand(
 	svc: TsserverSyncCapableService,
 	file: string,
 	command: "semanticDiagnosticsSync" | "syntacticDiagnosticsSync",
-): Promise<TsserverSyncRawDiagnostic[] | undefined> {
+): Promise<TsserverSyncCommandReceipt | undefined> {
 	if (typeof svc.executeCommand !== "function") return undefined;
 	const outcome = await svc.executeCommand(file, TSSERVER_REQUEST_COMMAND, [
 		command,
@@ -138,12 +162,48 @@ export async function runTsserverSyncCommand(
 	]);
 	if (!outcome.executed) return undefined;
 	const result = outcome.result as
-		| { success?: boolean; body?: unknown }
+		| {
+				type?: unknown;
+				command?: unknown;
+				request_seq?: unknown;
+				success?: boolean;
+				body?: unknown;
+		  }
 		| undefined;
-	if (!result || result.success !== true || !Array.isArray(result.body)) {
-		return undefined;
-	}
-	return result.body.filter(isTsserverSyncRawDiagnostic);
+	if (
+		!result ||
+		result.type !== "response" ||
+		result.command !== command ||
+		!Number.isInteger(result.request_seq) ||
+		(result.request_seq as number) < 0 ||
+		result.success !== true ||
+		!Array.isArray(result.body) ||
+		!result.body.every(isTsserverSyncRawDiagnostic)
+	) return undefined;
+	return {
+		command,
+		requestSeq: result.request_seq as number,
+		diagnostics: result.body,
+	};
+}
+
+function snapshotsMatch(
+	file: string,
+	left: LSPDocumentSnapshot | undefined,
+	right: LSPDocumentSnapshot | undefined,
+): left is LSPDocumentSnapshot {
+	if (!left || !right) return false;
+	const expected = normalizeMapKey(file);
+	return (
+		normalizeMapKey(left.filePath) === expected &&
+		normalizeMapKey(uriToPath(left.uri)) === expected &&
+		left.clientInstanceId === right.clientInstanceId &&
+		left.filePath === right.filePath &&
+		left.uri === right.uri &&
+		left.documentGeneration === right.documentGeneration &&
+		left.version === right.version &&
+		left.contentHash === right.contentHash
+	);
 }
 
 /**
@@ -164,29 +224,69 @@ export async function runTsserverSyncCommand(
  * Every one of these must fall through to the existing "unconfirmed" behavior
  * in the caller.
  *
- * `confirmed: true` with an empty `diagnostics` array = genuinely confirmed
- * clean. `confirmed: true` with a non-empty array = real diagnostics the
- * server had computed but never published (silentOnClean) — these must be
- * surfaced to the caller, not discarded. `confirmed: false` = sync path
- * unavailable, fall through to existing behavior.
+ * Empty diagnostics are confirmed clean only when the client identity, file URI,
+ * document generation, sent version/hash, response commands, and increasing
+ * inner request sequence remain stable across both awaited responses. Any drift
+ * returns undefined and preserves the caller's unconfirmed result.
  */
+export async function attemptTsserverSyncConfirmation(
+	file: string,
+	svc: TsserverSyncCapableService,
+): Promise<TsserverSyncConfirmation | undefined> {
+	try {
+		if (
+			typeof svc.getAdvertisedCommands !== "function" ||
+			typeof svc.getDocumentSnapshot !== "function"
+		) return undefined;
+		const advertised = await svc.getAdvertisedCommands(file);
+		if (!advertised.includes(TSSERVER_REQUEST_COMMAND)) return undefined;
+
+		const before = await svc.getDocumentSnapshot(file);
+		const semantic = await runTsserverSyncCommand(
+			svc,
+			file,
+			"semanticDiagnosticsSync",
+		);
+		const afterSemantic = await svc.getDocumentSnapshot(file);
+		const syntactic = await runTsserverSyncCommand(
+			svc,
+			file,
+			"syntacticDiagnosticsSync",
+		);
+		const afterSyntactic = await svc.getDocumentSnapshot(file);
+		if (semantic === undefined || syntactic === undefined) return undefined;
+		if (
+			!snapshotsMatch(file, before, afterSemantic) ||
+			!snapshotsMatch(file, before, afterSyntactic) ||
+			syntactic.requestSeq <= semantic.requestSeq
+		) return undefined;
+
+		return {
+			diagnostics: [
+				...syntactic.diagnostics,
+				...semantic.diagnostics,
+			].map(tsserverSyncDiagnosticToLsp),
+			binding: {
+				version: before.version,
+				contentHash: before.contentHash,
+			},
+			attribution: {
+				clientInstanceId: before.clientInstanceId,
+				filePath: before.filePath,
+				uri: before.uri,
+				documentGeneration: before.documentGeneration,
+				semanticRequestSeq: semantic.requestSeq,
+				syntacticRequestSeq: syntactic.requestSeq,
+			},
+		};
+	} catch {
+		return undefined;
+	}
+}
+
 export async function attemptTsserverSyncDiagnostics(
 	file: string,
 	svc: TsserverSyncCapableService,
 ): Promise<LSPDiagnostic[] | undefined> {
-	try {
-		if (typeof svc.getAdvertisedCommands !== "function") return undefined;
-		const advertised = await svc.getAdvertisedCommands(file);
-		if (!advertised.includes(TSSERVER_REQUEST_COMMAND)) return undefined;
-
-		const [semantic, syntactic] = await Promise.all([
-			runTsserverSyncCommand(svc, file, "semanticDiagnosticsSync"),
-			runTsserverSyncCommand(svc, file, "syntacticDiagnosticsSync"),
-		]);
-		if (semantic === undefined || syntactic === undefined) return undefined;
-
-		return [...syntactic, ...semantic].map(tsserverSyncDiagnosticToLsp);
-	} catch {
-		return undefined;
-	}
+	return (await attemptTsserverSyncConfirmation(file, svc))?.diagnostics;
 }
