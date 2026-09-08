@@ -1,5 +1,54 @@
-import { describe, expect, it } from "vitest";
-import { parseOpengrepReport } from "../../clients/opengrep-client.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	OpengrepClient,
+	parseOpengrepReport,
+} from "../../clients/opengrep-client.js";
+import { removeTempDirSync } from "./test-utils.js";
+
+const spawnMocks = vi.hoisted(() => ({ safeSpawnAsync: vi.fn() }));
+vi.mock("../../clients/safe-spawn.js", () => spawnMocks);
+
+let scanRoot: string;
+
+beforeEach(() => {
+	scanRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-opengrep-test-"));
+	spawnMocks.safeSpawnAsync.mockReset();
+});
+
+afterEach(() => removeTempDirSync(scanRoot));
+
+function reportPathFromArgs(args: string[]): string {
+	return args[args.indexOf("--json-output") + 1];
+}
+
+function mockNativeRun(
+	report: unknown | undefined,
+	result: {
+		status: number | null;
+		stdout?: string;
+		stderr?: string;
+		error?: Error;
+		failure?: string;
+	},
+): void {
+	spawnMocks.safeSpawnAsync.mockImplementation(
+		async (_bin: string, args: string[]) => {
+			if (report !== undefined) {
+				fs.writeFileSync(reportPathFromArgs(args), JSON.stringify(report));
+			}
+			return { stdout: "", stderr: "", ...result };
+		},
+	);
+}
+
+async function scan(): Promise<Awaited<ReturnType<OpengrepClient["scan"]>>> {
+	const client = new OpengrepClient();
+	vi.spyOn(client, "ensureAvailable").mockResolvedValue(true);
+	return client.scan(scanRoot);
+}
 
 /**
  * #591 review: opengrep's LSP mode does NOT honor `// nosemgrep` natively
@@ -174,5 +223,241 @@ describe("parseOpengrepReport (#584)", () => {
 		});
 		const findings = parseOpengrepReport(raw);
 		expect(findings[0]).toMatchObject({ endLine: 5, endCol: 1, startCol: 3 });
+	});
+});
+
+describe("OpengrepClient native scan receipts", () => {
+	it("keeps findings and partial-parser evidence from a valid exit-zero report", async () => {
+		mockNativeRun(
+			{
+				results: [
+					{
+						check_id: "rule-a",
+						path: "a.ts",
+						start: { line: 2 },
+						extra: { severity: "WARNING" },
+					},
+				],
+				errors: [
+					{
+						level: "warn",
+						type: ["PartialParsing", []],
+						message: "Syntax error at a.ts:4",
+						path: "a.ts",
+						spans: [{ start: { line: 4 } }],
+					},
+				],
+				paths: { scanned: ["a.ts", "b.ts"] },
+			},
+			{ status: 0 },
+		);
+
+		const result = (await scan()) as unknown as Record<string, unknown>;
+		expect(result).toMatchObject({
+			success: true,
+			reportIntegrity: "partial",
+			exitCode: 0,
+			scannedPathCount: 2,
+		});
+		expect(result.findings).toHaveLength(1);
+		expect(result.reportErrors).toEqual([
+			expect.objectContaining({
+				type: "PartialParsing",
+				level: "warn",
+				path: "a.ts",
+				line: 4,
+			}),
+		]);
+		expect(result.summary).toBe("opengrep report is partial; 1 report error(s)");
+	});
+
+	it("keeps a valid report but marks a nonzero native exit as failed", async () => {
+		mockNativeRun(
+			{
+				results: [
+					{
+						check_id: "rule-a",
+						path: "a.ts",
+						start: { line: 2 },
+						extra: { severity: "WARNING" },
+					},
+				],
+				errors: [],
+				paths: { scanned: ["a.ts"] },
+			},
+			{ status: 2, stderr: "native failure" },
+		);
+
+		const result = (await scan()) as unknown as Record<string, unknown>;
+		expect(result).toMatchObject({
+			success: false,
+			reportIntegrity: "partial",
+			exitCode: 2,
+		});
+		expect(result.findings).toHaveLength(1);
+		expect(result.summary).toMatch(/exit 2.*native failure/);
+	});
+
+	it("keeps a report written before an interrupted native scan", async () => {
+		mockNativeRun(
+			{
+				results: [
+					{
+						check_id: "rule-a",
+						path: "a.ts",
+						start: { line: 2 },
+						extra: { severity: "WARNING" },
+					},
+				],
+				errors: [],
+				paths: { scanned: ["a.ts"] },
+			},
+			{
+				status: null,
+				error: new Error("Spawn aborted"),
+				failure: "aborted",
+			},
+		);
+
+		const result = (await scan()) as unknown as Record<string, unknown>;
+		expect(result).toMatchObject({
+			success: false,
+			reportIntegrity: "partial",
+			exitCode: null,
+			processFailure: "aborted",
+		});
+		expect(result.findings).toHaveLength(1);
+	});
+
+	it("keeps findings but marks missing and unknown native severities partial", async () => {
+		mockNativeRun(
+			{
+				results: [
+					{
+						check_id: "missing-severity",
+						path: "a.ts",
+						start: { line: 2 },
+						extra: { severity: null },
+					},
+					{
+						check_id: "unknown-severity",
+						path: "b.ts",
+						start: { line: 3 },
+						extra: { severity: "CRITICAL" },
+					},
+				],
+				errors: [],
+				paths: { scanned: ["a.ts", "b.ts"] },
+			},
+			{ status: 0 },
+		);
+
+		const result = (await scan()) as unknown as {
+			reportIntegrity: string;
+			findings: Array<{ severity: string }>;
+			reportErrors: Array<{ type: string; path?: string }>;
+		};
+		expect(result.reportIntegrity).toBe("partial");
+		expect(result.findings.map((finding) => finding.severity)).toEqual([
+			"WARNING",
+			"CRITICAL",
+		]);
+		expect(result.reportErrors).toEqual([
+			expect.objectContaining({ type: "MalformedSeverity", path: "a.ts" }),
+			expect.objectContaining({ type: "MalformedSeverity", path: "b.ts" }),
+		]);
+	});
+
+	it("marks malformed report-array entries partial while keeping valid findings", async () => {
+		mockNativeRun(
+			{
+				results: [
+					{
+						check_id: "rule-a",
+						path: "a.ts",
+						start: { line: 2 },
+						extra: { severity: "WARNING" },
+					},
+					null,
+					{ check_id: "missing-path", start: { line: 3 } },
+				],
+				errors: [null],
+				paths: { scanned: ["a.ts", null] },
+			},
+			{ status: 0 },
+		);
+
+		const result = (await scan()) as unknown as {
+			success: boolean;
+			reportIntegrity: string;
+			findings: unknown[];
+			reportErrors: Array<{ type: string }>;
+		};
+		expect(result.success).toBe(true);
+		expect(result.reportIntegrity).toBe("partial");
+		expect(result.findings).toHaveLength(1);
+		expect(result.reportErrors.map((error) => error.type)).toEqual([
+			"MalformedResult",
+			"MalformedResult",
+			"MalformedReportError",
+			"MalformedScannedPath",
+		]);
+	});
+
+	it("reports malformed output as failed coverage, not a clean scan", async () => {
+		spawnMocks.safeSpawnAsync.mockImplementation(
+			async (_bin: string, args: string[]) => {
+				fs.writeFileSync(reportPathFromArgs(args), "{not json");
+				return { stdout: "", stderr: "", status: 0 };
+			},
+		);
+
+		const result = (await scan()) as unknown as Record<string, unknown>;
+		expect(result).toMatchObject({
+			success: false,
+			reportIntegrity: "malformed",
+			exitCode: 0,
+		});
+		expect(result.summary).toMatch(/malformed opengrep report/);
+	});
+
+	it("rejects a report that omits native coverage receipts", async () => {
+		mockNativeRun({ results: [], paths: { scanned: [] } }, { status: 0 });
+
+		const result = (await scan()) as unknown as Record<string, unknown>;
+		expect(result).toMatchObject({
+			success: false,
+			reportIntegrity: "malformed",
+		});
+	});
+
+	it("preserves signal detail when interruption produces no report", async () => {
+		mockNativeRun(undefined, {
+			status: null,
+			failure: "signal",
+			error: new Error("Process killed by signal: SIGTERM"),
+		});
+
+		const result = (await scan()) as unknown as Record<string, unknown>;
+		expect(result).toMatchObject({
+			success: false,
+			reportIntegrity: "missing",
+			processFailure: "signal",
+		});
+		expect(result.summary).toMatch(
+			/no report produced; no exit code; signal; Process killed by signal: SIGTERM/,
+		);
+	});
+
+	it("makes a missing report actionable with the native process receipt", async () => {
+		mockNativeRun(undefined, { status: 0 });
+
+		const result = (await scan()) as unknown as Record<string, unknown>;
+		expect(result).toMatchObject({
+			success: false,
+			reportIntegrity: "missing",
+			exitCode: 0,
+		});
+		expect(result.summary).toBe("no report produced; exit 0");
 	});
 });

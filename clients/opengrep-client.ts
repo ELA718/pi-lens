@@ -50,7 +50,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { mkdtempSync } from "node:fs";
 import { resolveOpengrepConfig } from "./opengrep-config.js";
-import { safeSpawnAsync } from "./safe-spawn.js";
+import {
+	safeSpawnAsync,
+	type SpawnFailureKind,
+	type SpawnResult,
+} from "./safe-spawn.js";
 import { SecurityScanClient } from "./security-scan-client.js";
 
 // --- Types ---
@@ -82,19 +86,38 @@ export interface OpengrepFinding {
 export interface OpengrepResult {
 	success: boolean;
 	findings: OpengrepFinding[];
+	/** Optional for compatibility with caches written before scan receipts. */
+	reportErrors?: OpengrepReportError[];
+	reportIntegrity?: "complete" | "partial" | "missing" | "malformed";
+	scannedPathCount?: number;
+	exitCode?: number | null;
+	processFailure?: SpawnFailureKind;
+	outputTruncated?: boolean;
 	scannedAt: string;
 	summary?: string;
+}
+
+export interface OpengrepReportError {
+	type: string;
+	level: string;
+	message: string;
+	path?: string;
+	line?: number;
 }
 
 const EMPTY_RESULT: Omit<OpengrepResult, "scannedAt"> = {
 	success: false,
 	findings: [],
+	reportErrors: [],
+	reportIntegrity: "missing",
+	exitCode: null,
 };
 
 // opengrep loads/compiles a full rule pack (1000+ rules for `auto`) before
 // scanning; generous budget for a large tree, matching trivy's CVE-DB-fetch
 // allowance rather than the lighter jscpd/gitleaks scans.
 const SCAN_TIMEOUT_MS = 180_000;
+const SUPPORTED_SEVERITIES = new Set(["ERROR", "WARNING", "INFO"]);
 
 // --- Client ---
 
@@ -170,29 +193,47 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 				{ cwd, timeout: SCAN_TIMEOUT_MS, signal },
 			);
 
-			if (result.error) {
-				this.log(`Scan error: ${result.error.message}`);
-				return {
-					...EMPTY_RESULT,
-					scannedAt,
-					summary: result.error.message.slice(0, 200),
-				};
-			}
-
 			if (!fs.existsSync(reportPath)) {
 				return {
 					...EMPTY_RESULT,
+					exitCode: result.status,
+					processFailure: result.failure,
+					outputTruncated: result.outputTruncated,
 					scannedAt,
-					summary:
-						(result.stderr ?? "").trim().split("\n")[0] || "no report produced",
+					summary: processSummary("no report produced", result),
 				};
 			}
 
-			const findings = parseOpengrepReport(fs.readFileSync(reportPath, "utf-8"));
+			const report = parseOpengrepReportResult(
+				fs.readFileSync(reportPath, "utf-8"),
+			);
+			if (!report) {
+				return {
+					...EMPTY_RESULT,
+					reportIntegrity: "malformed",
+					exitCode: result.status,
+					processFailure: result.failure,
+					outputTruncated: result.outputTruncated,
+					scannedAt,
+					summary: processSummary("malformed opengrep report", result),
+				};
+			}
+
+			const success = result.status === 0 && !result.error;
+			const reportIntegrity =
+				success && report.reportErrors.length === 0 ? "complete" : "partial";
+			const summary = success
+				? `opengrep report is partial; ${report.reportErrors.length} report error(s)`
+				: processSummary("opengrep failed", result);
 			return {
-				success: true,
-				findings,
+				success,
+				...report,
+				reportIntegrity,
+				exitCode: result.status,
+				processFailure: result.failure,
+				outputTruncated: result.outputTruncated,
 				scannedAt,
+				...(reportIntegrity === "partial" ? { summary } : {}),
 			};
 		} catch (err) {
 			return {
@@ -210,6 +251,22 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 	}
 }
 
+function processSummary(prefix: string, result: SpawnResult): string {
+	const details = [
+		result.status === null ? "no exit code" : `exit ${result.status}`,
+		result.failure,
+		result.error?.message,
+		result.stderr.trim().split("\n")[0],
+	].filter((detail): detail is string => Boolean(detail));
+	return `${prefix}; ${details.join("; ")}`.slice(0, 500);
+}
+
+export interface ParsedOpengrepReport {
+	findings: OpengrepFinding[];
+	reportErrors: OpengrepReportError[];
+	scannedPathCount?: number;
+}
+
 // --- Parser ---
 
 /**
@@ -223,28 +280,77 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
  * CLI surface has drifted in places, e.g. `--files-with-matches` requires
  * `--experimental` where semgrep's doesn't).
  */
+/**
+ * Compatibility parser for callers that only need findings. It accepts the
+ * historical results-only fixture shape. Native scans use the strict receipt
+ * parser below and never infer complete coverage from absent receipt fields.
+ */
 export function parseOpengrepReport(raw: string): OpengrepFinding[] {
-	if (!raw.trim()) return [];
+	return parseOpengrepReportEnvelope(raw, false)?.findings ?? [];
+}
+
+/** Parse a native report only when results, errors, and scanned-path receipts exist. */
+export function parseOpengrepReportResult(
+	raw: string,
+): ParsedOpengrepReport | undefined {
+	return parseOpengrepReportEnvelope(raw, true);
+}
+
+function parseOpengrepReportEnvelope(
+	raw: string,
+	requireReceipt: boolean,
+): ParsedOpengrepReport | undefined {
+	if (!raw.trim()) return undefined;
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
 	} catch {
-		return [];
+		return undefined;
 	}
-	if (!parsed || typeof parsed !== "object") return [];
-	const results = (parsed as Record<string, unknown>).results;
-	if (!Array.isArray(results)) return [];
+	if (!parsed || typeof parsed !== "object") return undefined;
+	const root = parsed as Record<string, unknown>;
+	if (!Array.isArray(root.results)) return undefined;
+	const paths = root.paths as Record<string, unknown> | undefined;
+	if (
+		requireReceipt &&
+		(!Array.isArray(root.errors) || !Array.isArray(paths?.scanned))
+	) {
+		return undefined;
+	}
+	const reportErrors: OpengrepReportError[] = [];
 	const findings: OpengrepFinding[] = [];
-	for (const entry of results) {
-		if (!entry || typeof entry !== "object") continue;
+	for (const entry of root.results) {
+		if (!entry || typeof entry !== "object") {
+			if (requireReceipt) reportErrors.push(malformedReportError("Result"));
+			continue;
+		}
 		const e = entry as Record<string, unknown>;
 		const checkId = typeof e.check_id === "string" ? e.check_id : undefined;
 		const filePath = typeof e.path === "string" ? e.path : undefined;
 		const start = e.start as { line?: unknown; col?: unknown } | undefined;
 		const end = e.end as { line?: unknown; col?: unknown } | undefined;
 		const startLine = typeof start?.line === "number" ? start.line : undefined;
-		if (!checkId || !filePath || !Number.isFinite(startLine)) continue;
+		if (!checkId || !filePath || !Number.isFinite(startLine)) {
+			if (requireReceipt) reportErrors.push(malformedReportError("Result"));
+			continue;
+		}
 		const extra = (e.extra as Record<string, unknown> | undefined) ?? {};
+		const rawSeverity = extra.severity;
+		const severity =
+			typeof rawSeverity === "string" ? rawSeverity.toUpperCase() : "WARNING";
+		if (
+			requireReceipt &&
+			(typeof rawSeverity !== "string" ||
+				!SUPPORTED_SEVERITIES.has(severity))
+		) {
+			reportErrors.push({
+				type: "MalformedSeverity",
+				level: "warn",
+				message: `opengrep finding has unsupported severity: ${String(rawSeverity)}`,
+				path: filePath,
+				line: startLine,
+			});
+		}
 		const metadata =
 			(extra.metadata as Record<string, unknown> | undefined) ?? {};
 		const cwe = Array.isArray(metadata.cwe)
@@ -259,9 +365,59 @@ export function parseOpengrepReport(raw: string): OpengrepFinding[] {
 			endCol: typeof end?.col === "number" ? end.col : 1,
 			message:
 				typeof extra.message === "string" ? extra.message : "opengrep finding",
-			severity: typeof extra.severity === "string" ? extra.severity : "WARNING",
+			severity,
 			cwe,
 		});
 	}
-	return findings;
+	for (const entry of Array.isArray(root.errors) ? root.errors : []) {
+		const parsedError = parseReportError(entry);
+		if (parsedError) reportErrors.push(parsedError);
+		else if (requireReceipt) reportErrors.push(malformedReportError("ReportError"));
+	}
+	const scannedPaths = paths?.scanned as unknown[];
+	if (
+		requireReceipt &&
+		Array.isArray(scannedPaths) &&
+		scannedPaths.some((entry) => typeof entry !== "string")
+	) {
+		reportErrors.push(malformedReportError("ScannedPath"));
+	}
+	return {
+		findings,
+		reportErrors,
+		...(Array.isArray(scannedPaths)
+			? {
+					scannedPathCount: scannedPaths.filter(
+						(entry) => typeof entry === "string",
+					).length,
+				}
+			: {}),
+	};
+}
+
+function parseReportError(entry: unknown): OpengrepReportError | undefined {
+	if (!entry || typeof entry !== "object") return undefined;
+	const error = entry as Record<string, unknown>;
+	const type = Array.isArray(error.type) ? error.type[0] : error.type;
+	const spans = Array.isArray(error.spans) ? error.spans : [];
+	const firstSpan = spans[0] as Record<string, unknown> | undefined;
+	const start = firstSpan?.start as Record<string, unknown> | undefined;
+	return {
+		type: typeof type === "string" ? type : "ReportError",
+		level: typeof error.level === "string" ? error.level : "warn",
+		message:
+			typeof error.message === "string"
+				? error.message.slice(0, 1_000)
+				: "opengrep reported incomplete coverage",
+		...(typeof error.path === "string" ? { path: error.path } : {}),
+		...(typeof start?.line === "number" ? { line: start.line } : {}),
+	};
+}
+
+function malformedReportError(part: string): OpengrepReportError {
+	return {
+		type: `Malformed${part}`,
+		level: "warn",
+		message: `opengrep report contains a malformed ${part.toLowerCase()} entry`,
+	};
 }

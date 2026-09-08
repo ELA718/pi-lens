@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import type {
 	OpengrepFinding,
+	OpengrepReportError,
 	OpengrepResult,
 } from "../../opengrep-client.js";
 import type {
@@ -50,12 +51,33 @@ export function opengrepFindingToProjectDiagnostic(
 	};
 }
 
+function opengrepReportErrorToProjectDiagnostic(
+	cwd: string,
+	error: OpengrepReportError,
+): ProjectDiagnostic {
+	return {
+		filePath: path.resolve(cwd, error.path ?? "."),
+		line: error.line ?? 1,
+		severity: error.level.toLowerCase() === "info" ? "info" : "warning",
+		semantic: "warning",
+		tool: "opengrep",
+		runner: "opengrep",
+		rule: `opengrep:report-error:${error.type}`,
+		message: `[incomplete coverage: ${error.type}] ${error.message}`,
+		source: "project-scan",
+	};
+}
+
 export function opengrepResultToProjectDiagnostics(
 	cwd: string,
 	result: OpengrepResult,
 ): ProjectDiagnostic[] {
-	if (!result.success || result.findings.length === 0) return [];
-	return result.findings.map((finding) =>
-		opengrepFindingToProjectDiagnostic(cwd, finding),
-	);
+	return [
+		...result.findings.map((finding) =>
+			opengrepFindingToProjectDiagnostic(cwd, finding),
+		),
+		...(result.reportErrors ?? []).map((error) =>
+			opengrepReportErrorToProjectDiagnostic(cwd, error),
+		),
+	];
 }

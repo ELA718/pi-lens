@@ -469,6 +469,48 @@ describe("project diagnostics adapters", () => {
 		expect(diags[1]).toMatchObject({ severity: "info", semantic: "warning" });
 	});
 
+	it("preserves findings and partial-parser evidence without calling coverage clean", () => {
+		const diags = opengrepResultToProjectDiagnostics(tmp, {
+			success: false,
+			scannedAt: "",
+			findings: [
+				{
+					checkId: "generic.warning-rule",
+					path: "src/a.ts",
+					startLine: 1,
+					startCol: 1,
+					endLine: 1,
+					endCol: 2,
+					message: "usable finding before interruption",
+					severity: "WARNING",
+				},
+			],
+			reportErrors: [
+				{
+					type: "PartialParsing",
+					level: "warn",
+					message: "Syntax error",
+					path: "src/b.ts",
+					line: 9,
+				},
+			],
+		});
+
+		expect(diags).toHaveLength(2);
+		expect(diags[0]).toMatchObject({
+			filePath: path.join(tmp, "src/a.ts"),
+			rule: "opengrep:generic.warning-rule",
+		});
+		expect(diags[1]).toMatchObject({
+			filePath: path.join(tmp, "src/b.ts"),
+			line: 9,
+			severity: "warning",
+			semantic: "warning",
+			rule: "opengrep:report-error:PartialParsing",
+			message: "[incomplete coverage: PartialParsing] Syntax error",
+		});
+	});
+
 	it("returns no opengrep diagnostics on a failed or empty scan", () => {
 		expect(
 			opengrepResultToProjectDiagnostics(tmp, {
