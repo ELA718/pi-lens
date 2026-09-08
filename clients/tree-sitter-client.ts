@@ -2931,6 +2931,98 @@ export class TreeSitterClient {
 		return this.isProvenRegExpReceiver(initializer, root, depth + 1, nodes);
 	}
 
+	private isProvenNativeMapSetReceiver(
+		receiver: TreeSitterNode | undefined,
+		root: TreeSitterNode,
+	): boolean {
+		if (receiver?.type !== "identifier") return false;
+		const nodes: TreeSitterNode[] = [];
+		const pending = [root];
+		while (pending.length > 0) {
+			const current = pending.pop();
+			if (!current || nodes.length >= NO_NESTED_ANCHOR_VISIT_CAP) return false;
+			if (current.type === "ERROR" || current.isMissing) return false;
+			nodes.push(current);
+			if (current.childCount > NO_NESTED_ANCHOR_VISIT_CAP - nodes.length - pending.length) return false;
+			pending.push(...current.children);
+		}
+
+		const sameNode = (left: TreeSitterNode | null | undefined, right: TreeSitterNode) =>
+			left?.startIndex === right.startIndex && left.endIndex === right.endIndex;
+		const declarations = nodes.filter(candidate =>
+			candidate.type === "variable_declarator" &&
+			candidate.childForFieldName?.("name")?.type === "identifier" &&
+			candidate.childForFieldName?.("name")?.text === receiver.text
+		);
+		if (declarations.length !== 1) return false;
+		const declaration = declarations[0];
+		const statement = declaration.parent;
+		const initializer = declaration.childForFieldName?.("value");
+		if (
+			statement?.type !== "lexical_declaration" ||
+			!statement.children.some(child => child.type === "const") ||
+			statement.parent?.type === "export_statement" ||
+			initializer?.type !== "new_expression" ||
+			declaration.startIndex >= receiver.startIndex
+		) return false;
+		const constructor = initializer.childForFieldName?.("constructor");
+		if (constructor?.type !== "identifier" || !["Map", "Set"].includes(constructor.text)) return false;
+
+		for (const candidate of nodes) {
+			if (candidate.type === "identifier" && ["globalThis", "window", "self"].includes(candidate.text)) return false;
+			if (candidate.type === "call_expression") {
+				const fn = candidate.childForFieldName?.("function");
+				if (
+					fn?.type === "member_expression" &&
+					["Object", "Reflect"].includes(fn.childForFieldName?.("object")?.text ?? "") &&
+					fn.childForFieldName?.("property")?.text === "getPrototypeOf" &&
+					/\b(?:Map|Set)\b/.test(candidate.childForFieldName?.("arguments")?.text ?? "")
+				) return false;
+			}
+			if (
+				["class_declaration", "class"].includes(candidate.type) &&
+				["Map", "Set"].includes(candidate.childForFieldName?.("name")?.text ?? "")
+			) return false;
+			if (candidate.type === "identifier" && ["Map", "Set"].includes(candidate.text)) {
+				const parent = candidate.parent;
+				if (
+					parent?.type !== "new_expression" ||
+					!sameNode(parent.childForFieldName?.("constructor"), candidate)
+				) return false;
+			}
+		}
+
+		const allowedMethods = constructor.text === "Map"
+			? new Set(["get", "set", "has", "delete", "clear", "entries", "keys", "values"])
+			: new Set(["add", "has", "delete", "clear", "entries", "keys", "values"]);
+		const declaredName = declaration.childForFieldName?.("name");
+		for (const reference of nodes) {
+			if (reference.type !== "identifier" || reference.text !== receiver.text) continue;
+			if (declaredName && sameNode(reference, declaredName)) continue;
+			const member = reference.parent;
+			const method = member?.childForFieldName?.("property")?.text ?? "";
+			const call = member?.parent;
+			if (
+				member?.type !== "member_expression" ||
+				!sameNode(member.childForFieldName?.("object"), reference) ||
+				!allowedMethods.has(method) ||
+				call?.type !== "call_expression" ||
+				!sameNode(call.childForFieldName?.("function"), member)
+			) return false;
+			if (["set", "add"].includes(method) && call.parent?.type !== "expression_statement") return false;
+			if (["entries", "keys", "values"].includes(method)) {
+				const consumer = call.parent;
+				if (consumer?.type === "spread_element") continue;
+				if (
+					consumer?.type === "for_in_statement" &&
+					sameNode(consumer.childForFieldName?.("right"), call)
+				) continue;
+				return false;
+			}
+		}
+		return true;
+	}
+
 	private isStaticSqlExpression(
 		node: TreeSitterNode | undefined,
 		root: TreeSitterNode,
@@ -5401,6 +5493,11 @@ export class TreeSitterClient {
 						return false;
 					}
 				}
+				if (
+					rootNode &&
+					captures.OBJ &&
+					this.isProvenNativeMapSetReceiver(captures.OBJ, rootNode)
+				) return false;
 				if (unprovenDynamicDestination) return true;
 				// Only flag when the URL argument looks like it could carry external
 				// input: member expressions (req.url, ctx.query.x) or identifiers
