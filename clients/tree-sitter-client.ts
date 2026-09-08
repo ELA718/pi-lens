@@ -3708,7 +3708,7 @@ export class TreeSitterClient {
 			});
 		};
 		const globalOwnerAccessIsStable = (): boolean => {
-			const globalOwners = new Set(["Deno", "process", "Bun", "String", "Array", "URL", "Object", "Reflect", "eval", "Function"]);
+			const globalOwners = new Set(["Deno", "process", "Bun", "String", "Array", "URL", "Number", "Object", "Reflect", "eval", "Function"]);
 			return nodes.every((node) => {
 				if (node.type === "identifier" && ["eval", "Function"].includes(node.text) && isGlobalReference(node)) return false;
 				if (node.type !== "identifier" || node.text !== "globalThis" || !isGlobalReference(node)) return true;
@@ -3761,6 +3761,16 @@ export class TreeSitterClient {
 			while (["parenthesized_expression", "non_null_expression", "as_expression", "satisfies_expression", "type_assertion"].includes(current.parent?.type ?? "")) current = current.parent!;
 			return current;
 		};
+		const globalMethodIsStable = (ownerUse: TreeSitterNode, method: string): boolean =>
+			globalOwnerAccessIsStable() && nodes.every((node) => {
+				if (node.type !== "identifier" || node.text !== ownerUse.text || !isGlobalReference(node)) return true;
+				const member = node.parent;
+				if (member?.type === "call_expression" && sameNode(member.childForFieldName?.("function"), node)) return true;
+				if (member?.type !== "member_expression" || !sameNode(member.childForFieldName?.("object"), node)) return false;
+				if (member.childForFieldName?.("property")?.text !== method) return true;
+				const value = outerTransparentExpression(member);
+				return value.parent?.type === "call_expression" && sameNode(value.parent.childForFieldName?.("function"), value);
+			});
 		const staticStringValue = (value: TreeSitterNode | null | undefined): string | undefined => {
 			if (value?.type !== "string" || value.text.includes("\\")) return undefined;
 			return value.children.filter((child) => child.type === "string_fragment").map((child) => child.text).join("");
@@ -3794,7 +3804,7 @@ export class TreeSitterClient {
 					const callee = parent.parent?.childForFieldName?.("function");
 					const owner = callee?.type === "member_expression" ? callee.childForFieldName?.("object") : undefined;
 					const operation = callee?.type === "member_expression" ? callee.childForFieldName?.("property")?.text : undefined;
-					if (owner?.type === "identifier" && owner.text === "Number" && isGlobalReference(owner) && ["isFinite", "isInteger", "isNaN", "isSafeInteger"].includes(operation ?? "")) return false;
+					if (owner?.type === "identifier" && owner.text === "Number" && isGlobalReference(owner) && ["isFinite", "isInteger", "isNaN", "isSafeInteger"].includes(operation ?? "") && globalMethodIsStable(owner, operation ?? "")) return false;
 					return true;
 				}
 				return ["arguments", "return_statement", "export_statement", "spread_element", "array", "object", "pair"].includes(parent?.type ?? "");

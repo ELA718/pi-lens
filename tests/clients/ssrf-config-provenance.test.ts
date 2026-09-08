@@ -103,6 +103,7 @@ describe("SSRF deployment-configuration provenance", () => {
 		["returned computed prototype acquisition", `const key = "__proto__"; function acquire() { return ""[key]; } const proto = acquire(); proto.trim = () => request.url; fetch(Deno.env.get("URL").trim());`],
 		["binding-resolved computed prototype mutation", `const value = ""; const key = "__proto__"; const proto = value[key]; proto.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
 		["destructured native prototype mutation", `const { __proto__: proto } = ""; proto.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
+		["replaced Number intrinsic escape", `Number.isFinite = function (value) { value.trim = function () { return request.url; }; return true; }; const { __proto__: proto } = ""; Number.isFinite(proto); fetch(Deno.env.get("URL").trim());`],
 		["conditional-source destructuring mutation", `const value = true ? "" : ""; const { __proto__: proto } = value; proto.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
 		["function-return destructuring mutation", `function value() { return ""; } const { __proto__: proto } = value(); proto.trim = function () { return request.url; }; fetch(Deno.env.get("URL").trim());`],
 		["parameter destructuring mutation", `function alter({ __proto__: proto }) { proto.trim = function () { return request.url; }; } alter(""); fetch(Deno.env.get("URL").trim());`],
