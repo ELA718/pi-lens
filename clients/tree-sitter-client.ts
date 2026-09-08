@@ -3524,6 +3524,653 @@ export class TreeSitterClient {
 		return true;
 	}
 
+	/**
+	 * Proves that an SSRF destination is built only from literals and static
+	 * deployment configuration. This is request-taint provenance only: it does
+	 * not certify the configured host, scheme, or transport policy.
+	 */
+	private isDeploymentConfigOnlyUrl(
+		destination: TreeSitterNode,
+		root: TreeSitterNode,
+	): boolean {
+		const FUNCTION_TYPES = new Set([
+			"function_declaration",
+			"function_expression",
+			"generator_function",
+			"generator_function_declaration",
+			"arrow_function",
+			"method_definition",
+		]);
+		const nodes: TreeSitterNode[] = [];
+		const pending = [root];
+		while (pending.length > 0) {
+			const node = pending.pop();
+			if (!node || nodes.length >= NO_NESTED_ANCHOR_VISIT_CAP) return false;
+			if (
+				node.type === "ERROR" ||
+				(node as TreeSitterNode & { isMissing?: boolean }).isMissing
+			) return false;
+			nodes.push(node);
+			if (node.childCount > NO_NESTED_ANCHOR_VISIT_CAP - nodes.length - pending.length) return false;
+			pending.push(...(node.children ?? []));
+		}
+		if (root.endIndex > 512_000) return false;
+
+		const nearestFunction = (node: TreeSitterNode): TreeSitterNode | null => {
+			let current = node.parent;
+			while (current && current !== root) {
+				if (FUNCTION_TYPES.has(current.type)) return current;
+				current = current.parent;
+			}
+			return null;
+		};
+		const sameNode = (
+			left: TreeSitterNode | null | undefined,
+			right: TreeSitterNode | null | undefined,
+		): boolean =>
+			!!left &&
+			!!right &&
+			left.startIndex === right.startIndex &&
+			left.endIndex === right.endIndex;
+		const contains = (outer: TreeSitterNode, inner: TreeSitterNode): boolean =>
+			outer.startIndex <= inner.startIndex && outer.endIndex >= inner.endIndex;
+		type Binding = {
+			name: TreeSitterNode;
+			owner: TreeSitterNode;
+			scope: TreeSitterNode;
+			kind: "variable" | "parameter" | "function" | "class" | "catch" | "loop";
+		};
+		const bindings = new Map<string, Binding[]>();
+		const addBinding = (binding: Binding): void => {
+			const sameName = bindings.get(binding.name.text) ?? [];
+			sameName.push(binding);
+			bindings.set(binding.name.text, sameName);
+		};
+		const bindingNameNodes = (pattern: TreeSitterNode | null | undefined): TreeSitterNode[] => {
+			if (!pattern) return [];
+			const names: TreeSitterNode[] = [];
+			const stack = [pattern];
+			while (stack.length > 0) {
+				const current = stack.pop();
+				if (!current) continue;
+				if (current.type === "identifier" || current.type === "shorthand_property_identifier_pattern") names.push(current);
+				if (["property_identifier", "type_identifier", "computed_property_name"].includes(current.type)) continue;
+				if (["assignment_pattern", "object_assignment_pattern"].includes(current.type)) {
+					const left = current.childForFieldName?.("left");
+					if (left) stack.push(left);
+					continue;
+				}
+				stack.push(...(current.children ?? []));
+			}
+			return names;
+		};
+		const functionScope = (node: TreeSitterNode): TreeSitterNode => {
+			let container: TreeSitterNode | null | undefined = node;
+			while (container?.parent && container.type !== "program" && !FUNCTION_TYPES.has(container.type)) container = container.parent;
+			return container?.type === "program" ? container : container?.childForFieldName?.("body") ?? root;
+		};
+		const declarationScope = (declaration: TreeSitterNode): TreeSitterNode =>
+			declaration.type === "variable_declaration" ? functionScope(declaration) : declaration.parent ?? root;
+		for (const node of nodes) {
+			if (node.type === "variable_declarator") {
+				const declaration = node.parent;
+				if (!declaration?.parent) continue;
+				for (const name of bindingNameNodes(node.childForFieldName?.("name"))) {
+					addBinding({ name, owner: node, scope: declarationScope(declaration), kind: "variable" });
+				}
+				continue;
+			}
+			if (node.type === "for_in_statement" && node.children.some((child) => ["var", "let", "const"].includes(child.type))) {
+				const body = node.childForFieldName?.("body");
+				if (!body) continue;
+				const scope = node.children.some((child) => child.type === "var") ? functionScope(node) : body;
+				for (const name of bindingNameNodes(node.childForFieldName?.("left"))) {
+					addBinding({ name, owner: node, scope, kind: "loop" });
+				}
+				continue;
+			}
+			if (FUNCTION_TYPES.has(node.type)) {
+				const body = node.childForFieldName?.("body");
+				const bareParameter = node.childForFieldName?.("parameter");
+				const parameters = bareParameter ? [bareParameter] : node.childForFieldName?.("parameters")?.children.filter((child) => child.isNamed) ?? [];
+				if (body) {
+					for (const parameter of parameters) {
+						for (const name of bindingNameNodes(parameter.childForFieldName?.("pattern") ?? parameter)) {
+							addBinding({ name, owner: node, scope: body, kind: "parameter" });
+						}
+					}
+				}
+				const name = node.childForFieldName?.("name");
+				if (name && node.parent) {
+					const declaration = node.type === "function_declaration" || node.type === "generator_function_declaration";
+					addBinding({ name, owner: node, scope: declaration ? node.parent : body ?? node, kind: "function" });
+				}
+				continue;
+			}
+			if (["class_declaration", "abstract_class_declaration", "class", "enum_declaration", "internal_module"].includes(node.type)) {
+				const name = node.childForFieldName?.("name");
+				const body = node.childForFieldName?.("body");
+				if (name && node.parent) addBinding({ name, owner: node, scope: node.type === "class" ? body ?? node : node.parent, kind: "class" });
+				continue;
+			}
+			if (node.type === "catch_clause") {
+				const body = node.childForFieldName?.("body");
+				if (!body) continue;
+				for (const name of bindingNameNodes(node.childForFieldName?.("parameter"))) {
+					addBinding({ name, owner: node, scope: body, kind: "catch" });
+				}
+			}
+		}
+		const bindingFor = (use: TreeSitterNode): Binding | undefined => {
+			const visible = (bindings.get(use.text) ?? []).filter((binding) => sameNode(binding.name, use) || contains(binding.scope, use));
+			visible.sort((left, right) => left.scope.endIndex - left.scope.startIndex - (right.scope.endIndex - right.scope.startIndex));
+			if (visible.length === 0) return undefined;
+			if (visible[1] && sameNode(visible[0].scope, visible[1].scope)) return undefined;
+			return visible[0];
+		};
+		const sameBinding = (left: Binding | undefined, right: Binding | undefined): boolean =>
+			!!left && !!right && sameNode(left.owner, right.owner) && sameNode(left.name, right.name);
+		const referencesFor = (binding: Binding): TreeSitterNode[] =>
+			nodes.filter((node) =>
+				(node.type === "identifier" || node.type === "shorthand_property_identifier") &&
+				node.text === binding.name.text && sameBinding(bindingFor(node), binding));
+		const bindingWrites = (binding: Binding): TreeSitterNode[] => {
+			const references = referencesFor(binding);
+			return nodes.filter((node) => {
+				if (!["assignment_expression", "augmented_assignment_expression", "update_expression"].includes(node.type)) return false;
+				const left = node.childForFieldName?.("left") ?? node.childForFieldName?.("argument") ?? node.children.find((child) => child.isNamed);
+				return !!left && references.some((reference) => contains(left, reference));
+			});
+		};
+		const isGlobalReference = (use: TreeSitterNode): boolean =>
+			!bindingFor(use) && !this.isImportedBinding(use.text, root) && !this.isShadowedByEnclosingParam(use, use.text);
+		const globalIsUnbound = (use: TreeSitterNode): boolean => {
+			if (!isGlobalReference(use)) return false;
+			return !nodes.some((node) => {
+				if (["assignment_expression", "augmented_assignment_expression", "update_expression"].includes(node.type)) {
+					const target = node.childForFieldName?.("left") ?? node.childForFieldName?.("argument") ?? node.children.find((child) => child.isNamed);
+					return bindingNameNodes(target).some((name) => name.text === use.text && !bindingFor(name));
+				}
+				if (node.type === "for_in_statement" && !node.children.some((child) => ["var", "let", "const"].includes(child.type))) {
+					return bindingNameNodes(node.childForFieldName?.("left")).some((name) => name.text === use.text && !bindingFor(name));
+				}
+				if (node.type === "variable_declarator") {
+					const pattern = node.childForFieldName?.("name");
+					const declaration = node.parent;
+					return !!pattern && pattern.type !== "identifier" && !!declaration && this.patternBindsName(pattern, use.text) && contains(declarationScope(declaration), use);
+				}
+				if (node.type === "catch_clause") {
+					const pattern = node.childForFieldName?.("parameter");
+					const body = node.childForFieldName?.("body");
+					return !!pattern && !!body && this.patternBindsName(pattern, use.text) && contains(body, use);
+				}
+				return false;
+			});
+		};
+		const globalOwnerAccessIsStable = (): boolean => {
+			const globalOwners = new Set(["Deno", "process", "Bun", "String", "Array", "URL", "Number", "Object", "Reflect", "eval", "Function"]);
+			return nodes.every((node) => {
+				if (node.type === "identifier" && ["eval", "Function"].includes(node.text) && isGlobalReference(node)) return false;
+				if (node.type !== "identifier" || node.text !== "globalThis" || !isGlobalReference(node)) return true;
+				const access = node.parent;
+				if (access?.type === "subscript_expression" && sameNode(access.childForFieldName?.("object"), node)) return false;
+				if (access?.type !== "member_expression" || !sameNode(access.childForFieldName?.("object"), node)) return false;
+				if (globalOwners.has(access.childForFieldName?.("property")?.text ?? "")) return false;
+				let value = access;
+				while (["parenthesized_expression", "non_null_expression", "as_expression", "satisfies_expression", "type_assertion"].includes(value.parent?.type ?? "")) value = value.parent!;
+				const consumer = value.parent;
+				if (consumer?.type === "variable_declarator" && sameNode(consumer.childForFieldName?.("value"), value)) return false;
+				if (consumer?.type === "assignment_expression" && sameNode(consumer.childForFieldName?.("right"), value)) return false;
+				return !["arguments", "return_statement", "export_statement", "spread_element", "array", "object", "pair"].includes(consumer?.type ?? "");
+			});
+		};
+		const globalObjectIsStable = (use: TreeSitterNode): boolean =>
+			globalOwnerAccessIsStable() && nodes.every((node) => {
+				if (node.type !== "identifier" || node.text !== use.text || !isGlobalReference(node)) return true;
+				const parent = node.parent;
+				return parent?.type === "member_expression" && sameNode(parent.childForFieldName?.("object"), node);
+			});
+		const isTransparentAlias = (value: TreeSitterNode | null | undefined, reference: TreeSitterNode): boolean => {
+			let current: TreeSitterNode | null | undefined = reference;
+			while (current && !sameNode(current, value)) {
+				if (!["parenthesized_expression", "non_null_expression", "as_expression", "satisfies_expression", "type_assertion"].includes(current.parent?.type ?? "")) return false;
+				current = current.parent;
+			}
+			return !!current;
+		};
+		const immutableValue = (value: TreeSitterNode | null | undefined, seen = new Set<TreeSitterNode>(), mode?: "allow-property-writes"): TreeSitterNode | null => {
+			if (!value || seen.size > 32) return null;
+			if (["parenthesized_expression", "non_null_expression", "as_expression", "satisfies_expression", "type_assertion"].includes(value.type)) {
+				return immutableValue(value.children.find((child) => child.isNamed), seen, mode);
+			}
+			if (value.type !== "identifier") return value;
+			const binding = bindingFor(value);
+			if (!binding || binding.kind !== "variable" || seen.has(binding.owner)) return null;
+			if (bindingWrites(binding).some((write) => {
+				if (!mode) return true;
+				const target = write.childForFieldName?.("left") ?? write.childForFieldName?.("argument") ?? write.children.find((child) => child.isNamed);
+				return !!target && referencesFor(binding).some((reference) => isTransparentAlias(target, reference));
+			})) return null;
+			const declaration = binding.owner.parent;
+			if (declaration?.type !== "lexical_declaration" || !declaration.children.some((child) => child.type === "const")) return null;
+			seen.add(binding.owner);
+			return immutableValue(binding.owner.childForFieldName?.("value"), seen, mode);
+		};
+		const outerTransparentExpression = (value: TreeSitterNode): TreeSitterNode => {
+			let current = value;
+			while (["parenthesized_expression", "non_null_expression", "as_expression", "satisfies_expression", "type_assertion"].includes(current.parent?.type ?? "")) current = current.parent!;
+			return current;
+		};
+		const globalMethodIsStable = (ownerUse: TreeSitterNode, method: string): boolean =>
+			globalOwnerAccessIsStable() && nodes.every((node) => {
+				if (node.type !== "identifier" || node.text !== ownerUse.text || !isGlobalReference(node)) return true;
+				const member = node.parent;
+				if (member?.type === "call_expression" && sameNode(member.childForFieldName?.("function"), node)) return true;
+				if (member?.type !== "member_expression" || !sameNode(member.childForFieldName?.("object"), node)) return false;
+				if (member.childForFieldName?.("property")?.text !== method) return true;
+				const value = outerTransparentExpression(member);
+				return value.parent?.type === "call_expression" && sameNode(value.parent.childForFieldName?.("function"), value);
+			});
+		const staticStringValue = (value: TreeSitterNode | null | undefined): string | undefined => {
+			if (value?.type !== "string" || value.text.includes("\\")) return undefined;
+			return value.children.filter((child) => child.type === "string_fragment").map((child) => child.text).join("");
+		};
+		const acquiredBindingIsUnproven = (binding: Binding, seen = new Set<TreeSitterNode>()): boolean => {
+			if (seen.has(binding.owner) || seen.size > 32) return true;
+			seen.add(binding.owner);
+			if (bindingWrites(binding).length > 0) return true;
+			return referencesFor(binding).some((reference) => {
+				if (sameNode(reference, binding.name)) return false;
+				const value = outerTransparentExpression(reference);
+				const parent = value.parent;
+				if (parent?.type === "variable_declarator" && isTransparentAlias(parent.childForFieldName?.("value"), reference)) {
+					const name = parent.childForFieldName?.("name");
+					const alias = name?.type === "identifier" ? bindingFor(name) : undefined;
+					return !alias || acquiredBindingIsUnproven(alias, seen);
+				}
+				if (parent?.type === "member_expression" && sameNode(parent.childForFieldName?.("object"), value)) {
+					const member = outerTransparentExpression(parent);
+					const consumer = member.parent;
+					if (consumer?.type === "call_expression" && sameNode(consumer.childForFieldName?.("function"), member)) return true;
+					if (consumer?.type === "variable_declarator" && sameNode(consumer.childForFieldName?.("value"), member)) {
+						const name = consumer.childForFieldName?.("name");
+						const alias = name?.type === "identifier" ? bindingFor(name) : undefined;
+						return !alias || acquiredBindingIsUnproven(alias, seen);
+					}
+					if (consumer?.type === "assignment_expression" && sameNode(consumer.childForFieldName?.("right"), member)) return true;
+					return ["arguments", "return_statement", "export_statement", "spread_element", "array", "object", "pair"].includes(consumer?.type ?? "");
+				}
+				if (parent?.type === "arguments") {
+					const callee = parent.parent?.childForFieldName?.("function");
+					const owner = callee?.type === "member_expression" ? callee.childForFieldName?.("object") : undefined;
+					const operation = callee?.type === "member_expression" ? callee.childForFieldName?.("property")?.text : undefined;
+					if (owner?.type === "identifier" && owner.text === "Number" && isGlobalReference(owner) && ["isFinite", "isInteger", "isNaN", "isSafeInteger"].includes(operation ?? "") && globalMethodIsStable(owner, operation ?? "")) return false;
+					return true;
+				}
+				return ["arguments", "return_statement", "export_statement", "spread_element", "array", "object", "pair"].includes(parent?.type ?? "");
+			});
+		};
+		const acquiredPatternNames = (pattern: TreeSitterNode): TreeSitterNode[] => {
+			const names: TreeSitterNode[] = [];
+			const stack = [pattern];
+			while (stack.length > 0) {
+				const current = stack.pop();
+				if (!current || ["rest_pattern", "rest_pattern_element"].includes(current.type)) continue;
+				if (current.type === "identifier" || current.type === "shorthand_property_identifier_pattern") {
+					names.push(current);
+					continue;
+				}
+				if (["property_identifier", "type_identifier", "computed_property_name"].includes(current.type)) continue;
+				if (["assignment_pattern", "object_assignment_pattern"].includes(current.type)) {
+					const left = current.childForFieldName?.("left");
+					if (left) stack.push(left);
+					continue;
+				}
+				stack.push(...(current.children ?? []));
+			}
+			return names;
+		};
+		const functionIsLocallyInvoked = (fn: TreeSitterNode): boolean => {
+			const name = fn.childForFieldName?.("name");
+			let binding = name?.type === "identifier" ? bindingFor(name) : undefined;
+			if (!binding) {
+				const value = outerTransparentExpression(fn);
+				const declaration = value.parent;
+				const bindingName = declaration?.type === "variable_declarator" && sameNode(declaration.childForFieldName?.("value"), value)
+					? declaration.childForFieldName?.("name")
+					: undefined;
+				binding = bindingName?.type === "identifier" ? bindingFor(bindingName) : undefined;
+			}
+			return !!binding && referencesFor(binding).some((reference) => {
+				const callee = outerTransparentExpression(reference);
+				return callee.parent?.type === "call_expression" && sameNode(callee.parent.childForFieldName?.("function"), callee);
+			});
+		};
+		const nativeTransformIsStable = (method: string): boolean => {
+			if (!globalOwnerAccessIsStable()) return false;
+			if (nodes.some((node) => {
+				if (node.type === "identifier" && ["Object", "Reflect"].includes(node.text) && isGlobalReference(node)) {
+					const member = node.parent;
+					const call = member?.parent;
+					const operation = member?.type === "member_expression" && sameNode(member.childForFieldName?.("object"), node)
+						? member.childForFieldName?.("property")?.text
+						: undefined;
+					if (node.text !== "Object" || operation !== "is" || call?.type !== "call_expression" || !sameNode(call.childForFieldName?.("function"), member)) return true;
+				}
+				if (["object_pattern", "array_pattern"].includes(node.type)) {
+					return acquiredPatternNames(node).some((name) => {
+						const binding = bindingFor(name);
+						return !binding || acquiredBindingIsUnproven(binding);
+					});
+				}
+				if (node.type === "member_expression" && ["constructor", "__proto__"].includes(node.childForFieldName?.("property")?.text ?? "")) return true;
+				if (node.type === "subscript_expression") {
+					if (node.childForFieldName?.("object")?.text === "globalThis") return true;
+					const index = immutableValue(node.childForFieldName?.("index"));
+					const property = staticStringValue(index);
+					const unknownProperty = !index || (index.type === "string" ? property === undefined : index.type !== "number");
+					const object = immutableValue(node.childForFieldName?.("object"), new Set(), "allow-property-writes");
+					const sensitiveProperty = ["constructor", "prototype", "__proto__"].includes(property ?? "");
+					const computedNativeInstance = unknownProperty && !!object && ["string", "template_string", "array"].includes(object.type);
+					const acquisition = outerTransparentExpression(node);
+					const declaration = acquisition.parent;
+					const name = declaration?.type === "variable_declarator" && sameNode(declaration.childForFieldName?.("value"), acquisition)
+						? declaration.childForFieldName?.("name")
+						: undefined;
+					const scope = nearestFunction(node);
+					const destinationScope = nearestFunction(destination);
+					const acquisitionCanRun = !scope || (!!destinationScope && sameNode(scope, destinationScope)) || functionIsLocallyInvoked(scope);
+					if (sensitiveProperty || computedNativeInstance || (unknownProperty && acquisitionCanRun)) return true;
+					if (name?.type === "identifier") {
+						const binding = bindingFor(name);
+						if (binding && acquiredBindingIsUnproven(binding) && unknownProperty) return true;
+					}
+					if (!unknownProperty) return false;
+					if (object?.type === "object") return false;
+					const computedMutation = nodes.some((candidate) => {
+						if (!["assignment_expression", "augmented_assignment_expression", "update_expression"].includes(candidate.type)) return false;
+						const target = candidate.childForFieldName?.("left") ?? candidate.childForFieldName?.("argument");
+						return !!target && contains(target, node);
+					});
+					return computedMutation;
+				}
+				if (node.type === "identifier" && node.text === "globalThis" && isGlobalReference(node)) {
+					const parent = node.parent;
+					if (parent?.type !== "member_expression" || !sameNode(parent.childForFieldName?.("object"), node)) return true;
+					return ["String", "Array", "URL"].includes(parent.childForFieldName?.("property")?.text ?? "");
+				}
+				return false;
+			})) return false;
+			const owners = method === "trim" || method === "toLowerCase" || method === "toUpperCase" || method === "split"
+				? ["String"]
+				: method === "filter" || method === "at" || method === "join"
+					? ["Array"]
+					: method === "slice"
+						? ["String", "Array"]
+						: ["String", "Array", "URL"];
+			return owners.every((owner) => {
+				const references = nodes.filter((node) => node.type === "identifier" && node.text === owner && isGlobalReference(node));
+				return references.every((reference) => {
+					const parent = reference.parent;
+					if (parent?.type === "member_expression" && sameNode(parent.childForFieldName?.("object"), reference)) return parent.childForFieldName?.("property")?.text !== "prototype";
+					if (parent?.type === "call_expression" && sameNode(parent.childForFieldName?.("function"), reference)) return true;
+					if (parent?.type === "new_expression" && sameNode(parent.childForFieldName?.("constructor"), reference)) return true;
+					return false;
+				}) && !nodes.some((node) => node.type === "member_expression" && node.text === `globalThis.${owner}.prototype`);
+			});
+		};
+		const environmentIsStable = (environment: TreeSitterNode): boolean => {
+			const owner = environment.childForFieldName?.("object");
+			if (!owner || (owner.type === "identifier" && (!globalIsUnbound(owner) || !globalObjectIsStable(owner)))) return false;
+			for (const candidate of nodes) {
+				if (candidate.type !== "member_expression" || candidate.childForFieldName?.("property")?.text !== "env") continue;
+				const candidateOwner = candidate.childForFieldName?.("object");
+				if (!candidateOwner || candidateOwner.text !== owner.text) continue;
+				if (candidateOwner.type === "identifier" && !globalIsUnbound(candidateOwner)) continue;
+				const member = candidate.parent;
+				if (member?.type !== "member_expression" || !sameNode(member.childForFieldName?.("object"), candidate)) return false;
+				const method = member.childForFieldName?.("property")?.text;
+				const parent = member.parent;
+				if (parent?.type === "call_expression" && sameNode(parent.childForFieldName?.("function"), member)) {
+					if (method === "get") continue;
+					return false;
+				}
+				if (owner.text === "Deno") return false;
+				const mutationTarget = parent?.childForFieldName?.("left") ?? parent;
+				if (["assignment_expression", "augmented_assignment_expression", "update_expression"].includes(parent?.type ?? "") && mutationTarget && contains(mutationTarget, member)) return false;
+			}
+			return true;
+		};
+
+		const enclosingCalls = (node: TreeSitterNode): TreeSitterNode[] => {
+			const calls: TreeSitterNode[] = [];
+			let current = node.parent;
+			while (current) {
+				if (current.type === "call_expression") calls.push(current);
+				current = current.parent;
+			}
+			return calls;
+		};
+		const sharesOrderedCall = (earlier: TreeSitterNode, later: TreeSitterNode): boolean =>
+			earlier.startIndex < later.startIndex && enclosingCalls(earlier).some((call) => contains(call, later));
+		const bindingHasObjectEscape = (
+			binding: Binding,
+			use: TreeSitterNode,
+			property: string | undefined,
+		): boolean => {
+			if (property === undefined) return false;
+			for (const reference of referencesFor(binding)) {
+				if (sameNode(reference, use) || sameNode(reference, binding.name)) continue;
+				let parent = reference.parent;
+				while (parent && !sameNode(parent, binding.scope)) {
+					if (parent.type === "variable_declarator" && isTransparentAlias(parent.childForFieldName?.("value"), reference)) return true;
+					if (parent.type === "assignment_expression" && isTransparentAlias(parent.childForFieldName?.("right"), reference)) return true;
+					if (parent.type === "object" && reference.type === "shorthand_property_identifier") return true;
+					if (parent.type === "pair" && isTransparentAlias(parent.childForFieldName?.("value"), reference)) return true;
+					if (parent.type === "spread_element" && isTransparentAlias(parent.children.find((child) => child.isNamed), reference)) return true;
+					if (parent.type === "array") {
+						const element = parent.children.find((child) => child.isNamed && contains(child, reference));
+						if (isTransparentAlias(element, reference)) return true;
+					}
+					if (parent.type === "arguments") {
+						const argument = parent.children.find((child) => child.isNamed && contains(child, reference));
+						if (isTransparentAlias(argument, reference) && !sharesOrderedCall(use, reference)) return true;
+					}
+					if (parent.type === "return_statement" || parent.type === "export_statement") {
+						const value = parent.children.find((child) => child.isNamed && contains(child, reference));
+						if (isTransparentAlias(value, reference)) return true;
+					}
+					parent = parent.parent;
+				}
+			}
+			return false;
+		};
+		type TraceContext = {
+			fn: TreeSitterNode | null;
+			params: ReadonlyMap<string, TreeSitterNode>;
+		};
+		const bindingValue = (
+			name: string,
+			use: TreeSitterNode,
+			property: string | undefined,
+			ctx: TraceContext,
+		): TreeSitterNode | null => {
+			const binding = bindingFor(use);
+			if (!binding) return null;
+			if (binding.kind === "parameter") {
+				if (!sameNode(ctx.fn, binding.owner) || !ctx.params.has(name) || bindingWrites(binding).length > 0 || bindingHasObjectEscape(binding, use, property)) return null;
+				return ctx.params.get(name) ?? null;
+			}
+			if (binding.kind !== "variable" || binding.owner.startIndex >= use.startIndex) return null;
+			const declaration = binding.owner;
+			const lexical = declaration.parent;
+			if (lexical?.parent?.type === "export_statement") return null;
+			if (bindingHasObjectEscape(binding, use, property)) return null;
+			const assignments = bindingWrites(binding);
+			const isConst = lexical?.type === "lexical_declaration" && lexical.children.some((child) => child.type === "const");
+			const initializer = declaration.childForFieldName?.("value");
+			if (isConst && initializer && assignments.length === 0) return initializer;
+			if (!initializer && assignments.length === 1) {
+				const assignment = assignments[0];
+				if (assignment.type === "assignment_expression" && assignment.startIndex < use.startIndex && assignment.childForFieldName?.("left")?.text === name) {
+					return assignment.childForFieldName?.("right") ?? null;
+				}
+			}
+			return null;
+		};
+
+		const privateFunction = (name: string, use: TreeSitterNode): TreeSitterNode | null => {
+			const declarations = nodes.filter(
+				(node) => node.type === "function_declaration" && node.childForFieldName?.("name")?.text === name,
+			);
+			if (declarations.length !== 1) return null;
+			const declaration = declarations[0];
+			if (declaration.parent?.type !== "program") return null;
+			const nameNode = declaration.childForFieldName?.("name");
+			const resolved = bindingFor(use);
+			if (!nameNode || !resolved || !sameNode(resolved.owner, declaration) || !sameNode(resolved.name, nameNode)) return null;
+			for (const node of nodes) {
+				if (node.type !== "identifier" || node.text !== name || sameNode(node, nameNode)) continue;
+				const parent = node.parent;
+				if (parent?.type !== "call_expression" || !sameNode(parent.childForFieldName?.("function"), node)) return null;
+			}
+			return declaration;
+		};
+
+		const objectExcludesProperty = (
+			value: TreeSitterNode | null | undefined,
+			property: string,
+			depth = 0,
+		): boolean => {
+			if (!value || depth > 32) return false;
+			if (["parenthesized_expression", "as_expression", "satisfies_expression"].includes(value.type)) {
+				return objectExcludesProperty(value.children.find((child) => child.isNamed), property, depth + 1);
+			}
+			if (value.type === "ternary_expression") {
+				return objectExcludesProperty(value.childForFieldName?.("consequence"), property, depth + 1) &&
+					objectExcludesProperty(value.childForFieldName?.("alternative"), property, depth + 1);
+			}
+			if (value.type !== "object") return false;
+			return value.children.filter((child) => child.isNamed).every((member) => {
+				if (member.type === "shorthand_property_identifier") return member.text !== property;
+				if (member.type === "pair") {
+					const key = member.childForFieldName?.("key");
+					return key?.type === "property_identifier" && key.text !== property;
+				}
+				if (member.type === "spread_element") {
+					return objectExcludesProperty(member.children.find((child) => child.isNamed), property, depth + 1);
+				}
+				return false;
+			});
+		};
+		const active = new Set<string>();
+		const trace = (
+			node: TreeSitterNode | null | undefined,
+			property: string | undefined,
+			ctx: TraceContext,
+			depth: number,
+		): boolean => {
+			if (!node || depth > 32) return false;
+			const paramKey = [...ctx.params.entries()].map(([name, value]) => `${name}:${value.startIndex}`).join(",");
+			const key = `${node.startIndex}:${node.endIndex}:${property ?? ""}:${ctx.fn?.startIndex ?? -1}:${paramKey}`;
+			if (active.has(key)) return false;
+			active.add(key);
+			try {
+				if (["string", "number", "true", "false", "null"].includes(node.type)) return property === undefined;
+				if (["parenthesized_expression", "non_null_expression", "as_expression", "await_expression", "template_substitution", "unary_expression"].includes(node.type)) {
+					return trace(node.children.find((child) => child.isNamed), property, ctx, depth + 1);
+				}
+				if (node.type === "template_string") {
+					if (property !== undefined) return false;
+					return node.children.filter((child) => child.type === "template_substitution").every((child) => trace(child, undefined, ctx, depth + 1));
+				}
+				if (node.type === "binary_expression" || node.type === "ternary_expression") {
+					if (property !== undefined) return false;
+					return node.children.filter((child) => child.isNamed).every((child) => trace(child, undefined, ctx, depth + 1));
+				}
+				if (node.type === "identifier" || node.type === "shorthand_property_identifier") {
+					if (node.text === "Boolean" && property === undefined && globalIsUnbound(node)) return true;
+					return trace(bindingValue(node.text, node, property, ctx), property, ctx, depth + 1);
+				}
+				if (node.type === "object") {
+					if (!property) return false;
+					const members = node.children.filter((child) => child.isNamed);
+					if (members.some((member) => member.type !== "pair" && member.type !== "shorthand_property_identifier" && member.type !== "spread_element")) return false;
+					if (members.some((member) => member.type === "pair" && member.childForFieldName?.("key")?.type !== "property_identifier")) return false;
+					if (members.some((member) => member.type === "spread_element" && !objectExcludesProperty(member.children.find((child) => child.isNamed), property))) return false;
+					const matches = members.filter((child) => {
+						if (child.type === "pair") return child.childForFieldName?.("key")?.text === property;
+						return child.text === property;
+					});
+					if (matches.length !== 1) return false;
+					const match = matches[0];
+					return trace(match.type === "pair" ? match.childForFieldName?.("value") : match, undefined, ctx, depth + 1);
+				}
+				if (node.type === "member_expression") {
+					const object = node.childForFieldName?.("object");
+					const member = node.childForFieldName?.("property")?.text;
+					if (!object || !member || property !== undefined) return property ? false : trace(object, member, ctx, depth + 1);
+					if (/^(?:process|Bun)\.env$/.test(object.text)) {
+						const owner = object.childForFieldName?.("object");
+						return !!owner && globalIsUnbound(owner) && environmentIsStable(object);
+					}
+					if (object.text === "import.meta.env") return environmentIsStable(object);
+					return trace(object, member, ctx, depth + 1);
+				}
+				if (node.type === "new_expression") {
+					const constructor = node.childForFieldName?.("constructor");
+					if (constructor?.text !== "URL" || !globalIsUnbound(constructor) || !nativeTransformIsStable("toString")) return false;
+					const args = node.childForFieldName?.("arguments")?.children.filter((child) => child.isNamed) ?? [];
+					return args.length > 0 && args.every((arg) => trace(arg, undefined, ctx, depth + 1));
+				}
+				if (node.type === "call_expression") {
+					const callee = node.childForFieldName?.("function");
+					const args = node.childForFieldName?.("arguments")?.children.filter((child) => child.isNamed) ?? [];
+					if (callee?.type === "member_expression") {
+						const receiver = callee.childForFieldName?.("object");
+						const method = callee.childForFieldName?.("property")?.text;
+						if (method === "get" && receiver?.type === "member_expression" && receiver.childForFieldName?.("property")?.text === "env") {
+							const owner = receiver.childForFieldName?.("object");
+							return property === undefined && args.length === 1 && args[0].type === "string" && !!owner && ["Deno", "process", "Bun"].includes(owner.text) && globalIsUnbound(owner) && environmentIsStable(receiver);
+						}
+						if (!receiver || !method || !new Set(["trim", "toLowerCase", "toUpperCase", "split", "filter", "at", "slice", "join", "toString"]).has(method) || !nativeTransformIsStable(method)) return false;
+						return trace(receiver, property, ctx, depth + 1) && args.every((arg) => trace(arg, undefined, ctx, depth + 1));
+					}
+					if (callee?.type !== "identifier") return false;
+					const declaration = privateFunction(callee.text, callee);
+					if (!declaration) return false;
+					const parameterNodes = declaration.childForFieldName?.("parameters")?.children.filter((child) => child.isNamed) ?? [];
+					if (parameterNodes.length !== args.length) return false;
+					const params = new Map<string, TreeSitterNode>();
+					for (let index = 0; index < parameterNodes.length; index++) {
+						const parameter = parameterNodes[index];
+						const pattern = parameter.childForFieldName?.("pattern") ?? parameter;
+						if (pattern.type !== "identifier") return false;
+						params.set(pattern.text, args[index]);
+					}
+					const body = declaration.childForFieldName?.("body");
+					if (!body) return false;
+					const returns: TreeSitterNode[] = [];
+					const stack = [body];
+					while (stack.length > 0) {
+						const current = stack.pop();
+						if (!current) continue;
+						if (current !== body && FUNCTION_TYPES.has(current.type)) continue;
+						if (current.type === "return_statement") returns.push(current);
+						else stack.push(...(current.children ?? []));
+					}
+					const nextContext = { fn: declaration, params };
+					return returns.length > 0 && returns.every((ret) => trace(ret.children.find((child) => child.isNamed), property, nextContext, depth + 1));
+				}
+				return false;
+			} finally {
+				active.delete(key);
+			}
+		};
+
+		return trace(destination, undefined, { fn: nearestFunction(destination), params: new Map() }, 0);
+	}
+
 	private isSafeSqlAlchemyExpressionCall(node: TreeSitterNode): boolean {
 		if (node.type !== "call") return false;
 		const callee = node.children?.[0]?.text ?? "";
@@ -4696,8 +5343,18 @@ export class TreeSitterClient {
 					/^(exec|execSync)$/.test(captures.FN?.text ?? "")
 				);
 			case "ts_ssrf_sink": {
+				let unprovenDynamicDestination = false;
 				if (rootNode && captures.URL) {
 					try { if (this.isProvenExactOriginGuardedFetch(captures.URL, rootNode)) return false; } catch { /* Unknown guards retain the finding. */ }
+					try {
+						if (this.isDeploymentConfigOnlyUrl(captures.URL, rootNode)) {
+							const callee = captures.URL.childForFieldName?.("function");
+							const method = callee?.type === "member_expression" ? callee.childForFieldName?.("property")?.text : undefined;
+							if (method !== "toString") return false;
+						} else {
+							unprovenDynamicDestination = ["call_expression", "new_expression"].includes(captures.URL.type);
+						}
+					} catch { unprovenDynamicDestination = true; }
 				}
 				if (rootNode && filePath && captures.URL) {
 					try { if (this.isPrivateSdkFetchHook(captures.URL, rootNode, filePath)) return false; } catch { /* Unknown hooks retain the finding. */ }
@@ -4744,6 +5401,7 @@ export class TreeSitterClient {
 						return false;
 					}
 				}
+				if (unprovenDynamicDestination) return true;
 				// Only flag when the URL argument looks like it could carry external
 				// input: member expressions (req.url, ctx.query.x) or identifiers
 				// whose names suggest user/external provenance. Plain generic names
