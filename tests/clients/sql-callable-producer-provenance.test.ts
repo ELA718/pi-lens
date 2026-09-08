@@ -109,11 +109,30 @@ execute(input);`)).toContain("execute");
 	it("retains a producer with an extra tainted SQL call", async () => {
 		env.addFile("src/lib/rpc-mutation.ts", `const RPC_MUTATION_NAME_SET = new Set(["fixed_rpc"]);
 import { typedRpc } from "./typed-rpc";
-export function rpcMutation(config) { return input => { const params = config.buildRpcParams(input); db.execute(params.sql); return typedRpc(config.rpcName, params); }; }`);
+export function rpcMutation(config) { return input => { if (!RPC_MUTATION_NAME_SET.has(config.rpcName)) throw Error(); const params = config.buildRpcParams(input); db.execute(params.sql); return typedRpc(config.rpcName, params); }; }`);
 		env.addFile("src/lib/typed-rpc.ts", `import { supabase } from "./supabase-client"; export function typedRpc(name, params) { return supabase.rpc(name, params); }`);
 		env.addFile("src/lib/supabase-client.ts", `import { createClient } from "@supabase/supabase-js"; export const supabase = createClient("url", "key");`);
 		expect(await sqlFunctionCaptures("src/extra-call.ts", `import { rpcMutation } from "@/lib/rpc-mutation";
 const execute = rpcMutation({ rpcName: "fixed_rpc", buildRpcParams: value => ({ sql: value }) }); execute(input);`)).toContain("execute");
+	});
+
+	it("retains alias SQL flow and mutated or escaped SDK clients", async () => {
+		const consumer = `import { rpcMutation } from "@/lib/rpc-mutation";
+const execute = rpcMutation({ rpcName: "fixed_rpc", buildRpcParams: value => ({ sql: value }) }); execute(input);`;
+		installRpcBoundary();
+		expect(await sqlFunctionCaptures("src/parent-safe.ts", consumer)).toEqual([]);
+
+		env.addFile("src/lib/rpc-mutation.ts", `const RPC_MUTATION_NAME_SET = new Set(["fixed_rpc"]); import { typedRpc } from "./typed-rpc";
+export function rpcMutation(config) { return input => { if (!RPC_MUTATION_NAME_SET.has(config.rpcName)) throw Error(); const params = config.buildRpcParams(input); const alias = params; db.execute(alias.sql); return typedRpc(config.rpcName, params); }; }`);
+		expect(await sqlFunctionCaptures("src/parent-alias-sql.ts", consumer)).toContain("execute");
+
+		installRpcBoundary();
+		env.addFile("src/lib/supabase-client.ts", `import { createClient } from "@supabase/supabase-js"; export const supabase = createClient("url", "key"); supabase.rpc = (_name, params) => db.execute(params.sql);`);
+		expect(await sqlFunctionCaptures("src/parent-mutated-sdk.ts", consumer)).toContain("execute");
+
+		installRpcBoundary();
+		env.addFile("src/lib/supabase-client.ts", `import { createClient } from "@supabase/supabase-js"; export const supabase = createClient("url", "key"); consume(supabase);`);
+		expect(await sqlFunctionCaptures("src/parent-sdk-escaped.ts", consumer)).toContain("execute");
 	});
 
 	it.each([
