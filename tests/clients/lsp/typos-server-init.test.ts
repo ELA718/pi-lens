@@ -26,6 +26,8 @@ vi.mock("../../../clients/latency-logger.js", () => ({
 }));
 
 const dirs: string[] = [];
+const savedPath = process.env.PATH;
+const savedPathExt = process.env.PATHEXT;
 
 afterEach(() => {
 	for (const dir of dirs.splice(0)) {
@@ -33,12 +35,22 @@ afterEach(() => {
 	}
 	ensureTool.mockReset();
 	launchLSP.mockReset();
+	if (savedPath === undefined) delete process.env.PATH;
+	else process.env.PATH = savedPath;
+	if (savedPathExt === undefined) delete process.env.PATHEXT;
+	else process.env.PATHEXT = savedPathExt;
 	vi.resetModules();
 });
 
 function makeRoot(): string {
 	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-typos-root-"));
 	dirs.push(tmp);
+	fs.writeFileSync(
+		path.join(tmp, process.platform === "win32" ? "typos-lsp.CMD" : "typos-lsp"),
+		"",
+	);
+	process.env.PATH = `${tmp}${path.delimiter}${savedPath ?? ""}`;
+	if (process.platform === "win32") process.env.PATHEXT = ".CMD";
 	return tmp;
 }
 

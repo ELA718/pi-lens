@@ -199,8 +199,16 @@ describe("runtime-install / discovery server wiring (#241)", () => {
 		const tmp = await import("node:fs").then((fs) =>
 			fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-jdtls-lombok-")),
 		);
+		const savedPath = process.env.PATH;
+		const savedPathExt = process.env.PATHEXT;
 		try {
 			const fs = await import("node:fs");
+			fs.writeFileSync(
+				path.join(tmp, process.platform === "win32" ? "jdtls.CMD" : "jdtls"),
+				"",
+			);
+			process.env.PATH = tmp;
+			if (process.platform === "win32") process.env.PATHEXT = ".CMD";
 			fs.writeFileSync(
 				path.join(tmp, "lombok.config"),
 				"config.stopBubbling = true\n",
@@ -213,6 +221,10 @@ describe("runtime-install / discovery server wiring (#241)", () => {
 				`--jvm-arg=-javaagent:${jar}`,
 			);
 		} finally {
+			if (savedPath === undefined) delete process.env.PATH;
+			else process.env.PATH = savedPath;
+			if (savedPathExt === undefined) delete process.env.PATHEXT;
+			else process.env.PATHEXT = savedPathExt;
 			removeTempDirSync(tmp);
 		}
 	});
