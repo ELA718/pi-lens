@@ -49,6 +49,7 @@ import {
 } from "../path-utils.js";
 import type {
 	LSPClientInfo,
+	LSPDocumentSnapshot,
 	LSPPullFailure,
 	LSPShutdownOptions,
 } from "./client.js";
@@ -96,7 +97,8 @@ import {
 	createWorkspaceDiagnosticsCacheContext,
 } from "./workspace-diagnostics-cache.js";
 import {
-	attemptTsserverSyncDiagnostics,
+	attemptTsserverSyncConfirmation,
+	type TsserverSyncConfirmation,
 } from "./tsserver-sync.js";
 import {
 	isWarmAttached,
@@ -2427,7 +2429,7 @@ export class LSPService {
 					// that landed. Pushing again would clear its diagnostic cache for
 					// nothing — leave its debounce entry (and its original timestamp)
 					// alone so the window still expires naturally.
-					if (notifySkippedServerIds.has(entry.info.id)) return;
+					if (notifySkippedServerIds.has(entry.info.id)) return undefined;
 					// Same identity as the broken/demonstratedReady maps.
 					const clientKey = await this.demonstratedReadyKeyFor(
 						entry.info,
@@ -2498,9 +2500,7 @@ export class LSPService {
 		// (undefined = the race didn't produce an answer; the end-of-wait
 		// fallback below may still fill it in on a timed-out empty result).
 		let tsserverSyncEligible = false;
-		let tsserverSyncConfirmed:
-			| import("./client.js").LSPDiagnostic[]
-			| undefined;
+		let tsserverSyncConfirmed: TsserverSyncConfirmation | undefined;
 		if (diagnosticsMode !== "none") {
 			// Resolution: env wins so users can tune the cap without rebuilding.
 			// Otherwise, on the single-server hot path (primary scope), use that
@@ -2880,9 +2880,7 @@ export class LSPService {
 				// (push already answered, sync unavailable/failed, push won while
 				// in flight) so the race is then decided by the push wait's own
 				// budget — exactly today's behavior.
-				const syncRacer = (async (): Promise<
-					import("./client.js").LSPDiagnostic[]
-				> => {
+				const syncRacer = (async (): Promise<TsserverSyncConfirmation> => {
 					await new Promise<void>((resolve) => {
 						const timer = setTimeout(resolve, graceMs);
 						timer.unref?.();
@@ -2897,7 +2895,7 @@ export class LSPService {
 						return new Promise<never>(() => {});
 					}
 					try {
-						const result = await attemptTsserverSyncDiagnostics(
+						const result = await attemptTsserverSyncConfirmation(
 							filePath,
 							this,
 						);
@@ -2937,7 +2935,18 @@ export class LSPService {
 						clientScope,
 						diagnosticsMode,
 						mode: "race",
-						confirmedDiagnosticCount: tsserverSyncConfirmed.length,
+						confirmedDiagnosticCount:
+							tsserverSyncConfirmed.diagnostics.length,
+						documentVersion: tsserverSyncConfirmed.binding.version,
+						documentUri: tsserverSyncConfirmed.attribution.uri,
+						documentGeneration:
+							tsserverSyncConfirmed.attribution.documentGeneration,
+						clientInstanceId:
+							tsserverSyncConfirmed.attribution.clientInstanceId,
+						semanticRequestSeq:
+							tsserverSyncConfirmed.attribution.semanticRequestSeq,
+						syntacticRequestSeq:
+							tsserverSyncConfirmed.attribution.syntacticRequestSeq,
 						budgetMs: timeoutMs,
 						savedVsBudgetMs: Math.max(0, timeoutMs - waitedMs),
 					},
@@ -3094,18 +3103,16 @@ export class LSPService {
 		};
 		let collected = options.collectDiagnostics
 			? tsserverSyncConfirmed !== undefined
-				? mergeLspDiagnostics(tsserverSyncConfirmed)
+				? mergeLspDiagnostics(tsserverSyncConfirmed.diagnostics)
 				: await collectPublishedDiagnostics()
 			: undefined;
-		// #1095 (P3-b): whether `collected` came from a tsserver sync confirm
-		// (`tsserverSyncRequest`) rather than the publish cache. A sync-confirmed
-		// result is authoritative for the CURRENT buffer but is NOT tied to the
-		// publish-path content binding (`diagnosticBindings`, set on publish), so
-		// composing that binding here could let a STALE publish fingerprint demote a
-		// genuinely-fresh sync answer to `false`. The end-of-wait fallback below can
-		// also set this. When true, the binding is surfaced as "unknown" (honest,
-		// non-demoting) rather than the stale publish binding.
+		// A sync confirmation now carries the exact client identity, document
+		// generation, URI, sent version/hash, and both correlated response sequences.
+		// The end-of-wait path can replace only PRIMARY collected diagnostics; the
+		// eligibility gate excludes all/auxiliary scope so real auxiliary failures and
+		// diagnostics remain untouched and inconclusive there.
 		let syncConfirmed = tsserverSyncConfirmed !== undefined;
+		let syncConfirmedBinding = tsserverSyncConfirmed?.binding;
 
 		// #707 end-of-wait fallback: when the racing confirm did NOT decide the
 		// wait (sync unavailable/failed mid-race, or push resolved as a bare
@@ -3129,7 +3136,7 @@ export class LSPService {
 			collected.length === 0
 		) {
 			try {
-				const syncResult = await attemptTsserverSyncDiagnostics(
+				const syncResult = await attemptTsserverSyncConfirmation(
 					filePath,
 					this,
 				);
@@ -3138,8 +3145,9 @@ export class LSPService {
 					// Clear the timed-out flag so the touch is no longer inconclusive.
 					diagnosticsTimedOut = false;
 					syncConfirmed = true;
-					collected = syncResult.length > 0
-						? mergeLspDiagnostics(syncResult)
+					syncConfirmedBinding = syncResult.binding;
+					collected = syncResult.diagnostics.length > 0
+						? mergeLspDiagnostics(syncResult.diagnostics)
 						: [];
 					logLatency({
 						type: "phase",
@@ -3152,6 +3160,16 @@ export class LSPService {
 							diagnosticsMode,
 							mode: "end-of-wait",
 							confirmedDiagnosticCount: collected.length,
+							documentVersion: syncResult.binding.version,
+							documentUri: syncResult.attribution.uri,
+							documentGeneration:
+								syncResult.attribution.documentGeneration,
+							clientInstanceId:
+								syncResult.attribution.clientInstanceId,
+							semanticRequestSeq:
+								syncResult.attribution.semanticRequestSeq,
+							syntacticRequestSeq:
+								syncResult.attribution.syntacticRequestSeq,
 						},
 					});
 				}
@@ -3322,10 +3340,7 @@ export class LSPService {
 		let binding: DiagnosticBinding | undefined;
 		if (collected !== undefined) {
 			binding = syncConfirmed
-				? // #1095 (P3-b): a tsserver sync-confirmed result is authoritative for
-					// the current buffer but not tied to the publish-path fingerprint —
-					// surface "unknown" so a stale publish binding can't demote it.
-					{ boundToCurrentDisk: "unknown" }
+				? this.mergeBinding(filePath, [syncConfirmedBinding])
 				: this.mergeBinding(
 						filePath,
 						// Optional-chain so a client without the getter (test doubles, a
@@ -3844,6 +3859,16 @@ export class LSPService {
 		}
 		const first = this.state.clients.values().next().value;
 		return first ? first.getAdvertisedCommands() : [];
+	}
+
+	async getDocumentSnapshot(
+		filePath: string,
+	): Promise<LSPDocumentSnapshot | undefined> {
+		const spawned = await this.getClientForFile(
+			filePath,
+			NAV_CLIENT_WAIT_TIMEOUT_MS,
+		);
+		return spawned?.client.getDocumentSnapshot?.(filePath);
 	}
 
 	/**
@@ -4583,6 +4608,8 @@ export class LSPService {
 	async runWorkspaceDiagnostics(
 		cwd: string,
 		options: {
+			/** Primary-only scans never start, wait for, or cache auxiliary servers. */
+			clientScope?: "all" | "primary";
 			maxFiles?: number;
 			signal?: AbortSignal;
 			onProgress?: (completed: number, total: number) => void;
@@ -4609,6 +4636,11 @@ export class LSPService {
 		const startedAt = Date.now();
 		const root = path.resolve(cwd);
 		const { signal } = options;
+		const clientScope = options.clientScope ?? "all";
+		const excludedServerIds =
+			clientScope === "all"
+				? WORKSPACE_SWEEP_EXCLUDED_SERVER_IDS
+				: new Set<string>();
 		// Cap the per-file LSP sweep: a Next.js-scale project can route thousands
 		// of files through the language server at concurrency 8, and without a
 		// caller cap that grinds for tens of minutes (#341). `maxFiles` lets
@@ -4647,8 +4679,8 @@ export class LSPService {
 		// (this sweep's `excludeServerIds` differs from that tool's).
 		const workspaceDiagnosticsCacheCtx =
 			createWorkspaceDiagnosticsCacheContext(root);
-		const workspaceSweepScopeKey = buildScopeKey("all", [
-			...WORKSPACE_SWEEP_EXCLUDED_SERVER_IDS,
+		const workspaceSweepScopeKey = buildScopeKey(clientScope, [
+			...excludedServerIds,
 		]);
 		const cachedResults: LSPWorkspaceDiagnosticResult[] = [];
 		const filesToTouch: string[] = [];
@@ -4809,10 +4841,16 @@ export class LSPService {
 				// exactly like a thrown error already did.
 				const preOpenAttempt = withDeadline(
 					(async () => {
-						const { clients } = await this.getClientsForFile(
-							filePath,
-							WORKSPACE_SWEEP_EXCLUDED_SERVER_IDS,
-						);
+						let clients: SpawnedServer[];
+						if (clientScope === "primary") {
+							const primary = await this.getClientForFile(filePath);
+							clients = primary ? [primary] : [];
+						} else {
+							clients = (await this.getClientsForFile(
+								filePath,
+								excludedServerIds,
+							)).clients;
+						}
 						for (const entry of clients) {
 							try {
 								await entry.client.notify.open(filePath, content, languageId);
@@ -4865,7 +4903,7 @@ export class LSPService {
 				// onTimeout:"undefined" so a hung file yields no diagnostics and the
 				// worker moves on; a real touchFile rejection still propagates to the
 				// catch below and is recorded as an error.
-				const attached = isWarmAttached()
+				const attached = clientScope === "all" && isWarmAttached()
 					? await tryWarmAttachedDiagnostics(
 							filePath,
 							content,
@@ -4890,13 +4928,13 @@ export class LSPService {
 							this.touchFile(filePath, content, {
 								diagnostics: "document",
 								collectDiagnostics: true,
-								clientScope: "all",
+								clientScope,
 								source: "lens_diagnostics_full",
 								// #584: opengrep's findings for a full sweep come from the
 								// `opengrep-client.ts` CLI extractor (one project-wide scan,
 								// cached, read via extractors.ts) instead — see the
 								// `excludeServerIds` doc on `LSPTouchFileOptions`.
-								excludeServerIds: WORKSPACE_SWEEP_EXCLUDED_SERVER_IDS,
+								excludeServerIds: excludedServerIds,
 								// #645: lets a workspaceIndexing server (marksman) pay its
 								// full wait budget only once across this whole sweep.
 								sweepIndexGate,

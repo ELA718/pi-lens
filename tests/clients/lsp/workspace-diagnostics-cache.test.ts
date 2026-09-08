@@ -70,7 +70,12 @@ describe("loadWorkspaceDiagnosticsCache / saveWorkspaceDiagnosticsCache (#671)",
 	});
 
 	it("fails open on a corrupt cache file", () => {
-		const cacheFile = path.join(tmp, ".pi-lens", "cache", "lsp-workspace-diagnostics.json");
+		const cacheFile = path.join(
+			tmp,
+			".pi-lens",
+			"cache",
+			"lsp-workspace-diagnostics.json",
+		);
 		fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
 		fs.writeFileSync(cacheFile, "{ not json");
 		expect(loadWorkspaceDiagnosticsCache(tmp)).toBeUndefined();
@@ -85,7 +90,12 @@ describe("loadWorkspaceDiagnosticsCache / saveWorkspaceDiagnosticsCache (#671)",
 	});
 
 	it("fails open when entries is missing/malformed", () => {
-		const cacheFile = path.join(tmp, ".pi-lens", "cache", "lsp-workspace-diagnostics.json");
+		const cacheFile = path.join(
+			tmp,
+			".pi-lens",
+			"cache",
+			"lsp-workspace-diagnostics.json",
+		);
 		fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
 		fs.writeFileSync(
 			cacheFile,
@@ -128,9 +138,7 @@ describe("isEntryFresh (#671)", () => {
 		const scannedAt = Date.now() - 10_000; // entry recorded 10s ago
 		const entry = makeEntry({ mtimeMs, scannedAt });
 		// Dependency's current mtime is "now" — after scannedAt.
-		expect(
-			isEntryFresh(filePath, entry, () => [depPath]),
-		).toBe(false);
+		expect(isEntryFresh(filePath, entry, () => [depPath])).toBe(false);
 	});
 
 	it("stays fresh when every dependency is older than the entry's scannedAt", () => {
@@ -153,7 +161,9 @@ describe("isEntryFresh (#671)", () => {
 
 describe("buildScopeKey / cacheKeyFor (#671)", () => {
 	it("produces a stable key independent of exclude-list ordering", () => {
-		expect(buildScopeKey("all", ["b", "a"])).toBe(buildScopeKey("all", ["a", "b"]));
+		expect(buildScopeKey("all", ["b", "a"])).toBe(
+			buildScopeKey("all", ["a", "b"]),
+		);
 	});
 
 	it("distinguishes scopes that differ in clientScope or exclusions", () => {
@@ -210,7 +220,10 @@ describe("WorkspaceDiagnosticsCacheContext (#671)", () => {
 			{
 				severity: 1 as const,
 				message: "boom",
-				range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+				range: {
+					start: { line: 0, character: 0 },
+					end: { line: 0, character: 1 },
+				},
 			},
 		];
 
@@ -462,6 +475,59 @@ describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 		// The mismatched entry was NOT served — a.ts (the only file) fell through to
 		// a fresh touch. A served cache hit would have produced zero wait calls.
 		expect(waitCalls.length).toBeGreaterThan(0);
+	});
+	it("keeps primary-scope cache entries isolated from all-scope entries", async () => {
+		const file = path.join(tmpSweep, "scope.ts");
+		fs.writeFileSync(file, "const scope = 1;\n");
+		const tsServer = makeTsServer(tmpSweep);
+		getServersForFileWithConfig.mockReturnValue([tsServer]);
+		const { client, waitCalls } = makeFakeClient(tmpSweep);
+		createLSPClient.mockResolvedValue(client);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		await service.runWorkspaceDiagnostics(tmpSweep, { files: [file] });
+		const afterAll = waitCalls.length;
+		await service.runWorkspaceDiagnostics(tmpSweep, {
+			files: [file],
+			clientScope: "primary",
+		});
+		expect(waitCalls.length).toBeGreaterThan(afterAll);
+		const afterPrimary = waitCalls.length;
+		await service.runWorkspaceDiagnostics(tmpSweep, {
+			files: [file],
+			clientScope: "primary",
+		});
+		expect(waitCalls.length).toBe(afterPrimary);
+	});
+
+	it("primary-scope workspace diagnostics never start an auxiliary server", async () => {
+		const file = path.join(tmpSweep, "primary.ts");
+		fs.writeFileSync(file, "const primary = 1;\n");
+		const tsServer = makeTsServer(tmpSweep);
+		const auxiliary = {
+			...makeTsServer(tmpSweep),
+			id: "ast-grep",
+			role: "auxiliary" as const,
+		};
+		getServersForFileWithConfig.mockReturnValue([tsServer, auxiliary]);
+		const { client } = makeFakeClient(tmpSweep);
+		createLSPClient.mockImplementation(
+			async ({ serverId }: { serverId: string }) => ({
+				...client,
+				serverId,
+			}),
+		);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		await new LSPService().runWorkspaceDiagnostics(tmpSweep, {
+			files: [file],
+			clientScope: "primary",
+		});
+
+		expect(
+			createLSPClient.mock.calls.map(([options]) => options.serverId),
+		).not.toContain("ast-grep");
 	});
 });
 
