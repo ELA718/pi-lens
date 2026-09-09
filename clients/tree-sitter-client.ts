@@ -2747,6 +2747,102 @@ export class TreeSitterClient {
 			return parent?.type === "call_expression" &&
 				isSameNode(parent.childForFieldName?.("function"), candidate);
 		};
+		const globalFetchAccess = (candidate: TreeSitterNode | null | undefined) => {
+			if (
+				(candidate?.type !== "member_expression" && candidate?.type !== "subscript_expression") ||
+				candidate.childForFieldName?.("object")?.type !== "identifier" ||
+				candidate.childForFieldName?.("object")?.text !== "globalThis"
+			) return false;
+			if (candidate.type === "member_expression") {
+				return candidate.childForFieldName?.("property")?.text === "fetch";
+			}
+			const index = candidate.childForFieldName?.("index");
+			return index?.type === "string" && index.text.slice(1, -1) === "fetch";
+		};
+		const directGlobalFetch = (candidate: TreeSitterNode | null | undefined) =>
+			candidate?.type === "member_expression" && globalFetchAccess(candidate);
+		const directGlobalFetchBindCall = (candidate: TreeSitterNode | null | undefined) => {
+			if (candidate?.type !== "call_expression") return false;
+			const fn = candidate.childForFieldName?.("function");
+			if (
+				fn?.type !== "member_expression" ||
+				fn.childForFieldName?.("property")?.text !== "bind" ||
+				!directGlobalFetch(fn.childForFieldName?.("object"))
+			) return false;
+			const args = candidate.childForFieldName?.("arguments")?.children.filter(
+				(child) => child.isNamed && child.type !== "comment",
+			) ?? [];
+			return args.length === 1 && args[0].type === "identifier" && args[0].text === "globalThis";
+		};
+		const staticString = (
+			candidate: TreeSitterNode | null | undefined,
+			stringDepth = 0,
+		): string | undefined => {
+			if (!candidate || stringDepth > 8) return undefined;
+			if (candidate.type === "string") {
+				return candidate.text.includes("\\") ? undefined : candidate.text.slice(1, -1);
+			}
+			if (candidate.type === "parenthesized_expression") {
+				return staticString(
+					candidate.children.find((child) => child.isNamed),
+					stringDepth + 1,
+				);
+			}
+			if (
+				candidate.type !== "binary_expression" ||
+				!candidate.children.some((child) => child.text === "+")
+			) return undefined;
+			const left = staticString(candidate.childForFieldName?.("left"), stringDepth + 1);
+			const right = staticString(candidate.childForFieldName?.("right"), stringDepth + 1);
+			return left === undefined || right === undefined ? undefined : left + right;
+		};
+		const isHarmlessMetaObjectReference = (
+			candidate: TreeSitterNode,
+			name: "Object" | "Reflect",
+		) => {
+			const access = candidate.parent;
+			if (
+				(access?.type !== "member_expression" && access?.type !== "subscript_expression") ||
+				!isSameNode(access.childForFieldName?.("object"), candidate)
+			) return false;
+			const property = access.type === "member_expression"
+				? access.childForFieldName?.("property")?.text
+				: staticString(access.childForFieldName?.("index"));
+			if (!property) return false;
+			const unsafe = name === "Object"
+				? ["assign", "defineProperties", "defineProperty", "getPrototypeOf", "setPrototypeOf"]
+				: ["defineProperty", "deleteProperty", "getPrototypeOf", "set", "setPrototypeOf"];
+			return !unsafe.includes(property);
+		};
+		const isProvenNativeGlobalFetchBind = (call: TreeSitterNode | null | undefined) => {
+			if (
+				!directGlobalFetchBindCall(call) ||
+				(references.get("Function")?.length ?? 0) > 0 ||
+				(references.get("fetch")?.length ?? 0) > 0 ||
+				(references.get("eval")?.length ?? 0) > 0
+			) return false;
+			return nodes.every((candidate) => {
+				if (staticString(candidate) === "bind") return false;
+				if (candidate.type !== "member_expression" && candidate.type !== "subscript_expression") {
+					return true;
+				}
+				const property = candidate.childForFieldName?.("property")?.text;
+				if (property === "bind") {
+					return candidate.parent?.type === "call_expression" &&
+						isSameNode(candidate.parent.childForFieldName?.("function"), candidate) &&
+						directGlobalFetchBindCall(candidate.parent);
+				}
+				if (!globalFetchAccess(candidate)) return true;
+				const parent = candidate.parent;
+				if (parent?.type === "unary_expression" && parent.children.some((child) => child.text === "!")) {
+					return true;
+				}
+				return parent?.type === "member_expression" &&
+					parent.childForFieldName?.("property")?.text === "bind" &&
+					parent.parent?.type === "call_expression" &&
+					directGlobalFetchBindCall(parent.parent);
+			});
+		};
 		const isHarmlessGlobalThisReference = (candidate: TreeSitterNode) => {
 			const parent = candidate.parent;
 			if (parent && isSameNode(parent.childForFieldName?.("object"), candidate)) {
@@ -2759,9 +2855,22 @@ export class TreeSitterClient {
 				const literal = index.text.slice(1, -1);
 				return !literal.includes("\\") && literal !== "RegExp";
 			}
-			return false;
+			return parent?.type === "arguments" && isProvenNativeGlobalFetchBind(parent.parent);
 		};
 		if (
+			nodes.some((candidate) =>
+				["class", "class_declaration", "function_expression", "generator_function", "generator_function_declaration"].includes(
+					candidate.type,
+				) && ["RegExp", "globalThis", "fetch", "Function"].includes(
+					candidate.childForFieldName?.("name")?.text ?? "",
+				)
+			) ||
+			(references.get("Object") ?? []).some(
+				(candidate) => !isHarmlessMetaObjectReference(candidate, "Object"),
+			) ||
+			(references.get("Reflect") ?? []).some(
+				(candidate) => !isHarmlessMetaObjectReference(candidate, "Reflect"),
+			) ||
 			(references.get("RegExp") ?? []).some(
 				(candidate) => !isNativeRegExpConstructorReference(candidate),
 			) ||
