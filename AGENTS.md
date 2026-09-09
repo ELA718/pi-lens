@@ -59,6 +59,14 @@ count but health should retain only one updated entry per subject. Both reset
 with the ledger at the session boundary; do not add caller-local duplicate
 sets or count one blocked action at both policy gates. (#1366, #1292)
 
+Workspace sweep pre-open and document-touch waits pass their caller signal to
+`withDeadline`. Cancellation settles only that wait, clears its timer and abort
+listener, and leaves shared LSP producers alive. Completed findings survive;
+an interrupted touch remains unconfirmed (`timedOut`), and late producer
+settlement cannot append results. Check cancellation again after acquiring a
+client before sending pre-open notifications. Pre-aborted and expired waits
+must still observe producer rejections. (ELA718/pi-lens#4)
+
 ## Maintaining this file (do this on every commit)
 
 AGENTS.md is the durable context handed to every agent that works on pi-lens. **Update it as part of the same commit that changes the world it describes** — never as a follow-up:
