@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync } from "../clients/test-utils.js";
 
@@ -614,11 +615,18 @@ describe("lsp_diagnostics tool", () => {
 	// command, not push-timing-dependent, so an empty body IS a confirmed clean
 	// answer and a non-empty body is real diagnostics that must be surfaced.
 	describe("#611 tsserver sync escape hatch", () => {
+		beforeEach(() => {
+			(mocked.service as any).getDocumentSnapshot = vi.fn(async (file: string) => ({
+				clientInstanceId: "fixture", filePath: file, uri: pathToFileURL(file).href,
+				documentGeneration: 1, version: 1, contentHash: "fixture-content",
+			}));
+		});
 		function mockExecuteCommand(
 			bodies: Partial<
 				Record<"semanticDiagnosticsSync" | "syntacticDiagnosticsSync", unknown[]>
 			>,
 		) {
+			let requestSeq = 0;
 			return vi
 				.fn()
 				.mockImplementation(
@@ -629,6 +637,7 @@ describe("lsp_diagnostics tool", () => {
 						return {
 							executed: true,
 							result: {
+								type: "response", command: sub, request_seq: ++requestSeq,
 								success: true,
 								body: bodies[sub] ?? [],
 							},

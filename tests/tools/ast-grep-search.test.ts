@@ -1,4 +1,5 @@
 import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
 	_telemetryClassificationErrorForTest,
@@ -639,7 +640,7 @@ describe("ast_grep_search tool", () => {
 			);
 			expect(searchWithRule).toHaveBeenCalledWith(
 				expect.any(String),
-				["src/"],
+				[path.resolve("src/")],
 				expect.objectContaining({ deadlineAt: expect.any(Number) }),
 			);
 		});

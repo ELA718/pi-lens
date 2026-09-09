@@ -3030,6 +3030,418 @@ export class TreeSitterClient {
 		return isStaticSqlExpression(node ?? null, root, TREE_SITTER_SQL_ADAPTER);
 	}
 
+	/** Prove an ambiguously named call reaches a fixed RPC/mutation boundary. */
+	private isProvenNonSqlCallable(
+		callee: TreeSitterNode | undefined,
+		receiver: TreeSitterNode | undefined,
+		root: TreeSitterNode,
+		filePath: string,
+	): boolean {
+		const maxNodes = 50_000;
+		let filesRead = 0;
+		const active = new Set<string>();
+		const openedTrees: TreeSitterTree[] = [];
+		const same = (a?: TreeSitterNode | null, b?: TreeSitterNode | null) =>
+			Boolean(a && b && a.startIndex === b.startIndex && a.endIndex === b.endIndex);
+		const nodes = (start: TreeSitterNode): TreeSitterNode[] | undefined => {
+			const result: TreeSitterNode[] = [], pending = [start];
+			while (pending.length && result.length < maxNodes) {
+				const node = pending.pop();
+				if (!node) return undefined;
+				if (node.type === "ERROR" || node.isMissing) return undefined;
+				result.push(node); pending.push(...node.children);
+			}
+			return pending.length ? undefined : result;
+		};
+		const named = (node?: TreeSitterNode | null) => node?.children.filter(child => child.isNamed && child.type !== "comment") ?? [];
+		const unwrappedText = (node?: TreeSitterNode | null): string | undefined => {
+			if (!node) return undefined;
+			return ["as_expression", "type_assertion", "parenthesized_expression"].includes(node.type)
+				? unwrappedText(named(node)[0])
+				: node.text;
+		};
+		const args = (call?: TreeSitterNode | null) => {
+			const list = call?.type === "call_expression" ? call.childForFieldName?.("arguments") : undefined;
+			const values = named(list);
+			return list && !values.some(value => value.type === "spread_element") ? values : undefined;
+		};
+		const params = (fn?: TreeSitterNode | null) => {
+			const list = fn?.childForFieldName?.("parameters"), single = fn?.childForFieldName?.("parameter");
+			const result: TreeSitterNode[] = [];
+			for (const item of list ? named(list) : single ? [single] : []) {
+				const pattern = item.type === "identifier" ? item : item.childForFieldName?.("pattern");
+				if (pattern?.type !== "identifier") return undefined;
+				result.push(pattern);
+			}
+			return result;
+		};
+		const imported = (name: string, treeRoot: TreeSitterNode) => {
+			const allNodes = nodes(treeRoot) ?? [];
+			const matches = allNodes.filter(node => node.type === "import_specifier" &&
+				(node.childForFieldName?.("alias") ?? node.childForFieldName?.("name"))?.text === name);
+			if (matches.length !== 1) return undefined;
+			if (allNodes.some(node =>
+				(node.type === "variable_declarator" && node.childForFieldName?.("name")?.text === name) ||
+				(["function_declaration", "class_declaration"].includes(node.type) && node.childForFieldName?.("name")?.text === name) ||
+				(["assignment_expression", "augmented_assignment_expression"].includes(node.type) && node.childForFieldName?.("left")?.text === name)
+			)) return undefined;
+			if (allNodes.some(node => ["required_parameter", "optional_parameter"].includes(node.type) && node.childForFieldName?.("pattern")?.text === name)) return undefined;
+			let statement: TreeSitterNode | null | undefined = matches[0].parent;
+			while (statement && statement.type !== "import_statement") statement = statement.parent;
+			const source = statement?.childForFieldName?.("source")?.text.slice(1, -1);
+			const original = matches[0].childForFieldName?.("name")?.text;
+			return source && original ? { source, original } : undefined;
+		};
+		const targets = (sourceFile: string, source: string) => {
+			const cwd = findNearestMarkerRoot(path.dirname(sourceFile), ["package.json"], { boundaries: [".git"] });
+			if (!cwd) return [];
+			return source.startsWith(".") ? resolveImportToFiles(cwd, sourceFile, "tsx", source) :
+				resolveAliasedImport(cwd, source, path.dirname(sourceFile));
+		};
+		type Exported = { node: TreeSitterNode; root: TreeSitterNode; file: string };
+		const resolveExport = (sourceFile: string, exportName: string, depth = 0): Exported | undefined => {
+			const resolved = path.resolve(sourceFile);
+			if (depth > 8 || filesRead >= 24 || active.has(resolved)) return undefined;
+			try {
+				if (fs.statSync(resolved).size > 256_000) return undefined;
+				const parser = this.parsers.get(resolved.endsWith(".tsx") ? "tsx" : "typescript");
+				if (!parser) return undefined;
+				filesRead++; active.add(resolved);
+				const tree = parser.parse(fs.readFileSync(resolved, "utf8"));
+				openedTrees.push(tree);
+				{
+					if (!nodes(tree.rootNode)) return undefined;
+					for (const statement of tree.rootNode.children.filter(node => node.type === "export_statement")) {
+						const declaration = statement.childForFieldName?.("declaration") ?? statement.children.find(node => ["function_declaration", "lexical_declaration"].includes(node.type));
+						if (declaration?.type === "function_declaration" && declaration.childForFieldName?.("name")?.text === exportName)
+							return { node: declaration, root: tree.rootNode, file: resolved };
+						const declarator = declaration?.type === "lexical_declaration" ? declaration.children.find(node => node.type === "variable_declarator" && node.childForFieldName?.("name")?.text === exportName) : undefined;
+						if (declarator) return { node: declarator, root: tree.rootNode, file: resolved };
+						const source = statement.childForFieldName?.("source")?.text.slice(1, -1);
+						const specifier = statement.children.flatMap(child => child.children).find(node => node.type === "export_specifier" &&
+							(node.childForFieldName?.("alias") ?? node.childForFieldName?.("name"))?.text === exportName);
+						if (source && specifier) {
+							const next = targets(resolved, source);
+							if (next.length === 1) return resolveExport(next[0], specifier.childForFieldName?.("name")?.text ?? exportName, depth + 1);
+						}
+					}
+				}
+			} catch { return undefined; } finally { active.delete(resolved); }
+			return undefined;
+		};
+		const importedExport = (name: string, treeRoot: TreeSitterNode, sourceFile: string) => {
+			const binding = imported(name, treeRoot);
+			if (!binding || (!binding.source.startsWith(".") && !binding.source.startsWith("@/") && !binding.source.startsWith("@domains/"))) return undefined;
+			const next = targets(sourceFile, binding.source);
+			return next.length === 1 ? resolveExport(next[0], binding.original) : undefined;
+		};
+		const pair = (object: TreeSitterNode, key: string) => {
+			const found = named(object).filter(node => node.type === "pair" && node.childForFieldName?.("key")?.text === key);
+			return found.length === 1 ? found[0].childForFieldName?.("value") ?? undefined : undefined;
+		};
+		const resolveConstAtUse = (name: string, use: TreeSitterNode, treeRoot: TreeSitterNode) => {
+			const scopes: TreeSitterNode[] = [];
+			for (let current: TreeSitterNode | null | undefined = use; current; current = current.parent) {
+				if (["statement_block", "function_declaration", "function_expression", "arrow_function", "program"].includes(current.type)) scopes.push(current);
+			}
+			const ownerScope = (node: TreeSitterNode) => {
+				for (let current: TreeSitterNode | null | undefined = node.parent; current; current = current.parent) {
+					if (["statement_block", "function_declaration", "function_expression", "arrow_function", "program"].includes(current.type)) return current;
+				}
+				return treeRoot;
+			};
+			const all = nodes(treeRoot) ?? [];
+			for (const scope of scopes) {
+				if (all.some(node => ["required_parameter", "optional_parameter"].includes(node.type) && same(ownerScope(node), scope) && node.childForFieldName?.("pattern")?.text === name)) return undefined;
+				const declarations = all.filter(node => node.type === "variable_declarator" && same(ownerScope(node), scope) && node.childForFieldName?.("name")?.text === name);
+				if (declarations.length === 0) continue;
+				if (declarations.length !== 1 || declarations[0].startIndex >= use.startIndex || declarations[0].parent?.type !== "lexical_declaration" || !declarations[0].parent.children.some(node => node.type === "const")) return undefined;
+				if (all.some(node => ["assignment_expression", "augmented_assignment_expression"].includes(node.type) && same(ownerScope(node), scope) && node.childForFieldName?.("left")?.text === name)) return undefined;
+				return declarations[0].childForFieldName?.("value") ?? undefined;
+			}
+			return undefined;
+		};
+		const sdkBindingIsContained = (name: string, treeRoot: TreeSitterNode): boolean => {
+			const all = nodes(treeRoot) ?? [];
+			const aliases = new Set([name]);
+			let changed = true;
+			while (changed && aliases.size <= 16) {
+				changed = false;
+				for (const declaration of all.filter(node => node.type === "variable_declarator")) {
+					const declared = declaration.childForFieldName?.("name"), value = declaration.childForFieldName?.("value");
+					if (declared?.type !== "identifier" || !value || aliases.has(declared.text)) continue;
+					let source = value;
+					while (["as_expression", "type_assertion", "parenthesized_expression"].includes(source.type)) source = named(source)[0];
+					if (source?.type === "identifier" && aliases.has(source.text)) {
+						aliases.add(declared.text); changed = true;
+					}
+				}
+			}
+			if (aliases.size > 16) return false;
+			const safeRpcInstrumentation = (assignment: TreeSitterNode) => {
+				const left = assignment.childForFieldName?.("left"), right = assignment.childForFieldName?.("right");
+				if (left?.childForFieldName?.("property")?.text !== "rpc" || right?.type !== "arrow_function") return false;
+				const forwarded = (nodes(right) ?? []).filter(node => node.type === "call_expression").map(node => node.childForFieldName?.("function")?.text);
+				if (!forwarded.includes("originalRpc") || !forwarded.includes("wrapPostgrestBuilder")) return false;
+				const original = all.filter(node => node.type === "variable_declarator" && node.childForFieldName?.("name")?.text === "originalRpc");
+				return original.length === 1 && /\.rpc\.bind\(/.test(original[0].childForFieldName?.("value")?.text ?? "");
+			};
+			const safeReference = (reference: TreeSitterNode) => {
+				const parent = reference.parent;
+				if (parent?.type === "variable_declarator") return same(parent.childForFieldName?.("name"), reference) || same(parent.childForFieldName?.("value"), reference);
+				if (["as_expression", "member_expression", "subscript_expression"].includes(parent?.type ?? "")) {
+					const assignment = parent?.parent?.type === "assignment_expression" && same(parent.parent.childForFieldName?.("left"), parent) ? parent.parent : undefined;
+					return !assignment || parent?.childForFieldName?.("property")?.text !== "rpc" || safeRpcInstrumentation(assignment);
+				}
+				const list = parent?.type === "arguments" ? parent : undefined;
+				const callFn = list?.parent?.childForFieldName?.("function");
+				return callFn?.type === "member_expression" && callFn.childForFieldName?.("property")?.text === "bind";
+			};
+			return all.filter(node => node.type === "identifier" && aliases.has(node.text)).every(safeReference);
+		};
+
+		const sdkOrigin = (name: string, treeRoot: TreeSitterNode, sourceFile: string) => {
+			const origin = importedExport(name, treeRoot, sourceFile);
+			if (origin?.node.type !== "variable_declarator" || imported("createClient", origin.root)?.source !== "@supabase/supabase-js" || !sdkBindingIsContained(name, origin.root)) return false;
+			const seen = new Set<string>();
+			const reachesCreateClient = (value: TreeSitterNode | null | undefined, depth = 0): boolean => {
+				if (!value || depth > 12) return false;
+				if (["as_expression", "parenthesized_expression"].includes(value.type)) return reachesCreateClient(named(value)[0], depth + 1);
+				if (value.type === "identifier") {
+					if (seen.has(value.text)) return false;
+					seen.add(value.text);
+					return reachesCreateClient(this.resolveFileConstValueNode(value.text, origin.root), depth + 1);
+				}
+				if (value.type !== "call_expression") return false;
+				const fn = value.childForFieldName?.("function");
+				if (fn?.type !== "identifier") return false;
+				if (fn.text === "createClient") return imported("createClient", origin.root)?.source === "@supabase/supabase-js";
+				const functions = (nodes(origin.root) ?? []).filter(node => node.type === "function_declaration" && node.childForFieldName?.("name")?.text === fn.text);
+				if (functions.length !== 1) return false;
+				const returns = (nodes(functions[0]) ?? []).filter(node => node.type === "return_statement");
+				return returns.length > 0 && returns.every(statement => {
+					const returned = named(statement)[0];
+					if (reachesCreateClient(returned, depth + 1)) return true;
+					if (returned?.type !== "member_expression") return false;
+					const assignments = (nodes(functions[0]) ?? []).filter(node => node.type === "assignment_expression" && node.childForFieldName?.("left")?.text === returned.text);
+					return assignments.length === 1 && reachesCreateClient(assignments[0].childForFieldName?.("right"), depth + 1);
+				});
+			};
+			return reachesCreateClient(origin.node.childForFieldName?.("value"));
+		};
+		const sdkValueOrigin = (value: TreeSitterNode | null | undefined, treeRoot: TreeSitterNode, sourceFile: string, seen = new Set<string>()): boolean => {
+			if (!value || seen.size > 8) return false;
+			if (["as_expression", "type_assertion", "parenthesized_expression"].includes(value.type)) return sdkValueOrigin(named(value)[0], treeRoot, sourceFile, seen);
+			if (value.type !== "identifier" || seen.has(value.text)) return false;
+			if (imported(value.text, treeRoot)) return sdkOrigin(value.text, treeRoot, sourceFile);
+			const next = this.resolveFileConstValueNode(value.text, treeRoot);
+			return sdkValueOrigin(next, treeRoot, sourceFile, new Set(seen).add(value.text));
+		};
+		const rpcFactoryCall = (call: TreeSitterNode, treeRoot: TreeSitterNode, sourceFile: string) => {
+			const fn = call.childForFieldName?.("function"), config = args(call)?.[0];
+			const mapper = config?.type === "object" ? pair(config, "buildRpcParams") : undefined;
+			if (fn?.type !== "identifier" || config?.type !== "object" || named(config).some(node => node.type !== "pair") ||
+				pair(config, "rpcName")?.type !== "string" || !mapper || !["arrow_function", "function_expression"].includes(mapper.type) ||
+				(nodes(mapper) ?? []).some(node => node.type === "call_expression")) return false;
+			const producer = importedExport(fn.text, treeRoot, sourceFile);
+			if (producer?.node.type !== "function_declaration" || producer.node.childForFieldName?.("name")?.text !== "rpcMutation" ||
+				!/RPC_MUTATION_NAME_SET\.has\(config\.rpcName\)/s.test(producer.node.text)) return false;
+			const returnedCallbacks = (nodes(producer.node) ?? []).filter(node => node.type === "return_statement").flatMap(node => named(node)).filter(node => ["arrow_function", "function_expression"].includes(node.type));
+			if (returnedCallbacks.length !== 1) return false;
+			const input = params(returnedCallbacks[0])?.[0]?.text;
+			if (!input) return false;
+			const callbackNodes = nodes(returnedCallbacks[0]) ?? [];
+			const tainted = new Set([input]);
+			let changed = true;
+			while (changed && tainted.size <= 32) {
+				changed = false;
+				for (const declaration of callbackNodes.filter(node => node.type === "variable_declarator")) {
+					const declared = declaration.childForFieldName?.("name"), value = declaration.childForFieldName?.("value");
+					if (declared?.type !== "identifier" || !value || tainted.has(declared.text)) continue;
+					if ((nodes(value) ?? []).some(part => part.type === "identifier" && tainted.has(part.text))) {
+						tainted.add(declared.text); changed = true;
+					}
+				}
+			}
+			if (tainted.size > 32) return false;
+			const taintedCalls = callbackNodes.filter(node => node.type === "call_expression" && args(node)?.some(argument =>
+				(nodes(argument) ?? []).some(part => part.type === "identifier" && tainted.has(part.text))));
+
+			if (taintedCalls.some(node => {
+				const functionText = node.childForFieldName?.("function")?.text;
+				if (functionText === "config.buildRpcParams") return unwrappedText(args(node)?.[0]) !== input;
+				if (functionText === "isRecord") return false;
+				return functionText !== "typedRpc" || unwrappedText(args(node)?.[0]) !== "config.rpcName";
+			})) return false;
+			const typed = (nodes(producer.node) ?? []).find(node => node.type === "call_expression" && unwrappedText(args(node)?.[0]) === "config.rpcName" && node.childForFieldName?.("function")?.type === "identifier");
+			const typedName = typed?.childForFieldName?.("function")?.text;
+			const typedExport = typedName ? importedExport(typedName, producer.root, producer.file) : undefined;
+
+			if (typedExport?.node.type !== "function_declaration") return false;
+			const typedParams = params(typedExport.node);
+			if (!typedParams?.length) return false;
+			const rawParams = named(typedExport.node.childForFieldName?.("parameters"));
+			const calls = (nodes(typedExport.node) ?? []).filter(node => node.type === "call_expression");
+
+			return calls.length > 0 && calls.every(node => {
+				const member = node.childForFieldName?.("function");
+				const object = member?.type === "member_expression" ? member.childForFieldName?.("object") : undefined;
+				if (object?.type !== "identifier" || member?.childForFieldName?.("property")?.text !== "rpc" || unwrappedText(args(node)?.[0]) !== typedParams[0].text) return false;
+				const parameterIndex = typedParams.findIndex(parameter => parameter.text === object.text);
+				const defaultValue = parameterIndex >= 0 ? rawParams[parameterIndex]?.childForFieldName?.("value") : undefined;
+				return parameterIndex >= 0
+					? sdkValueOrigin(defaultValue, typedExport.root, typedExport.file)
+					: sdkOrigin(object.text, typedExport.root, typedExport.file);
+			});
+		};
+		const mutationObject = (name: string, use: TreeSitterNode, treeRoot: TreeSitterNode, sourceFile: string) => {
+			const initializer = resolveConstAtUse(name, use, treeRoot);
+			const hookName = initializer?.type === "call_expression" ? initializer.childForFieldName?.("function")?.text : undefined;
+			const hook = hookName ? importedExport(hookName, treeRoot, sourceFile) : undefined;
+			if (hook?.node.type !== "function_declaration") return false;
+			const returns = (nodes(hook.node) ?? []).filter(node => node.type === "return_statement");
+			const useMutation = returns.length === 1 ? named(returns[0])[0] : undefined;
+			const useName = useMutation?.childForFieldName?.("function")?.text;
+			const options = useMutation?.type === "call_expression" ? args(useMutation)?.[0] : undefined;
+			const mutationFn = options?.type === "object" ? pair(options, "mutationFn") : undefined;
+			if (!useName) return false;
+			return imported(useName, hook.root)?.source === "@tanstack/react-query" && mutationFn?.type === "call_expression" && rpcFactoryCall(mutationFn, hook.root, hook.file);
+		};
+		const safeCallback = (callback: TreeSitterNode) => {
+			const callbackParams = params(callback);
+			let body = callback.childForFieldName?.("body");
+			while (body && ["await_expression", "parenthesized_expression"].includes(body.type)) body = named(body)[0];
+			if (body?.type === "statement_block") {
+				const statements = named(body); body = statements.length === 1 && statements[0].type === "return_statement" ? named(statements[0])[0] : undefined;
+			}
+			const member = body?.type === "call_expression" ? body.childForFieldName?.("function") : undefined;
+			const object = member?.type === "member_expression" ? member.childForFieldName?.("object") : undefined;
+			if (!callbackParams?.length || (nodes(callback) ?? []).filter(node => node.type === "call_expression").length !== 1 || member?.childForFieldName?.("property")?.text !== "mutateAsync" || object?.type !== "identifier" || !mutationObject(object.text, object, root, filePath)) return false;
+			const callArgs = args(body);
+			return callbackParams.every(param => (nodes(callback) ?? []).filter(node => node.type.endsWith("identifier") && node.text === param.text && !same(node, param)).every(reference =>
+				callArgs?.some(argument => { for (let current: TreeSitterNode | null | undefined = reference; current && !same(current, callback); current = current.parent) if (same(current, argument)) return true; return false; }) === true));
+		};
+		const localCallback = () => {
+			if (callee?.type !== "identifier") return false;
+			let helper: TreeSitterNode | null | undefined = callee.parent;
+			while (helper && !(["function_declaration", "function_expression", "arrow_function"].includes(helper.type) && params(helper)?.some(param => param.text === callee.text))) helper = helper.parent;
+			const helperParams = params(helper), index = helperParams?.findIndex(param => param.text === callee.text) ?? -1;
+			if (!helper || !helperParams || index < 0) return false;
+			const parameter = helperParams[index];
+			if ((nodes(helper) ?? []).some(node => node.type === "identifier" && node.text === parameter.text && !same(node, parameter) && !(node.parent?.type === "call_expression" && same(node.parent.childForFieldName?.("function"), node)))) return false;
+			let initializer = helper, ownerName = helper.type === "function_declaration" ? helper.childForFieldName?.("name")?.text : undefined;
+			if (!ownerName && helper.parent?.type === "arguments") {
+				const wrapper = helper.parent.parent, wrapperName = wrapper?.childForFieldName?.("function")?.text;
+				if (wrapper?.type !== "call_expression" || !same(args(wrapper)?.[0], helper) || !wrapperName || imported(wrapperName, root)?.source !== "react") return false;
+				initializer = wrapper;
+			}
+			if (!ownerName) {
+				const declaration = initializer.parent?.type === "variable_declarator" ? initializer.parent : undefined;
+				if (!declaration || declaration.parent?.type !== "lexical_declaration" || !declaration.parent.children.some(node => node.type === "const")) return false;
+				ownerName = declaration.childForFieldName?.("name")?.text;
+			}
+			if (!ownerName) return false;
+			let callers = 0;
+			for (const reference of (nodes(root) ?? []).filter(node => node.type === "identifier" && node.text === ownerName)) {
+				if (reference.parent?.type === "variable_declarator" || reference.parent?.type === "function_declaration") continue;
+				const call = reference.parent?.type === "call_expression" && same(reference.parent.childForFieldName?.("function"), reference) ? reference.parent : undefined;
+				if (call) { const callback = args(call)?.[index]; if (!callback || !safeCallback(callback)) return false; callers++; continue; }
+				const array = reference.parent, wrapper = array?.type === "array" && array.parent?.type === "arguments" ? array.parent.parent : undefined;
+				const wrapperName = wrapper?.childForFieldName?.("function")?.text;
+				if (wrapper?.type !== "call_expression" || !same(args(wrapper)?.[1], array) || !wrapperName || imported(wrapperName, root)?.source !== "react") return false;
+			}
+			return callers > 0;
+		};
+		const pureLocalFunction = (name: string, treeRoot: TreeSitterNode, seen = new Set<string>()): boolean => {
+			if (seen.has(name) || seen.size > 12) return false;
+			const functions = (nodes(treeRoot) ?? []).filter(node => node.type === "function_declaration" && node.childForFieldName?.("name")?.text === name);
+			if (functions.length !== 1) return false;
+			const nextSeen = new Set(seen).add(name);
+			const unshadowedGlobal = (globalName: string) => !(nodes(treeRoot) ?? []).some(node =>
+				(node.type === "import_specifier" && (node.childForFieldName?.("alias") ?? node.childForFieldName?.("name"))?.text === globalName) ||
+				(node.type === "variable_declarator" && node.childForFieldName?.("name")?.text === globalName) ||
+				(["function_declaration", "class_declaration"].includes(node.type) && node.childForFieldName?.("name")?.text === globalName) ||
+				(["required_parameter", "optional_parameter"].includes(node.type) && node.childForFieldName?.("pattern")?.text === globalName) ||
+				(["assignment_expression", "augmented_assignment_expression"].includes(node.type) && node.childForFieldName?.("left")?.text === globalName));
+			const functionCalls = (nodes(functions[0]) ?? []).filter(node => node.type === "call_expression");
+			return functionCalls.every(call => {
+				const fn = call.childForFieldName?.("function");
+				if (["String", "Number.isFinite", "Array.isArray", "Object.values"].includes(fn?.text ?? "")) return unshadowedGlobal((fn?.text ?? "").split(".")[0]);
+				if (fn?.childForFieldName?.("property")?.text === "every") {
+					const object = fn.childForFieldName?.("object");
+					if (object?.type === "identifier") return unshadowedGlobal("Array") && functions[0].text.includes(`Array.isArray(${object.text})`);
+					return object?.type === "call_expression" && object.childForFieldName?.("function")?.text === "Object.values" && unshadowedGlobal("Object");
+				}
+				if (fn?.type === "identifier" && fn.text === name) return true;
+				return fn?.type === "identifier" && pureLocalFunction(fn.text, treeRoot, nextSeen);
+			});
+		};
+
+		const registry = () => {
+			if (callee?.text !== "execute" || receiver?.type !== "identifier") return false;
+			const receiverReferences = (nodes(root) ?? []).filter(node => node.type === "identifier" && node.text === receiver.text);
+			if (receiverReferences.some(reference => {
+				if (reference.parent?.type === "variable_declarator" && same(reference.parent.childForFieldName?.("name"), reference)) return false;
+				if (["unary_expression", "binary_expression", "parenthesized_expression"].includes(reference.parent?.type ?? "")) return false;
+				const member = reference.parent?.type === "member_expression" && same(reference.parent.childForFieldName?.("object"), reference) ? reference.parent : undefined;
+				return member?.childForFieldName?.("property")?.text !== "execute" || member.parent?.type !== "call_expression";
+			})) return false;
+			const init = resolveConstAtUse(receiver.text, receiver, root), getterName = init?.type === "call_expression" ? init.childForFieldName?.("function")?.text : undefined;
+			const getter = getterName ? importedExport(getterName, root, filePath) : undefined;
+			if (getter?.node.type !== "function_declaration") return false;
+			const returns = (nodes(getter.node) ?? []).filter(node => node.type === "return_statement"), lookup = returns.length === 1 ? named(returns[0])[0] : undefined;
+			const registryName = lookup?.type === "subscript_expression" ? lookup.childForFieldName?.("object")?.text : undefined;
+			const value = registryName ? this.resolveFileConstValueNode(registryName, getter.root) : undefined;
+
+			if (!registryName || value?.type !== "object") return false;
+			if ((nodes(getter.root) ?? []).filter(node => node.type === "identifier" && node.text === registryName).some(reference => {
+				if (reference.parent?.type === "variable_declarator" && same(reference.parent.childForFieldName?.("name"), reference)) return false;
+				if (same(reference, lookup?.childForFieldName?.("object"))) return false;
+				if (reference.parent?.type === "binary_expression" && reference.parent.text.includes(" in ")) return false;
+				const list = reference.parent?.type === "arguments" ? reference.parent : undefined;
+				return list?.parent?.childForFieldName?.("function")?.text !== "Object.keys";
+			})) return false;
+			const proveObject = (object: TreeSitterNode, treeRoot: TreeSitterNode, sourceFile: string, depth = 0): boolean => {
+				if (depth > 8) return false;
+				for (const entry of named(object)) {
+
+					if (entry.type === "spread_element") {
+						const spread = named(entry)[0], resolved = spread?.type === "identifier" ? importedExport(spread.text, treeRoot, sourceFile) : undefined;
+						const spreadValue = resolved?.node.type === "variable_declarator" ? resolved.node.childForFieldName?.("value") : undefined;
+						if (resolved && (nodes(resolved.root) ?? []).filter(node => node.type === "identifier" && node.text === spread?.text).some(reference =>
+							!(reference.parent?.type === "variable_declarator" && same(reference.parent.childForFieldName?.("name"), reference)))) return false;
+
+						if (!resolved || spreadValue?.type !== "object" || !proveObject(spreadValue, resolved.root, resolved.file, depth + 1)) return false;
+						continue;
+					}
+					const config = entry.type === "pair" ? entry.childForFieldName?.("value") : undefined, execute = config?.type === "object" ? pair(config, "execute") : undefined;
+					if (config?.type !== "object") return false;
+					if (!execute) continue;
+					const calls = (nodes(execute) ?? []).filter(node => node.type === "call_expression"), rpc = calls.find(call => call.childForFieldName?.("function")?.childForFieldName?.("property")?.text === "rpc");
+					const rpcObject = rpc?.childForFieldName?.("function")?.childForFieldName?.("object")?.text;
+
+					if (!rpc || args(rpc)?.[0]?.type !== "string" || !rpcObject || !sdkOrigin(rpcObject, treeRoot, sourceFile)) return false;
+					for (const call of calls.filter(call => !same(call, rpc))) {
+						const fn = call.childForFieldName?.("function");
+						if (["String", "Number.isFinite", "Array.isArray", "Object.values"].includes(fn?.text ?? "") || fn?.childForFieldName?.("property")?.text === "every") continue;
+						if (fn?.type !== "identifier" || !pureLocalFunction(fn.text, treeRoot)) return false;
+					}
+				}
+				return true;
+			};
+			return proveObject(value, getter.root, getter.file);
+		};
+		try {
+			const localProof = localCallback();
+			const registryProof = registry();
+			const initializer = callee?.type === "identifier" ? resolveConstAtUse(callee.text, callee, root) : undefined;
+			const directProof = initializer?.type === "call_expression" && rpcFactoryCall(initializer, root, filePath);
+			return localProof || registryProof || directProof;
+		} finally {
+			for (const tree of openedTrees) (tree as TreeSitterTree & { delete?: () => void }).delete?.();
+		}
+	}
+
 	/**
 	 * Resolves `name` (as used in the *same file*) to a provably fixed URL:
 	 * a `const` declarator whose initializer is a string literal, or a
@@ -5427,6 +5839,7 @@ export class TreeSitterClient {
 						captures.SQL_FUNC?.text === "exec" &&
 						this.isProvenRegExpReceiver(captures.SQL_RECEIVER, rootNode)
 					) return false;
+					if (filePath && this.isProvenNonSqlCallable(captures.SQL_FUNC, captures.SQL_RECEIVER, rootNode, filePath)) return false;
 					return !this.isStaticSqlExpression(sqlArg, rootNode);
 				}
 			case "ts_command_injection_sink":

@@ -1,3 +1,4 @@
+<!-- Worktree reconciliation: MCP now mirrors ast_outline, ast_dump, and diagnostic_mark; retain read receipts and isError across transports. -->
 # pi-lens — agent context
 
 Standalone diagnostics await LSP generation teardown before emitting results.
