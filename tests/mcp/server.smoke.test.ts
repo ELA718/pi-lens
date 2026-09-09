@@ -56,6 +56,9 @@ describe("pi-lens MCP server (stdio smoke)", { retry: 2 }, () => {
 		expect(names).toContain("pilens_turn_end");
 		expect(names).toContain("pilens_ast_grep_search");
 		expect(names).toContain("pilens_ast_grep_replace");
+		expect(names).toContain("pilens_ast_grep_outline");
+		expect(names).toContain("pilens_ast_grep_dump");
+		expect(names).toContain("pilens_diagnostic_mark");
 		expect(names).toContain("pilens_lsp_navigation");
 		expect(names).toContain("pilens_lsp_diagnostics");
 		expect(names).toContain("pilens_symbol_search");
@@ -85,6 +88,19 @@ describe("pi-lens MCP server (stdio smoke)", { retry: 2 }, () => {
 			"hasDescendantKind",
 		);
 	}, 25_000);
+
+	it.each([
+		["pilens_ast_grep_search", {}, "pattern is required"],
+		["pilens_ast_grep_replace", {}, "pattern"],
+		["pilens_ast_grep_outline", {}, "paths is required"],
+		["pilens_ast_grep_dump", { lang: "typescript" }, "source is required"],
+		["pilens_diagnostic_mark", {}, "valid disposition are required"],
+	])("preserves validation errors from %s", async (name, args, message) => {
+		const res = await harness.request(90, "tools/call", { name, arguments: args });
+		const result = res.result as { isError?: boolean; content: { text: string }[] };
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toContain(message);
+	});
 
 	it("does not advertise rebuild from an installed package", async () => {
 		const installedRoot = fs.mkdtempSync(

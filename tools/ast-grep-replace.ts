@@ -5,6 +5,7 @@
  */
 
 import { Type } from "../clients/deps/typebox.js";
+import * as path from "node:path";
 import type { AstGrepClient } from "../clients/ast-grep-client.js";
 import {
 	astGrepRemediationHint,
@@ -178,7 +179,7 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 					details: {},
 				};
 			}
-			const searchPaths = paths?.length ? paths : [ctx.cwd || "."];
+			const searchPaths = (paths?.length ? paths : ["."]).map(file => path.resolve(ctx.cwd || ".", file));
 
 			// Phase 3: structural-intent params → synthesize YAML with fix: field
 			if (hasStructuralIntent({ insideKind, hasKind, follows, precedes })) {

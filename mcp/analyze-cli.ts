@@ -80,7 +80,9 @@ function formatReport(result: McpAnalyzeResult, cwd: string): string {
 interface HookPayload {
 	cwd?: string;
 	hook_event_name?: string;
-	tool_input?: { file_path?: string; path?: string };
+	tool_input?: { file_path?: string; path?: string; command?: string };
+	tool_name?: string;
+	stop_hook_active?: boolean;
 }
 
 /**
@@ -204,6 +206,8 @@ async function runTurnEndMode(
 	cwd: string,
 	payload: HookPayload | undefined,
 ): Promise<void> {
+	const codexHook = process.argv.includes("--codex-hook");
+	if (codexHook && payload?.stop_hook_active) return;
 	// Subagent edits already fire PostToolUse into the shared workspace turn
 	// state, and the consume bridges are one-shot — a subagent pass would eat the
 	// main agent's findings into a transcript nobody reads, and multiply the
@@ -228,7 +232,7 @@ async function runTurnEndMode(
 		// hook's only transcript-visible channel, so the skip goes there too —
 		// one line, so a genuinely absent server is a footnote, not noise.
 		process.stderr.write(`${message} (cwd: ${cwd})\n`);
-		await writeStdout(message);
+		await writeStdout(codexHook ? JSON.stringify({ systemMessage: message }) : message);
 		recordTurnEndOutcome(cwd, { ran: false, reason: outcome.reason });
 		process.exitCode = 0;
 		return;
@@ -236,7 +240,7 @@ async function runTurnEndMode(
 
 	recordTurnEndOutcome(cwd, { ran: true });
 	const report = formatTurnEnd(outcome.response);
-	if (report) await writeStdout(report);
+	if (report) await writeStdout(codexHook ? JSON.stringify({ decision: "block", reason: report }) : report);
 	process.exitCode = 0;
 }
 
@@ -247,7 +251,7 @@ function writeStdout(text: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
-	const hookMode = process.argv.includes("--hook");
+	const hookMode = process.argv.includes("--hook") || process.argv.includes("--codex-hook");
 	const withLsp = process.argv.includes("--lsp");
 	const fileArg = argVal("file");
 	const turnEndFlag = process.argv.includes("--turn-end");
@@ -265,30 +269,45 @@ async function main(): Promise<void> {
 		return runTurnEndMode(cwd, payload);
 	}
 
-	const file =
-		fileArg ?? payload?.tool_input?.file_path ?? payload?.tool_input?.path;
-	if (!file) process.exit(0); // nothing to analyze — stay silent
-
-	// Warm path first: if the MCP server is up for this workspace, it analyzes in
-	// its warm process (LSP-COMPLETE) and we never load the dispatch graph here.
-	// Falls back to a cold, no-LSP local run when no server is reachable.
-	let result = await requestWarmAnalyze(cwd, file);
-	if (!result) {
-		const { analyzeFile } = await import("../clients/mcp/analyze.js");
-		result = await analyzeFile(file, cwd, {
-			flags: withLsp ? {} : { "no-lsp": true },
-			record: false,
-			// Edit-detection path (PostToolUse) — mark the file for pilens_turn_end.
-			registerTurnState: true,
-		});
+	const file = fileArg ?? payload?.tool_input?.file_path ?? payload?.tool_input?.path;
+	const files = new Set<string>();
+	if (file) files.add(file);
+	if (!file && payload?.tool_name === "apply_patch") {
+		// Codex sends the applied patch in tool_input.command. Deleted files
+		// have no body to analyze; a move replaces the preceding update path.
+		let pending: string | undefined;
+		for (const line of (payload.tool_input?.command ?? "").split(/\r?\n/)) {
+			const header = /^\*\*\* (Add File|Update File|Delete File|Move to): (.+)$/.exec(line);
+			if (!header) continue;
+			if (header[1] === "Move to") {
+				if (pending) files.delete(pending);
+				files.add(header[2]);
+				pending = undefined;
+			} else {
+				pending = header[1] === "Delete File" ? undefined : header[2];
+				if (pending) files.add(pending);
+			}
+		}
 	}
-	// One-shot consumers cannot rely on the installer's unref'd debounce.
+	if (files.size === 0) process.exit(0);
+
+	const reports: string[] = [];
+	for (const target of files) {
+		let result = await requestWarmAnalyze(cwd, target);
+		if (!result) {
+			const { analyzeFile } = await import("../clients/mcp/analyze.js");
+			result = await analyzeFile(target, cwd, {
+				flags: withLsp ? {} : { "no-lsp": true },
+				record: false,
+				registerTurnState: true,
+			});
+		}
+		if (result.counts.diagnostics > 0) reports.push(formatReport(result, cwd));
+	}
 	const { flushProbeCache } = await import("../clients/installer/index.js");
 	await flushProbeCache();
-
-	if (result.counts.diagnostics === 0) process.exit(0); // clean → no noise
-
-	const report = formatReport(result, cwd);
+	if (reports.length === 0) process.exit(0);
+	const report = reports.join("\n\n");
 	if (hookMode) {
 		process.stdout.write(
 			JSON.stringify({
