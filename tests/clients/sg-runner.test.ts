@@ -405,6 +405,34 @@ describe("SgRunner", () => {
 		});
 	});
 
+	it.each([null, false, true])("rule scans reuse the resolved binary (apply=%s)", async (apply) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-resolved-"));
+		try {
+			safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) => ({
+				status: args.includes("--version") && cmd !== "sg" ? 1 : 0,
+				stdout: args.includes("--version") ? "ast-grep 0.45.1" : "[]",
+				stderr: "",
+			}));
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+			const runner = new SgRunner();
+			expect(await runner.ensureAvailable()).toBe(true);
+			safeSpawnAsync.mockClear();
+			const rule = "id: agent-rule\nlanguage: TypeScript\nrule: { kind: function_declaration }\n";
+			if (apply === null) {
+				await runner.tempScanDetailedAsync(root, "agent-rule", rule);
+			} else {
+				await runner.tempScanWithFixAsync(root, "agent-rule", rule, apply);
+			}
+			expect(safeSpawnAsync).toHaveBeenCalled();
+			for (const [cmd, args] of safeSpawnAsync.mock.calls) {
+				expect(cmd).toBe("sg");
+				expect(args[0]).toBe("scan");
+			}
+		} finally {
+			removeTempDirSync(root);
+		}
+	});
+
 	describe("tempScanWithFixAsync() — apply reports the pre-apply match count", () => {
 		it("counts what was changed even though the rule no longer matches post-apply", async () => {
 			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-apply-"));

@@ -141,6 +141,32 @@ afterAll(() => {
 // output) — it passes every time in isolation. retry: 2 absorbs the transient
 // contention spike (the established pattern for load-sensitive tests here).
 describe("pi-lens-analyze bin", { retry: 2 }, () => {
+	it("does not repeat a Codex Stop continuation", async () => {
+		const { stdout, code } = await runBin(["--codex-hook"], JSON.stringify({
+			cwd: tmpDir, hook_event_name: "Stop", stop_hook_active: true,
+		}));
+		expect(code).toBe(0);
+		expect(stdout).toBe("");
+	});
+
+	it("analyzes Codex patch additions and move destinations, skipping deletions", async () => {
+		const moved = path.join(tmpDir, "moved file.ts");
+		fs.writeFileSync(moved, SMELLY);
+		const { stdout, code } = await runBin(["--hook"], JSON.stringify({
+			cwd: tmpDir,
+			hook_event_name: "PostToolUse",
+			tool_name: "apply_patch",
+			tool_input: { command: "*** Begin Patch\n*** Add File: smelly.ts\n+content\n*** Update File: absent.ts\n*** Move to: moved file.ts\n@@\n-old\n+new\n*** Delete File: deleted.ts\n*** End Patch" },
+		}));
+		expect(code).toBe(0);
+		const result = JSON.parse(stdout);
+		expect(result.hookSpecificOutput.hookEventName).toBe("PostToolUse");
+		expect(result.hookSpecificOutput.additionalContext).toContain("smelly.ts");
+		expect(result.hookSpecificOutput.additionalContext).toContain("moved file.ts");
+		expect(result.hookSpecificOutput.additionalContext).not.toContain("absent.ts");
+		expect(result.hookSpecificOutput.additionalContext).not.toContain("deleted.ts");
+	}, 45_000);
+
 	it("reports structural warnings in plain CLI mode", async () => {
 		const { stdout, code } = await runBin([
 			`--file=${smellyFile}`,
@@ -317,6 +343,20 @@ describe("pi-lens-analyze turn-end mode", { retry: 2 }, () => {
 			cwd: turnDir,
 		});
 	}, 20_000);
+
+	it("returns a Codex continuation when the warm pass reports findings", async () => {
+		stub = await startTurnEndStub(turnDir, {
+			route: "turn-end", version: WARM_TURN_END_SCHEMA_VERSION,
+			turnEnd: FRAMED_ADVISORY,
+		});
+		const { stdout, code } = await runBin(["--codex-hook"], JSON.stringify({
+			cwd: turnDir, hook_event_name: "Stop", stop_hook_active: false,
+		}));
+		expect(code).toBe(0);
+		expect(JSON.parse(stdout)).toEqual({
+			decision: "block", reason: expect.stringContaining("2 unused exports"),
+		});
+	});
 
 	it("stays silent when the warm pass found nothing", async () => {
 		stub = await startTurnEndStub(turnDir, {

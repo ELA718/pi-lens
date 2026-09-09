@@ -11,7 +11,8 @@
  * Requires `npm run build` first (resolves mcp/server.js next to its source).
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -93,6 +94,7 @@ describe("module_report + read_symbol over MCP (tiny project)", () => {
 		expect(report.api.some((e) => e.name === "foo")).toBe(true);
 		// Read path never calls LSP → always "none".
 		expect(report.semantic.source).toBe("none");
+		expect((res.result as { structuredContent?: unknown }).structuredContent).toBeUndefined();
 	}, 30_000);
 
 	it("answers pilens_read_symbol with the verbatim body", async () => {
@@ -104,6 +106,27 @@ describe("module_report + read_symbol over MCP (tiny project)", () => {
 		const text = textOf(res);
 		expect(text).toContain("export function foo");
 		expect(text).toContain("return 1;");
+		const source = text.slice(text.indexOf("\n\n") + 2);
+		expect((res.result as { structuredContent?: unknown }).structuredContent).toEqual({
+			readReceipt: { version: 1, path: path.join(projectDir, "a.ts"), startLine: 1, endLine: 3,
+				sourceHash: createHash("sha256").update(source).digest("hex") },
+		});
+	}, 30_000);
+
+	it("receipts cover only the delivered slice, never an enclosing outline", async () => {
+		const args = { file: path.join(projectDir, "a.ts"), line: 2, maxLines: 1, aroundLine: 1 };
+		const res = await harness.request(13, "tools/call", {
+			name: "pilens_read_enclosing", arguments: { ...args, onOversize: "slice" },
+		});
+		const source = textOf(res).split("\n\n").slice(1).join("\n\n");
+		expect((res.result as { structuredContent?: unknown }).structuredContent).toEqual({
+			readReceipt: { version: 1, path: path.join(projectDir, "a.ts"), startLine: 2, endLine: 2,
+				sourceHash: createHash("sha256").update(source).digest("hex") },
+		});
+		const outline = await harness.request(14, "tools/call", {
+			name: "pilens_read_enclosing", arguments: { ...args, onOversize: "outline" },
+		});
+		expect((outline.result as { structuredContent?: unknown }).structuredContent).toBeUndefined();
 	}, 30_000);
 
 	it("embeds did-you-mean suggestions on a near-miss (#523)", async () => {
@@ -112,6 +135,26 @@ describe("module_report + read_symbol over MCP (tiny project)", () => {
 			arguments: { file: path.join(projectDir, "a.ts"), symbol: "fooo" },
 		});
 		expect((res.result as { isError?: boolean }).isError).toBe(true);
+		expect((res.result as { structuredContent?: unknown }).structuredContent).toBeUndefined();
 		expect(textOf(res)).toContain("foo");
+	}, 30_000);
+
+	it("AST search and replacement resolve relative paths against the requested cwd", async () => {
+		const other = makeTinyProject("pi-lens-ast-cwd-");
+		const file = path.join(other, "a.ts");
+		writeFileSync(file, "export function elsewhere() { return 99; }\n");
+		const original = readFileSync(path.join(projectDir, "a.ts"), "utf8");
+		try {
+			const search = await harness.request(20, "tools/call", {
+				name: "pilens_ast_grep_search", arguments: { cwd: other, paths: ["a.ts"], lang: "typescript", nodeKind: "function_declaration" },
+			});
+			expect(textOf(search)).toContain("elsewhere");
+			const replaced = await harness.request(21, "tools/call", {
+				name: "pilens_ast_grep_replace", arguments: { cwd: other, paths: ["a.ts"], lang: "typescript", pattern: "return 99;", rewrite: "return 100;", apply: true },
+			});
+			expect((replaced.result as { isError?: boolean }).isError).toBeFalsy();
+			expect(readFileSync(file, "utf8")).toContain("return 100;");
+			expect(readFileSync(path.join(projectDir, "a.ts"), "utf8")).toBe(original);
+		} finally { rmSync(other, { recursive: true, force: true }); }
 	}, 30_000);
 });
