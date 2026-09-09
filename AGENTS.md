@@ -1,3 +1,4 @@
+<!-- Worktree reconciliation: MCP now mirrors ast_outline, ast_dump, and diagnostic_mark; retain read receipts and isError across transports. -->
 # pi-lens — agent context
 
 Standalone diagnostics await LSP generation teardown before emitting results.
@@ -170,6 +171,14 @@ The TSX runtime and installer source `tree-sitter-tsx.wasm` from the official
 `tree-sitter-typescript` package, not the frozen aggregator: valid quoted JSX
 attributes may contain literal ampersands. Keep runtime/downloader overrides and
 the provenance manifest aligned; malformed JSX must still produce recovery nodes.
+
+Workspace sweep pre-open and document-touch waits pass their caller signal to
+`withDeadline`. Cancellation settles only that wait, clears its timer and abort
+listener, and leaves shared LSP producers alive. Completed findings survive;
+an interrupted touch remains unconfirmed (`timedOut`), and late producer
+settlement cannot append results. Check cancellation again after acquiring a
+client before sending pre-open notifications. Pre-aborted and expired waits
+must still observe producer rejections. (ELA718/pi-lens#4)
 
 ## Maintaining this file (do this on every commit)
 

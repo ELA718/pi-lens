@@ -9,10 +9,7 @@ import { createSubsystemLogger } from "./extension-log.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	getSgCommand,
-	resolveManagedToolClient,
-} from "./dispatch/runners/utils/runner-helpers.js";
+import { resolveManagedToolClient } from "./dispatch/runners/utils/runner-helpers.js";
 import { getProjectIgnoreGlobs } from "./file-utils.js";
 import { findGlobalBinary } from "./package-manager.js";
 import { safeSpawnAsync, type SpawnResult } from "./safe-spawn.js";
@@ -662,7 +659,7 @@ export class SgRunner {
 	): Promise<SgScanResult> {
 		const { sessionDir, configFile } = this.prepareTempScan(ruleId, ruleYaml);
 		try {
-			const { cmd: sgCmd, args: sgPre } = getSgCommand();
+			const { cmd: sgCmd, argsPrefix: sgPre } = this.getSgCommand();
 			const result = await safeSpawnAsync(
 				sgCmd,
 				[
@@ -720,7 +717,7 @@ export class SgRunner {
 	): Promise<{ matches: SgMatch[]; error?: string }> {
 		const { sessionDir, configFile } = this.prepareTempScan(ruleId, ruleYaml);
 		try {
-			const { cmd: sgCmd, args: sgPre } = getSgCommand();
+			const { cmd: sgCmd, argsPrefix: sgPre } = this.getSgCommand();
 			const scanArgs = [
 				...sgPre,
 				"scan",

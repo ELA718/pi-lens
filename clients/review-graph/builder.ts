@@ -1095,12 +1095,12 @@ export async function getGraphSourceFiles(
 	// tree with few source files among a huge pile of non-source files can trip the
 	// entry budget first. That result is a useful partial graph, but its lower-bound
 	// count MUST travel with the graph and persistence metadata; it is never clean.
-	const { files: collected, entryBudgetExceeded } =
+	const { files: collected, entryBudgetExceeded, fileBudgetExceeded } =
 		await collectProjectSourceFilesWithBudgetAsync(cwd, {
 			// Only walk graph-relevant extensions so the cap counts what the graph
 			// keeps (post-filter), not JSON/YAML/MD noise it would discard anyway.
 			extensions: MAIN_KIND_EXTENSIONS,
-			maxFiles: maxGraphFiles + 1,
+			maxFiles: maxGraphFiles,
 			...(_reviewGraphEntryBudgetForTests === undefined
 				? {}
 				: { maxScanEntries: _reviewGraphEntryBudgetForTests }),
@@ -1117,12 +1117,12 @@ export async function getGraphSourceFiles(
 			metadata: { cwd, collectedFiles: collected.length },
 		});
 	}
-	if (collected.length > maxGraphFiles) {
-		// Contents are unused by the too_many_files branch; return the capped list
-		// so the caller's `length > maxGraphFiles` check still trips.
+	if (fileBudgetExceeded) {
+		// The collector already probes one additional eligible file. Carry that
+		// proven lower bound without visiting another file or inventing a path.
 		return {
 			files: collected,
-			sourceFileCount: collected.length,
+			sourceFileCount: maxGraphFiles + 1,
 			maxFileCount: maxGraphFiles,
 			entryBudgetExceeded,
 		};
@@ -4598,7 +4598,7 @@ async function _doBuildGraph(
 	const sourceFilesTruncated = sourceCollection.entryBudgetExceeded;
 	const ignoredIds = await ignoredIdsPromise;
 	const maxGraphFiles = sourceCollection.maxFileCount;
-	if (filesToBuild.length > maxGraphFiles) {
+	if (sourceFileCount > maxGraphFiles) {
 		const graph = createEmptyGraph();
 		graph.version = REVIEW_GRAPH_VERSION;
 		graph.builtAt = new Date().toISOString();

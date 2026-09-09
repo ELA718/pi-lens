@@ -25,6 +25,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AstGrepClient } from "../clients/ast-grep-client.js";
 import { CacheManager } from "../clients/cache-manager.js";
+import { hashDiagnosticContent } from "../clients/lsp/diagnostic-binding.js";
 import {
 	getDegradationSummary,
 	renderDegradationLines,
@@ -68,6 +69,9 @@ import {
 	type WarmTurnEndRequest,
 	type WarmTurnEndResponse,
 } from "../clients/lens-engine.js";
+import { createAstGrepDumpTool } from "../tools/ast-dump.js";
+import { createAstGrepOutlineTool } from "../tools/ast-grep-outline.js";
+import { createLensDiagnosticMarkTool } from "../tools/lens-diagnostic-mark.js";
 import { createAstGrepReplaceTool } from "../tools/ast-grep-replace.js";
 import { createAstGrepSearchTool } from "../tools/ast-grep-search.js";
 import { createLensDiagnosticsTool } from "../tools/lens-diagnostics.js";
@@ -559,6 +563,9 @@ const lensDiagnosticsTool = createLensDiagnosticsTool(
 const astGrepClient = new AstGrepClient();
 const astGrepSearchTool = createAstGrepSearchTool(astGrepClient);
 const astGrepReplaceTool = createAstGrepReplaceTool(astGrepClient);
+const astGrepOutlineTool = createAstGrepOutlineTool(astGrepClient);
+const astGrepDumpTool = createAstGrepDumpTool(astGrepClient);
+const diagnosticMarkTool = createLensDiagnosticMarkTool(() => DEFAULT_CWD);
 // #792: unlike every other per-request `cwd` resolution in this file, this
 // tool used to be built ONCE at module load with `createMcpHost().getFlag`,
 // which freezes `projectRoot` at the server's own launch directory — a
@@ -593,6 +600,15 @@ function schemaWithCwd(parameters: unknown): Record<string, unknown> {
 }
 
 const ALL_TOOLS = [
+	...([
+		["pilens_ast_grep_outline", astGrepOutlineTool],
+		["pilens_ast_grep_dump", astGrepDumpTool],
+		["pilens_diagnostic_mark", diagnosticMarkTool],
+	] as const).map(([name, tool]) => ({
+		name,
+		description: tool.description,
+		inputSchema: schemaWithCwd(tool.parameters),
+	})),
 	{
 		name: "pilens_analyze",
 		description:
@@ -1032,10 +1048,21 @@ function formatAnalyze(
 	return toolText(summary, servedBy ? { ...result, servedBy } : result);
 }
 
+// Bind to the delivered source, never a later disk read. This is coverage
+// evidence only: the host must associate it with its own successful call and
+// session, then check the snapshot before admitting an edit.
+function readReceipt(result: { path: string; startLine?: number; endLine?: number; source?: string }): Record<string, unknown> | undefined {
+	const { path: file, startLine, endLine, source } = result;
+	if (typeof source !== "string" || typeof startLine !== "number" || typeof endLine !== "number" ||
+		!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) ||
+		startLine < 1 || endLine < startLine || source.split("\n").length !== endLine - startLine + 1) return undefined;
+	return { readReceipt: { version: 1, path: file, startLine, endLine, sourceHash: hashDiagnosticContent(source) } };
+}
+
 async function callTool(
 	name: string,
 	args: Record<string, unknown>,
-): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
+): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean; structuredContent?: Record<string, unknown> }> {
 	if (name === "pilens_analyze") {
 		const file = args.file;
 		if (typeof file !== "string" || file.length === 0) {
@@ -1440,6 +1467,7 @@ async function callTool(
 			: "";
 		const header = `${result.kind} ${result.name}${ambiguityNote}${sigSuffix}  ${path.relative(cwd, result.path)}:${result.startLine}-${result.endLine}`;
 		return {
+			structuredContent: readReceipt(result),
 			content: [
 				{ type: "text" as const, text: `${header}\n\n${result.source ?? ""}` },
 			],
@@ -1501,6 +1529,7 @@ async function callTool(
 			: `${result.startLine}-${result.endLine}`;
 		const header = `${result.kind} ${result.name}  ${path.relative(cwd, result.path)}:${range}`;
 		return {
+			structuredContent: readReceipt(result),
 			content: [
 				{ type: "text" as const, text: `${header}\n\n${result.source ?? ""}` },
 			],
@@ -1589,8 +1618,8 @@ async function callTool(
 			new AbortController().signal,
 			undefined,
 			{ cwd },
-		)) as { content: { type: "text"; text: string }[] };
-		return { content: out.content };
+		)) as { content: { type: "text"; text: string }[]; isError?: boolean };
+		return { content: out.content, isError: out.isError };
 	}
 
 	if (name === "pilens_latency") {
@@ -1644,6 +1673,17 @@ async function callTool(
 		return toolText(parts.filter(Boolean).join("\n"), outcome);
 	}
 
+	if (name === "pilens_ast_grep_dump") {
+		const out = await astGrepDumpTool.execute("mcp", args, new AbortController().signal, undefined);
+		return { content: out.content, isError: "isError" in out ? out.isError : undefined };
+	}
+	if (name === "pilens_ast_grep_outline" || name === "pilens_diagnostic_mark") {
+		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
+		const tool = name === "pilens_ast_grep_outline" ? astGrepOutlineTool : diagnosticMarkTool;
+		const out = await tool.execute("mcp", args, new AbortController().signal, undefined, { cwd });
+		return { content: out.content, isError: "isError" in out ? out.isError : undefined };
+	}
+
 	if (name === "pilens_ast_grep_search" || name === "pilens_ast_grep_replace") {
 		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
 		const tool =
@@ -1656,8 +1696,8 @@ async function callTool(
 			new AbortController().signal,
 			undefined,
 			{ cwd },
-		)) as { content: { type: "text"; text: string }[] };
-		return { content: out.content };
+		)) as { content: { type: "text"; text: string }[]; isError?: boolean };
+		return { content: out.content, isError: out.isError };
 	}
 
 	if (name === "pilens_lsp_navigation" || name === "pilens_lsp_diagnostics") {
@@ -1671,8 +1711,8 @@ async function callTool(
 			new AbortController().signal,
 			undefined,
 			{ cwd },
-		)) as { content: { type: "text"; text: string }[] };
-		return { content: out.content };
+		)) as { content: { type: "text"; text: string }[]; isError?: boolean };
+		return { content: out.content, isError: out.isError };
 	}
 
 	return { ...toolText(`Unknown tool: ${name}`), isError: true };
@@ -1719,6 +1759,9 @@ async function callTool(
 // mechanism that CAUSES staleness — noting "stale" on the tool that fixes
 // staleness would be confusing, not honest.
 const WARN_ONLY_STALE_TOOLS = new Set([
+	"pilens_ast_grep_outline",
+	"pilens_ast_grep_dump",
+	"pilens_diagnostic_mark",
 	"pilens_module_report",
 	"pilens_project_report",
 	"pilens_symbol_search",

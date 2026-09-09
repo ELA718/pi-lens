@@ -36,6 +36,8 @@ export function combineAbortSignals(
 }
 
 export interface DeadlineOptions {
+	/** Cancel this wait without stopping the shared producer. Uses onTimeout policy. */
+	signal?: AbortSignal;
 	/** Duration budget in ms. Provide this OR `deadlineAt`. */
 	ms?: number;
 	/** Absolute deadline (`Date.now()`-based). Provide this OR `ms`. */
@@ -58,7 +60,7 @@ export interface DeadlineOptions {
 // keeps the precise `Promise<T>` return; any undefined-producing mode is `T | undefined`.
 export function withDeadline<T>(
 	promise: Promise<T>,
-	options: { ms?: number; deadlineAt?: number; onTimeout?: "reject"; onReject?: "propagate" },
+	options: { ms?: number; deadlineAt?: number; signal?: AbortSignal; onTimeout?: "reject"; onReject?: "propagate" },
 ): Promise<T>;
 export function withDeadline<T>(
 	promise: Promise<T>,
@@ -74,30 +76,38 @@ export function withDeadline<T>(
 		options.ms ??
 		(options.deadlineAt !== undefined ? options.deadlineAt - Date.now() : 0);
 
-	// Past deadline / non-positive budget: settle immediately, no timer.
-	if (ms <= 0) {
+	// Observe the producer even when the caller was already cancelled or its
+	// deadline has passed. Cancellation only owns this wait, not the producer.
+	promise.catch(() => {});
+	const { signal } = options;
+	const abortReason = () => signal?.reason ?? new DOMException("Aborted", "AbortError");
+	if (signal?.aborted || ms <= 0) {
 		return onTimeout === "undefined"
 			? Promise.resolve(undefined)
-			: Promise.reject(new Error(`Timeout after ${Math.max(0, ms)}ms`));
+			: Promise.reject(signal?.aborted ? abortReason() : new Error(`Timeout after ${Math.max(0, ms)}ms`));
 	}
 
-	// Base promise with rejection handled per `onReject`. In propagate mode we
-	// still attach a no-op catch so that if the timer wins the race, the loser
-	// promise's later rejection does not surface as an unhandled rejection.
 	const base: Promise<T | undefined> =
 		onReject === "undefined" ? promise.catch(() => undefined) : promise;
-	if (onReject === "propagate") promise.catch(() => {});
-
 	let timer: ReturnType<typeof setTimeout> | undefined;
-	const timeoutPromise = new Promise<T | undefined>((resolve, reject) => {
+	let onAbort: (() => void) | undefined;
+	const boundary = new Promise<T | undefined>((resolve, reject) => {
 		timer = setTimeout(() => {
 			if (onTimeout === "undefined") resolve(undefined);
 			else reject(new Error(`Timeout after ${ms}ms`));
 		}, ms);
+		if (signal) {
+			onAbort = () => {
+				if (onTimeout === "undefined") resolve(undefined);
+				else reject(abortReason());
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+		}
 	});
 
-	return Promise.race([base, timeoutPromise]).finally(() => {
-		if (timer) clearTimeout(timer);
+	return Promise.race([base, boundary]).finally(() => {
+		if (timer !== undefined) clearTimeout(timer);
+		if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 	});
 }
 
