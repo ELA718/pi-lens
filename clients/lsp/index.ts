@@ -4822,24 +4822,10 @@ export class LSPService {
 				}
 				contentCache.set(filePath, content);
 				const languageId = getLanguageId(filePath) ?? "plaintext";
-				// #615: this pre-open pass had NO bound at all — unlike every other
-				// per-file step in this sweep (`processFile`'s `touchFile` call
-				// below is `withDeadline`-wrapped). `getClientsForFile` can wait on
-				// a server spawn/initialize handshake, and `notify.open` can wait
-				// on a stuck notification write; either hanging left the WHOLE
-				// sweep stuck with no heartbeat and no escape (a real dogfooding
-				// incident: `lsp_workspace_diagnostics_start` logged, then total
-				// silence — and pressing Escape didn't help either, since the
-				// per-iteration `signal?.aborted` check above never gets a turn
-				// while stuck inside a single file's await). Two bounds, not one:
-				// `withDeadline` catches a hang with no abort press at all; racing
-				// the abort signal directly means an explicit Escape unblocks
-				// immediately too, instead of waiting out the rest of `perFileMs`.
-				// `onTimeout:"undefined"` mirrors the existing catch-based "best
-				// effort" intent below: a timed-out/aborted pre-open just means
-				// `processFile`'s own touchFile call pays for the open instead,
-				// exactly like a thrown error already did.
-				const preOpenAttempt = withDeadline(
+				// Bound both server acquisition and notification writes. The shared
+				// deadline helper releases its timer/listener when cancellation wins;
+				// it does not shut down a server another caller may still be using.
+				await withDeadline(
 					(async () => {
 						let clients: SpawnedServer[];
 						if (clientScope === "primary") {
@@ -4852,6 +4838,7 @@ export class LSPService {
 							)).clients;
 						}
 						for (const entry of clients) {
+							if (signal?.aborted) return;
 							try {
 								await entry.client.notify.open(filePath, content, languageId);
 							} catch {
@@ -4860,22 +4847,8 @@ export class LSPService {
 							}
 						}
 					})(),
-					{ ms: perFileMs, onTimeout: "undefined" },
+					{ ms: perFileMs, onTimeout: "undefined", signal },
 				);
-				await (signal
-					? Promise.race([
-							preOpenAttempt,
-							new Promise<void>((resolve) => {
-								if (signal.aborted) {
-									resolve();
-									return;
-								}
-								signal.addEventListener("abort", () => resolve(), {
-									once: true,
-								});
-							}),
-						])
-					: preOpenAttempt);
 			}
 		};
 
@@ -4939,7 +4912,7 @@ export class LSPService {
 								// full wait budget only once across this whole sweep.
 								sweepIndexGate,
 							}),
-							{ ms: perFileMs, onTimeout: "undefined" },
+							{ ms: perFileMs, onTimeout: "undefined", signal },
 						);
 				const diagnostics = touchResult?.diags;
 				// #571: prefer #570's real per-touch inconclusive signal
